@@ -1528,6 +1528,12 @@ export class CursorConnectStreamService {
       options.session?.requestedModelParameters
     )
 
+    const shouldRequestThinkingSummary =
+      options.thinkingDetailsRequested === true ||
+      (route.backend === "codex" &&
+        ((options.thinkingLevel || 0) > 0 ||
+          (!!requestedReasoningEffort && requestedReasoningEffort !== "none")))
+
     if ((options.thinkingLevel || 0) > 0 || requestedReasoningEffort) {
       const thinkingIntent = this.buildCursorThinkingIntent(
         options.thinkingLevel || 0,
@@ -1536,7 +1542,7 @@ export class CursorConnectStreamService {
       )
       applyThinkingIntentToDto(dto, thinkingIntent)
     }
-    dto._includeThinkingSummary = options.thinkingDetailsRequested === true
+    dto._includeThinkingSummary = shouldRequestThinkingSummary
 
     const requestedServiceTier = this.resolveRequestedCodexServiceTier(
       options.session?.requestedModelParameters
@@ -1607,6 +1613,12 @@ export class CursorConnectStreamService {
       ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
       : 0
 
+    const shouldRequestThinkingSummary =
+      options.thinkingDetailsRequested === true ||
+      (route.backend === "codex" &&
+        ((options.thinkingLevel || 0) > 0 ||
+          (!!requestedReasoningEffort && requestedReasoningEffort !== "none")))
+
     const request: CodexExecutionRequest = {
       model: route.model,
       system: effectiveSystemPrompt || undefined,
@@ -1616,7 +1628,7 @@ export class CursorConnectStreamService {
         options.pendingToolUseIds && options.pendingToolUseIds.length > 0
           ? options.pendingToolUseIds
           : undefined,
-      includeThinkingSummary: options.thinkingDetailsRequested === true,
+      includeThinkingSummary: shouldRequestThinkingSummary,
       serviceTier: this.resolveRequestedCodexServiceTier(
         options.session?.requestedModelParameters
       ),
@@ -17384,20 +17396,6 @@ ${raw}
         if (statusEnum === 2) return { status: "error", message: "not found" }
         return { status: "error", message: "unspecified status" }
       }
-      if (msgCase === "canvasGetUrlResult") {
-        // CanvasGetUrlResult { url?: string }
-        const url = (execMsg.message.value as { url?: string }).url
-        return url
-          ? { status: "success" }
-          : { status: "error", message: "no url returned" }
-      }
-      if (msgCase === "canvasDestroyResult") {
-        // CanvasDestroyResult { success: bool, stopped_server: bool }
-        const success = (execMsg.message.value as { success?: boolean }).success
-        return success
-          ? { status: "success" }
-          : { status: "error", message: "canvas destroy failed" }
-      }
       if (msgCase === "executeHookResult") {
         // ExecuteHookResult { response: ExecuteHookResponse }
         // 有 response 就表示成功
@@ -17505,25 +17503,6 @@ ${raw}
         if (statusEnum === 1) return `[${label}] accepted`
         if (statusEnum === 2) return `[${label}] not found`
         return `[${label}] status=${statusEnum ?? "unspecified"}`
-      }
-
-      // CanvasGetUrlResult: { url?: string }
-      if (msgCase === "canvasGetUrlResult") {
-        const url = (execMsg.message.value as { url?: string }).url
-        return url
-          ? `[canvasGetUrl] url=${url}`
-          : "[canvasGetUrl] no url returned"
-      }
-
-      // CanvasDestroyResult: { success: bool, stopped_server: bool }
-      if (msgCase === "canvasDestroyResult") {
-        const payload = execMsg.message.value as {
-          success?: boolean
-          stoppedServer?: boolean
-        }
-        return payload.success
-          ? `[canvasDestroy] success (stoppedServer=${payload.stoppedServer ?? false})`
-          : "[canvasDestroy] failed"
       }
 
       // ExecuteHookResult: { response: ExecuteHookResponse }

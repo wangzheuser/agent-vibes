@@ -50,6 +50,7 @@ const SKIP_PACKAGES = new Set(["google.protobuf", "google.protobuf.compiler"])
 // 无法从 schema 解引用回真实包/类型名的混淆残留类型。
 // 这类类型会被收敛为当前 package 内的占位类型，避免生成不可编译的 import。
 let opaquePlaceholderTypes = new Map()
+let knownSchemaTypes = new Set()
 
 // Google 类型 → 文件映射
 const GOOGLE_TYPE_TO_FILE = {
@@ -62,6 +63,7 @@ const GOOGLE_TYPE_TO_FILE = {
   "google.protobuf.NullValue": "google/protobuf/value.proto",
   "google.protobuf.Any": "google/protobuf/any.proto",
   "google.protobuf.FieldMask": "google/protobuf/field_mask.proto",
+  "google.protobuf.Mixin": "google/protobuf/api.proto",
   "google.protobuf.FileDescriptorProto": "google/protobuf/descriptor.proto",
   "google.protobuf.DescriptorProto": "google/protobuf/descriptor.proto",
 }
@@ -75,6 +77,7 @@ const GOOGLE_STUBS = {
   "google/protobuf/struct.proto": `syntax = "proto3";\npackage google.protobuf;\nimport "google/protobuf/value.proto";\n// Struct is defined in value.proto to avoid circular import\n`,
   "google/protobuf/any.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage Any {\n  string type_url = 1;\n  bytes value = 2;\n}\n`,
   "google/protobuf/field_mask.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage FieldMask {\n  repeated string paths = 1;\n}\n`,
+  "google/protobuf/api.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage Mixin {\n  string name = 1;\n  string root = 2;\n}\n`,
   "google/protobuf/descriptor.proto": `syntax = "proto3";\npackage google.protobuf;\nmessage FileDescriptorProto {\n  string name = 1;\n  string package = 2;\n  repeated string dependency = 3;\n  repeated int32 public_dependency = 10;\n  repeated int32 weak_dependency = 11;\n  string syntax = 12;\n  string edition = 14;\n}\nmessage DescriptorProto {\n  string name = 1;\n}\n`,
 }
 
@@ -125,6 +128,39 @@ function ensureOpaquePlaceholder(pkg, typeName) {
   if (!opaquePlaceholderTypes.has(pkg))
     opaquePlaceholderTypes.set(pkg, new Set())
   opaquePlaceholderTypes.get(pkg).add(typeName)
+}
+
+function collectOpaquePlaceholdersForPackage(pkg, data, schema) {
+  const scanField = (field) => {
+    resolveFieldType(field, pkg)
+  }
+
+  for (const def of Object.values(data.messages)) {
+    if (!def.fields) continue
+    for (const field of def.fields) scanField(field)
+  }
+
+  const phSet = placeholderTypes.get(pkg)
+  if (phSet) {
+    for (const phTypeName of phSet) {
+      const def = schema.messages[phTypeName]
+      if (!def || !def.fields) continue
+      for (const field of def.fields) scanField(field)
+    }
+  }
+
+  for (const svc of Object.values(data.services || {})) {
+    for (const method of svc.methods) {
+      shortenRef(method.inputType, pkg)
+      shortenRef(method.outputType, pkg)
+    }
+  }
+}
+
+function isMissingCurrentPackageType(typeName, currentPkg) {
+  if (!typeName || typeName.startsWith("google.")) return false
+  const refPkg = getPackage(typeName)
+  return refPkg === currentPkg && !knownSchemaTypes.has(typeName)
 }
 
 // T 值 → proto 标量类型
@@ -198,6 +234,11 @@ function toPlaceholderName(fullTypeName) {
 function shortenRef(typeName, currentPkg) {
   if (SCALAR_TYPES.has(typeName)) return typeName
   if (typeName.startsWith("map<")) return typeName
+
+  if (isMissingCurrentPackageType(typeName, currentPkg)) {
+    ensureOpaquePlaceholder(currentPkg, typeName)
+    return toPlaceholderName(typeName)
+  }
 
   if (isOpaqueTypeName(typeName)) {
     ensureOpaquePlaceholder(currentPkg, typeName)
@@ -441,6 +482,10 @@ function detectAndBreakCycles(pkgData, schema) {
 function main() {
   console.log("读取 schema...")
   const schema = JSON.parse(fs.readFileSync(INPUT, "utf-8"))
+  knownSchemaTypes = new Set([
+    ...Object.keys(schema.messages || {}),
+    ...Object.keys(schema.enums || {}),
+  ])
 
   // 1. 按 package 分组
   console.log("\n按 package 分组...")
@@ -622,6 +667,8 @@ function collectUsedGoogleFiles(pkgList, pkgData, importGraph) {
 // ============================================================
 
 function generatePackageProto(pkg, data, schema, imports) {
+  collectOpaquePlaceholdersForPackage(pkg, data, schema)
+
   const lines = []
 
   lines.push('syntax = "proto3";')
@@ -758,13 +805,14 @@ function writeEnum(lines, name, def, indent) {
   lines.push(`${pad}}`)
 }
 
-// PH enum：值名加 PH_ 前缀避免 proto3 同 scope 冲突
+// PH enum：值名加 enum 前缀，避免 proto3/C++ scope 下跨 enum value 冲突
 function writePHEnum(lines, name, def, indent) {
   const pad = "  ".repeat(indent)
+  const valuePrefix = name.replace(/[^A-Za-z0-9_]/g, "_").toUpperCase()
   lines.push(`${pad}enum ${name} {`)
   if (def.values) {
     for (const v of def.values) {
-      lines.push(`${pad}  PH_${v.name} = ${v.number};`)
+      lines.push(`${pad}  ${valuePrefix}_${v.name} = ${v.number};`)
     }
   }
   lines.push(`${pad}}`)

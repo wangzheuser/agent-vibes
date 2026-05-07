@@ -6,10 +6,7 @@ import type { KvServerMessage as KvStorageMessage } from "./kv-storage.service"
 import {
   AgentMode,
   AgentServerMessageSchema,
-  // New: Canvas / ForceBackground / McpState / SubagentAwait exec schemas
-  CanvasDestroyArgsSchema,
-  CanvasGetUrlArgsSchema,
-  CanvasRegisterArgsSchema,
+  // New: ForceBackground / McpState / SubagentAwait exec schemas
   // CommunicateUpdate 完整工具链
   CommunicateUpdateArgsSchema,
   CommunicateUpdateErrorSchema,
@@ -3990,34 +3987,6 @@ export class CursorGrpcService {
             toolCallId: safeString(
               a.toolCallId ?? a.tool_call_id ?? toolCallId
             ),
-          }),
-        }
-      }
-      case "canvas_get_url": {
-        const a = args as Record<string, unknown>
-        return {
-          case: "canvasGetUrlArgs" as const,
-          value: create(CanvasGetUrlArgsSchema, {
-            canvasId: safeString(a.canvasId ?? a.canvas_id),
-            preview: Boolean(a.preview),
-          }),
-        }
-      }
-      case "canvas_destroy": {
-        const a = args as Record<string, unknown>
-        return {
-          case: "canvasDestroyArgs" as const,
-          value: create(CanvasDestroyArgsSchema, {
-            canvasId: safeString(a.canvasId ?? a.canvas_id),
-          }),
-        }
-      }
-      case "canvas_register": {
-        const a = args as Record<string, unknown>
-        return {
-          case: "canvasRegisterArgs" as const,
-          value: create(CanvasRegisterArgsSchema, {
-            path: safeString(a.path),
           }),
         }
       }

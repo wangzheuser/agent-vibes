@@ -2022,10 +2022,26 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   /**
    * Execute web search via Cloud Code API (through worker with auth)
    */
-  async webSearch(query: string): Promise<unknown> {
-    const worker = this.getNextWorker()
-    await this.primeWorkerBootstrap(worker)
-    return this.sendRequest(worker, "webSearch", { query })
+  async webSearch(
+    query: string,
+    excludedWorkerEmails?: ReadonlySet<string>
+  ): Promise<unknown> {
+    const worker = this.getNextWorker("gemini-2.5-flash", false, {
+      excludedWorkerEmails,
+      requireGenerationCapacity: true,
+    })
+    this.bindWorkerToContext(worker)
+    worker.requestCount++
+    worker.activeGenerationRequests++
+    try {
+      await this.primeWorkerBootstrap(worker)
+      return await this.sendRequest(worker, "webSearch", { query })
+    } finally {
+      worker.activeGenerationRequests = Math.max(
+        0,
+        worker.activeGenerationRequests - 1
+      )
+    }
   }
 
   async recordCodeAssistMetrics(

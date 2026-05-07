@@ -34,6 +34,8 @@ import {
 } from "./process-pool.service"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
 
+const GOOGLE_WEB_SEARCH_MODEL = "gemini-2.5-flash"
+
 /**
  * Adapt the official Antigravity system prompt for the Cursor IDE environment.
  *
@@ -428,6 +430,14 @@ export class GoogleService implements ProviderAdapter {
     waitMs: number
   ): string {
     return `All Cloud Code workers are temporarily unavailable for ${model}. Retry after ${Math.ceil(waitMs / 1000)}s.`
+  }
+
+  private buildCloudCodeWebSearchRateLimitMessage(waitMs: number): string {
+    return [
+      `All Cloud Code web_search accounts are rate-limited. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+      "Note: web_search uses Google Cloud Code generateContent with Google Search grounding, not the GPT/OpenAI native search quota surface.",
+      this.describeCloudCodeAccountStatuses(GOOGLE_WEB_SEARCH_MODEL),
+    ].join("\n")
   }
 
   private markCurrentWorkerAttempted(
@@ -905,7 +915,9 @@ export class GoogleService implements ProviderAdapter {
   private isQuotaExhausted(errMsg: string): boolean {
     return (
       errMsg.includes("QUOTA_EXHAUSTED") ||
-      errMsg.includes("exhausted your capacity")
+      errMsg.includes("RESOURCE_EXHAUSTED") ||
+      errMsg.includes("exhausted your capacity") ||
+      errMsg.includes("Resource has been exhausted")
     )
   }
 
@@ -1909,21 +1921,93 @@ export class GoogleService implements ProviderAdapter {
       throw new Error("Google Cloud Code API not configured for web_search")
     }
 
-    try {
-      const data = (await this.processPool.webSearch(
-        normalizedQuery
-      )) as Record<string, unknown>
-      const responseData = this.unwrapCloudCodeResponse(data)
-      const text = this.extractGenerateContentText(responseData)
-      const references = this.extractGenerateContentReferences(responseData)
-      return {
-        text: this.withWebSearchSources(text, references),
-        references,
+    const maxWorkerAttempts = Math.max(
+      this.processPool.workerCount,
+      this.MAX_RETRIES
+    )
+    const excludedWorkerEmails = new Set<string>()
+    let lastError: Error | null = null
+
+    for (let attempt = 0; attempt < maxWorkerAttempts; attempt++) {
+      try {
+        const data = (await this.processPool.webSearch(
+          normalizedQuery,
+          excludedWorkerEmails
+        )) as Record<string, unknown>
+        this.processPool.markSuccessForModel(GOOGLE_WEB_SEARCH_MODEL)
+        const responseData = this.unwrapCloudCodeResponse(data)
+        const text = this.extractGenerateContentText(responseData)
+        const references = this.extractGenerateContentReferences(responseData)
+        return {
+          text: this.withWebSearchSources(text, references),
+          references,
+        }
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error)
+        if (error instanceof WorkerPoolCooldownError) {
+          const waitMs = this.processPool.getMinCooldownMsForModel(
+            GOOGLE_WEB_SEARCH_MODEL
+          )
+          throw new Error(
+            this.buildCloudCodeWebSearchRateLimitMessage(
+              Math.max(waitMs, error.waitMs)
+            )
+          )
+        }
+
+        if (errMsg.includes("429")) {
+          this.recordGoogleAccountError(
+            this.processPool.getLastWorkerEmail(),
+            GOOGLE_WEB_SEARCH_MODEL,
+            429
+          )
+          const retryDelayMs = this.parseRetryDelayMs(errMsg)
+          const exhausted = this.isQuotaExhausted(errMsg)
+          const failedWorkerEmail =
+            this.markCurrentWorkerAttempted(excludedWorkerEmails)
+          const cooldownMs = exhausted
+            ? this.resolveQuotaExhaustedCooldownMs(
+                GOOGLE_WEB_SEARCH_MODEL,
+                errMsg,
+                failedWorkerEmail
+              )
+            : Math.min(retryDelayMs ?? 60_000, this.MAX_429_WAIT_MS)
+
+          this.processPool.setModelCooldownForLastWorker(
+            GOOGLE_WEB_SEARCH_MODEL,
+            cooldownMs,
+            exhausted ? "quota_exhausted" : "rate_limited"
+          )
+
+          if (
+            this.processPool.hasAvailableWorkerForModel(
+              GOOGLE_WEB_SEARCH_MODEL,
+              {
+                excludedWorkerEmails,
+                requireGenerationCapacity: true,
+              }
+            )
+          ) {
+            this.logger.warn(
+              `[pool-rotate] web_search rate limited${exhausted ? " (quota exhausted)" : ""} [${this.processPool.getLastWorkerEmail()}], rotating to next available worker`
+            )
+            lastError = error instanceof Error ? error : new Error(errMsg)
+            continue
+          }
+
+          throw new Error(
+            this.buildCloudCodeWebSearchRateLimitMessage(cooldownMs)
+          )
+        }
+
+        lastError = error instanceof Error ? error : new Error(errMsg)
+        break
       }
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error)
-      throw new Error(`web_search failed: ${errMsg}`)
     }
+
+    throw new Error(
+      `web_search failed: ${lastError?.message || "request failed"}`
+    )
   }
 
   /**

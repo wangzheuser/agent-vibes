@@ -175,7 +175,7 @@ Follow these steps in order:
 For the Cursor client side, a free account is enough. No paid Cursor plan is required.
 
 One-click download + install from [GitHub Releases](https://github.com/funny-vibes/agent-vibes/releases):
-Compatible Cursor version: `3.1.14`.
+Compatible Cursor version: `3.2.21`.
 
 #### macOS Apple Silicon
 

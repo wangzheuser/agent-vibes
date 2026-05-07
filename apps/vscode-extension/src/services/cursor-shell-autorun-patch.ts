@@ -2,8 +2,18 @@ import * as fs from "fs"
 import { CursorPatchBaselineService } from "./cursor-patch-baseline"
 import { getCursorWorkbenchPath } from "../utils/platform"
 
-const ORIGINAL_SNIPPET = "O=s===void 0?!1:s,U=h===void 0?200:h,"
-const PATCHED_SNIPPET = "O=s===void 0?!0:s,U=h===void 0?200:h,"
+const PATCH_TARGETS = [
+  {
+    original: "O=s===void 0?!1:s,U=h===void 0?200:h,",
+    patched: "O=s===void 0?!0:s,U=h===void 0?200:h,",
+  },
+  {
+    original:
+      "defaultExpanded:s,callId:o,startedAtMs:a,approval:l,description:u,commandSummary:d,collapsedHeight:h,showBackgroundNudge:f,backgroundNudgeDelayMs:g,onSendToBackground:y,approvalKeybindingRunLabel:w,approvalKeybindingAllowlistLabel:C,shellBubbleId:x,running:A,onStopRunning:R,canOpenExternalTerminal:P,onOpenExternalTerminal:M,enableAllowlistToggleMenu:B}=n,O=r===void 0?!1:r,q=s===void 0?!1:s,W=h===void 0?200:h,",
+    patched:
+      "defaultExpanded:s,callId:o,startedAtMs:a,approval:l,description:u,commandSummary:d,collapsedHeight:h,showBackgroundNudge:f,backgroundNudgeDelayMs:g,onSendToBackground:y,approvalKeybindingRunLabel:w,approvalKeybindingAllowlistLabel:C,shellBubbleId:x,running:A,onStopRunning:R,canOpenExternalTerminal:P,onOpenExternalTerminal:M,enableAllowlistToggleMenu:B}=n,O=r===void 0?!1:r,q=s===void 0?!0:s,W=h===void 0?200:h,",
+  },
+] as const
 
 export interface CursorShellAutoRunPatchStatus {
   filePath: string | null
@@ -37,8 +47,12 @@ export class CursorShellAutoRunPatchService {
     }
 
     const content = fs.readFileSync(filePath, "utf-8")
-    status.isPatched = content.includes(PATCHED_SNIPPET)
-    status.canPatch = content.includes(ORIGINAL_SNIPPET) || status.isPatched
+    status.isPatched = PATCH_TARGETS.some(({ patched }) =>
+      content.includes(patched)
+    )
+    status.canPatch =
+      PATCH_TARGETS.some(({ original }) => content.includes(original)) ||
+      status.isPatched
 
     return status
   }
@@ -55,7 +69,7 @@ export class CursorShellAutoRunPatchService {
       }
 
       const content = fs.readFileSync(status.filePath, "utf-8")
-      if (content.includes(PATCHED_SNIPPET)) {
+      if (PATCH_TARGETS.some(({ patched }) => content.includes(patched))) {
         return {
           success: true,
           updated: false,
@@ -63,7 +77,10 @@ export class CursorShellAutoRunPatchService {
         }
       }
 
-      if (!content.includes(ORIGINAL_SNIPPET)) {
+      const target = PATCH_TARGETS.find(({ original }) =>
+        content.includes(original)
+      )
+      if (!target) {
         return {
           success: false,
           updated: false,
@@ -75,7 +92,7 @@ export class CursorShellAutoRunPatchService {
 
       fs.writeFileSync(
         status.filePath,
-        content.replace(ORIGINAL_SNIPPET, PATCHED_SNIPPET),
+        content.replace(target.original, target.patched),
         "utf-8"
       )
 

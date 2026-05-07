@@ -1411,7 +1411,10 @@ func getCloudCodeRetryDelayMS(response *http.Response, errorText string) (time.D
 }
 
 func isQuotaExhausted(errorText string) bool {
-	return strings.Contains(errorText, "QUOTA_EXHAUSTED") || strings.Contains(errorText, "exhausted your capacity")
+	return strings.Contains(errorText, "QUOTA_EXHAUSTED") ||
+		strings.Contains(errorText, "RESOURCE_EXHAUSTED") ||
+		strings.Contains(errorText, "exhausted your capacity") ||
+		strings.Contains(errorText, "Resource has been exhausted")
 }
 
 func isModelCapacityExhausted(errorText string) bool {
