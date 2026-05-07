@@ -6,6 +6,7 @@ import { FastifyReply, FastifyRequest } from "fastify"
 import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.service"
 import { CodexService } from "../../../llm/openai/codex.service"
 import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.service"
+import { parseModelRequest } from "../../../llm/shared/model-request"
 import { ModelRouterService } from "../../../llm/shared/model-router.service"
 import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
 import {
@@ -152,6 +153,54 @@ export class CursorAdapterController {
   private logModelNames(label: string, modelNames: string[]): void {
     this.logger.debug(
       `${label}: ${modelNames.length} model(s) -> ${modelNames.join(", ")}`
+    )
+  }
+
+  private scheduleCodexWarmupForCursorModel(
+    cursorModel: string | undefined,
+    reason: string
+  ): void {
+    const normalizedModel = cursorModel?.trim()
+    if (!normalizedModel) {
+      return
+    }
+
+    try {
+      const routableModel =
+        parseModelRequest(normalizedModel).baseModel || normalizedModel
+      const route = this.modelRouter.resolveModel(routableModel)
+      if (route.backend !== "codex") {
+        return
+      }
+
+      void this.codexService
+        .prewarmSessionConnection(
+          {
+            model: route.model,
+          },
+          { reason }
+        )
+        .catch((error) => {
+          this.logger.debug(
+            `Codex warmup failed for model=${normalizedModel} routed=${route.model}: ${error instanceof Error ? error.message : String(error)}`
+          )
+        })
+    } catch (error) {
+      this.logger.debug(
+        `Skipped Codex warmup for model=${normalizedModel}: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+
+  private schedulePreferredCodexWarmup(models: Array<{ name: string }>): void {
+    const preferredModel =
+      models.find((model) => model.name === "gpt-5.5")?.name ||
+      models.find((model) => model.name === "gpt-5.4")?.name ||
+      models.find((model) => model.name === "gpt-5")?.name ||
+      models[0]?.name
+    this.scheduleCodexWarmupForCursorModel(
+      preferredModel,
+      "agent-usable-models"
     )
   }
 
@@ -313,6 +362,7 @@ export class CursorAdapterController {
       "AgentService.GetUsableModels response",
       cursorModels.map((model) => model.name)
     )
+    this.schedulePreferredCodexWarmup(cursorModels)
     const response = create(GetUsableModelsResponseSchema, { models })
     res
       .status(200)
@@ -497,8 +547,8 @@ export class CursorAdapterController {
             startMessageParsed = true
             const request = startMessage.message.value
             const diffCount = request.gitDiff?.diffs.length ?? 0
-            // Default to the highest tier model (gpt-5.4) if Cursor doesn't specify one
-            const model = request.modelDetails?.modelName || "gpt-5.4"
+            // Default to the highest tier model if Cursor doesn't specify one
+            const model = request.modelDetails?.modelName || "gpt-5.5"
             this.logger.log(
               `BugBot review request: ${diffCount} file(s), model=${model}, deepReview=${request.deepReview ?? false}`
             )
@@ -649,7 +699,7 @@ export class CursorAdapterController {
     summary: string
     bugReports: ReturnType<typeof create<typeof BugReportsSchema>>
   }> {
-    const primaryModel = request.modelDetails?.modelName || "gpt-5.4"
+    const primaryModel = request.modelDetails?.modelName || "gpt-5.5"
     const diffText = this.buildUnifiedDiffFromGitDiff(
       request.gitDiff?.diffs || []
     )

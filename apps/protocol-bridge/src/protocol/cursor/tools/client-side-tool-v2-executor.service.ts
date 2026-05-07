@@ -86,8 +86,20 @@ export class ClientSideToolV2ExecutorService {
       resolvedRoot,
       requestedPaths
     )
-    const validTargets = resolvedTargets.filter((entry) => entry.kind === "ok")
-    const failedTargets = resolvedTargets.filter((entry) => entry.kind !== "ok")
+    const validTargets = resolvedTargets.filter(
+      (entry): entry is { kind: "ok"; absPath: string; relPath: string } =>
+        entry.kind === "ok"
+    )
+    const failedTargets = resolvedTargets.filter(
+      (
+        entry
+      ): entry is {
+        kind: "error"
+        absPath: string
+        relPath: string
+        error: string
+      } => entry.kind !== "ok"
+    )
 
     if (validTargets.length === 0) {
       const fileResults = failedTargets.map((entry) => ({

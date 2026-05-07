@@ -291,7 +291,7 @@ export class ConnectRPCHandler {
 
     // First, yield the initial request body
     const initialBody = req.body as Buffer
-    let pendingBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+    let pendingBuffer: Buffer = Buffer.alloc(0)
     const compressionEncoding = this.resolveRequestCompressionEncoding(req)
     this.logger.log(
       `>>> Initial body: ${initialBody ? initialBody.length : 0} bytes (encoding=${compressionEncoding})`

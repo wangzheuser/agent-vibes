@@ -1,4 +1,9 @@
-const BOOLEAN_KEYS = ["USE_HTTP2", "LOG_DEBUG", "ENFORCE_DOC_PROHIBITION"]
+const BOOLEAN_KEYS = [
+  "USE_HTTP2",
+  "LOG_DEBUG",
+  "ENFORCE_DOC_PROHIBITION",
+  "AGENT_VIBES_GOOGLE_STARTUP_UPSTREAM_CHECK",
+]
 
 const INTEGER_KEYS: Record<string, { min: number; max?: number }> = {
   PORT: { min: 1, max: 65535 },

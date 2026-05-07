@@ -294,7 +294,19 @@ export interface ChatSession {
     epoch: number
   }
   model: string
+  lastAssistantBackend?: BackendType
+  /** @deprecated previous_response_id 现在由 CodexService.turnSessions 管理 */
+  lastCodexResponseId?: string
+  /** @deprecated previous_response_id 现在由 CodexService.activeTurnContexts 管理 */
+  lastCodexRequestSignature?: string
+  /** @deprecated warmup payload 现在由 CodexService.warmupPayloadCache 管理 */
+  lastCodexWarmupPayload?: Record<string, unknown>
+  /** @deprecated previous_response_id 现在由 CodexService.activeTurnContexts 管理 */
+  pendingCodexResponseId?: string
+  /** @deprecated previous_response_id 现在由 CodexService.activeTurnContexts 管理 */
+  pendingCodexRequestSignature?: string
   thinkingLevel: number
+  thinkingDetailsRequested: boolean
   isAgentic: boolean
   supportedTools: string[]
   mcpToolDefs?: ParsedCursorRequest["mcpToolDefs"]
@@ -382,6 +394,7 @@ export interface PendingToolCall {
   toolInput: Record<string, unknown>
   historyToolName?: string
   historyToolInput?: Record<string, unknown>
+  codexToolCallType?: "function" | "custom"
   toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
@@ -522,6 +535,7 @@ interface PersistedPendingToolCall {
   toolInput: Record<string, unknown>
   historyToolName?: string
   historyToolInput?: Record<string, unknown>
+  codexToolCallType?: "function" | "custom"
   toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
@@ -624,7 +638,7 @@ interface PersistedTopLevelAgentTurnState {
 }
 
 interface PersistedChatSessionV1 {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10
   conversationId: string
   messages: SessionMessage[]
   messageRecords?: ContextTranscriptRecord[]
@@ -634,7 +648,11 @@ interface PersistedChatSessionV1 {
   lastEmittedContextSummaryCompactionEpoch?: number
   lastContextSummaryCompactionEpoch?: number
   model: string
+  lastAssistantBackend?: BackendType
+  lastCodexResponseId?: string
+  lastCodexRequestSignature?: string
   thinkingLevel: number
+  thinkingDetailsRequested?: boolean
   isAgentic: boolean
   supportedTools: string[]
   mcpToolDefs?: ParsedCursorRequest["mcpToolDefs"]
@@ -696,6 +714,16 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
   private cleanupInterval!: ReturnType<typeof setInterval>
   private persistFlushInterval!: ReturnType<typeof setInterval>
 
+  /**
+   * Optional cleanup callback fired when a session is removed.
+   * The orchestration layer registers this to call ProviderAdapter.dispose(),
+   * releasing provider-specific resources (e.g., Codex WebSocket connections).
+   */
+  private onSessionCleanupHandler?: (
+    conversationId: string,
+    session: ChatSession
+  ) => void
+
   constructor(private readonly persistence: PersistenceService) {}
 
   onModuleInit(): void {
@@ -711,6 +739,17 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     )
     this.cleanupInterval.unref?.()
     this.persistFlushInterval.unref?.()
+  }
+
+  /**
+   * Register a callback to be invoked when a session is removed (expired or deleted).
+   * Used by the orchestration layer to release provider-specific resources
+   * (e.g., ProviderAdapter.dispose() for Codex WebSocket connections).
+   */
+  registerSessionCleanupHandler(
+    handler: (conversationId: string, session: ChatSession) => void
+  ): void {
+    this.onSessionCleanupHandler = handler
   }
 
   onModuleDestroy(): void {
@@ -1115,7 +1154,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
     return {
-      version: 8,
+      version: 10,
       conversationId: session.conversationId,
       messages: session.messages,
       messageRecords: session.messageRecords,
@@ -1184,7 +1223,11 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         session.pendingContextSummaryUiUpdate?.epoch ??
         session.contextState.compactionEpoch,
       model: session.model,
+      lastAssistantBackend: session.lastAssistantBackend,
+      lastCodexResponseId: session.lastCodexResponseId,
+      lastCodexRequestSignature: session.lastCodexRequestSignature,
       thinkingLevel: session.thinkingLevel,
+      thinkingDetailsRequested: session.thinkingDetailsRequested,
       isAgentic: session.isAgentic,
       supportedTools: session.supportedTools,
       mcpToolDefs: session.mcpToolDefs,
@@ -1199,6 +1242,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           toolInput: toolCall.toolInput,
           historyToolName: toolCall.historyToolName,
           historyToolInput: toolCall.historyToolInput,
+          codexToolCallType: toolCall.codexToolCallType,
           toolFamilyHint: toolCall.toolFamilyHint,
           modelCallId: toolCall.modelCallId,
           startedEmitted: toolCall.startedEmitted,
@@ -1959,6 +2003,13 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         }
       : this.createEmptyTopLevelAgentTurnState()
 
+    // Codex response chains are bound to slot assignments within a single
+    // bridge process lifetime. After a restart, slots may be reassigned and
+    // server-side response caches expire, so restoring these fields would
+    // cause continuation requests to fail with 400 "Previous response not found".
+    const restoredLastCodexRequestSignature: string | undefined = undefined
+    const restoredLastCodexResponseId: string | undefined = undefined
+
     return {
       conversationId: persisted.conversationId,
       messages: this.syncMessagesFromRecords(messageRecords),
@@ -1981,10 +2032,19 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       // should be handled by repairInterruptedToolProtocol() with proper
       // restart recovery context, not by generic synthetic tool_result injection.
       model: persisted.model || "claude-sonnet-4.5",
+      lastAssistantBackend:
+        typeof persisted.lastAssistantBackend === "string"
+          ? persisted.lastAssistantBackend
+          : undefined,
+      lastCodexResponseId: restoredLastCodexResponseId,
+      lastCodexRequestSignature: restoredLastCodexRequestSignature,
+      pendingCodexResponseId: undefined,
+      pendingCodexRequestSignature: undefined,
       thinkingLevel:
         typeof persisted.thinkingLevel === "number"
           ? persisted.thinkingLevel
           : 0,
+      thinkingDetailsRequested: persisted.thinkingDetailsRequested === true,
       isAgentic: persisted.isAgentic === true,
       supportedTools: Array.isArray(persisted.supportedTools)
         ? persisted.supportedTools
@@ -2191,7 +2251,14 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       lastEmittedContextSummaryCompactionEpoch: undefined,
       pendingContextSummaryUiUpdate: undefined,
       model: initialRequest?.model || "claude-sonnet-4.5",
+      lastAssistantBackend: undefined,
+      lastCodexResponseId: undefined,
+      lastCodexRequestSignature: undefined,
+      pendingCodexResponseId: undefined,
+      pendingCodexRequestSignature: undefined,
       thinkingLevel: initialRequest?.thinkingLevel || 0,
+      thinkingDetailsRequested:
+        initialRequest?.thinkingDetailsRequested === true,
       isAgentic: initialRequest?.isAgentic || false,
       supportedTools: initialRequest?.supportedTools || [],
       mcpToolDefs: initialRequest?.mcpToolDefs,
@@ -2249,6 +2316,32 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     return true
   }
 
+  markAssistantBackend(
+    conversationId: string,
+    backend: BackendType,
+    _codexResponseId?: string
+  ): void {
+    const session = this.getSession(conversationId)
+    if (!session) return
+
+    session.lastActivityAt = new Date()
+    session.lastAssistantBackend = backend
+    // previous_response_id 相关字段已废弃，由 CodexService.turnSessions 管理
+
+    this.schedulePersist(conversationId)
+  }
+
+  // ── 以下方法已废弃并删除 ──────────────────────────────────────────────
+  // cacheCodexWarmupPayload()        → 移入 CodexService.warmupPayloadCache
+  // getCachedCodexWarmupPayload()    → 移入 CodexService.warmupPayloadCache
+  // stagePendingCodexRequestSignature()
+  // commitPendingCodexResponse()
+  // discardPendingCodexResponse()
+  //
+  // previous_response_id 的完整生命周期现在由 CodexService.activeTurnContexts 管理。
+  // warmup payload 的缓存现在由 CodexService.warmupPayloadCache 管理。
+  // 对标官方 Codex CLI 的 ModelClientSession.WebsocketSession 设计。
+
   /**
    * Create or get existing session
    */
@@ -2274,6 +2367,10 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       }
       if (initialRequest?.thinkingLevel !== undefined) {
         session.thinkingLevel = initialRequest.thinkingLevel
+      }
+      if (initialRequest?.thinkingDetailsRequested !== undefined) {
+        session.thinkingDetailsRequested =
+          initialRequest.thinkingDetailsRequested === true
       }
       if (initialRequest?.supportedTools) {
         session.supportedTools = initialRequest.supportedTools
@@ -2934,7 +3031,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     toolFamilyHint?: "mcp" | "web_fetch",
     modelCallId: string = "",
     historyToolName?: string,
-    historyToolInput?: Record<string, unknown>
+    historyToolInput?: Record<string, unknown>,
+    codexToolCallType?: "function" | "custom"
   ): Promise<void> {
     const session = this.getSession(conversationId)
     if (session) {
@@ -2968,6 +3066,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         toolInput,
         historyToolName,
         historyToolInput,
+        codexToolCallType,
         toolFamilyHint,
         modelCallId,
         startedEmitted: false,
@@ -3380,6 +3479,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     const session = this.sessions.get(conversationId)
     if (session) {
       session.pendingInteractionQueries.clear()
+      this.onSessionCleanupHandler?.(conversationId, session)
     }
     this.clearScheduledPersist(conversationId)
     this.sessions.delete(conversationId)
@@ -3410,6 +3510,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       }
 
       this.clearScheduledPersist(conversationId)
+      this.onSessionCleanupHandler?.(conversationId, session)
       this.sessions.delete(conversationId)
       cleanedCount++
     }

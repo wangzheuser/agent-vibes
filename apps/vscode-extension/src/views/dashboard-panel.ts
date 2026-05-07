@@ -8,11 +8,15 @@ import { CMD, CURSOR_DOMAINS } from "../constants"
 import { BridgeManager } from "../services/bridge-manager"
 import { startCodexOAuthFlow } from "../services/codex-oauth-service"
 import { ConfigManager } from "../services/config-manager"
+import { CursorChecksumsService } from "../services/cursor-checksums"
+import { CursorPatchManagerService } from "../services/cursor-patch-manager"
+import { CursorShellAutoRunPatchService } from "../services/cursor-shell-autorun-patch"
 import { NetworkManager } from "../services/network-manager"
 import { startOAuthFlow } from "../services/oauth-service"
 import { detectCurrentAntigravityVersion } from "../utils/antigravity-version"
 import { detectCurrentCursorVersion } from "../utils/cursor-version"
 import { logger } from "../utils/logger"
+import { getCursorProductMetadata } from "../utils/platform"
 
 type AccountChannel = "antigravity" | "claude-api" | "codex" | "openai-compat"
 
@@ -71,6 +75,10 @@ export class DashboardPanel {
 
   private accountFileWatchers: vscode.FileSystemWatcher[] = []
   private accountFileDebounceTimer: ReturnType<typeof setTimeout> | null = null
+  private readonly cursorPatchManager = new CursorPatchManagerService()
+  private readonly cursorChecksums = new CursorChecksumsService()
+  private readonly cursorShellAutoRunPatch =
+    new CursorShellAutoRunPatchService()
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -208,25 +216,31 @@ export class DashboardPanel {
       case "runCommand":
         if (msg.command) {
           const fwdBefore = this.network.isForwardingActive()
-          await vscode.commands.executeCommand(msg.command)
-          // Immediate refresh
-          setTimeout(() => this.sendAllData(), 1000)
-          // For forwarding commands that run async in terminal (sudo),
-          // poll until the state actually changes or timeout after 30s.
-          if (
-            msg.command.includes("Forwarding") ||
-            msg.command.includes("forwarding")
-          ) {
-            let polls = 0
-            const maxPolls = 15
-            const pollInterval = setInterval(() => {
-              polls++
-              const fwdNow = this.network.isForwardingActive()
-              this.sendAllData()
-              if (fwdNow !== fwdBefore || polls >= maxPolls) {
-                clearInterval(pollInterval)
-              }
-            }, 2000)
+          const commandPromise = vscode.commands.executeCommand(msg.command)
+          // Push the changed state quickly so toggles/buttons can reflect
+          // the command result before any follow-up notification is dismissed.
+          setTimeout(() => this.sendAllData(), 50)
+          try {
+            await commandPromise
+          } finally {
+            setTimeout(() => this.sendAllData(), 1000)
+            // For forwarding commands that run async in terminal (sudo),
+            // poll until the state actually changes or timeout after 30s.
+            if (
+              msg.command.includes("Forwarding") ||
+              msg.command.includes("forwarding")
+            ) {
+              let polls = 0
+              const maxPolls = 15
+              const pollInterval = setInterval(() => {
+                polls++
+                const fwdNow = this.network.isForwardingActive()
+                this.sendAllData()
+                if (fwdNow !== fwdBefore || polls >= maxPolls) {
+                  clearInterval(pollInterval)
+                }
+              }, 2000)
+            }
           }
         }
         break
@@ -789,6 +803,46 @@ export class DashboardPanel {
    * Send all dashboard data to the webview.
    */
   private sendAllData(): void {
+    const resetPatchState = this.cursorPatchManager.getResetState()
+    const cursorBuildInfo = getCursorProductMetadata()
+    const forwardingActive = this.network.isForwardingActive()
+    const cursorBuildValue = cursorBuildInfo
+      ? [
+          cursorBuildInfo.version,
+          cursorBuildInfo.commit ? cursorBuildInfo.commit.slice(0, 12) : null,
+          cursorBuildInfo.date
+            ? new Date(cursorBuildInfo.date).toISOString().slice(0, 10)
+            : null,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join(" • ")
+      : "Unknown"
+    const shellAutoRunPatchStatus = this.cursorShellAutoRunPatch.getStatus()
+    const shellPatchStatusDesc = !shellAutoRunPatchStatus.fileExists
+      ? "Cursor workbench file was not found in a supported install location."
+      : shellAutoRunPatchStatus.isPatched
+        ? shellAutoRunPatchStatus.hasBaseline
+          ? "Shell auto-run command cards default to expanded mode."
+          : "Shell auto-run command cards are already patched, but Agent Vibes has no captured original baseline for this file."
+        : shellAutoRunPatchStatus.canPatch
+          ? "Forces shell auto-run command cards to default to expanded mode until Cursor fixes the regression upstream."
+          : "This Cursor build does not match the known shell auto-run patch target."
+
+    const cursorChecksumsStatus = this.cursorChecksums.getStatus()
+    const checksumToggleValue =
+      cursorChecksumsStatus.differsFromBaseline === true ||
+      (shellAutoRunPatchStatus.isPatched && cursorChecksumsStatus.allMatched)
+    const checksumStatusDesc = !cursorChecksumsStatus.productExists
+      ? "Cursor product.json was not found in a supported install location."
+      : cursorChecksumsStatus.differsFromBaseline === true
+        ? "Core file checksums were updated from the original product.json backup. Agent Vibes does this automatically whenever it applies a core patch."
+        : shellAutoRunPatchStatus.isPatched && cursorChecksumsStatus.allMatched
+          ? cursorChecksumsStatus.hasBaseline
+            ? "Core file checksums already match the patched shell workbench file. Agent Vibes keeps this aligned automatically when it applies a core patch."
+            : "Core file checksums already match the patched shell workbench file, but Agent Vibes has no captured original baseline for product.json."
+          : cursorChecksumsStatus.allMatched
+            ? "Core file checksums already match product.json."
+            : `${cursorChecksumsStatus.mismatchCount} core file checksum(s) differ from product.json. This usually only needs manual repair after out-of-band core file changes.`
     const channelAccountsData = {
       codex: this.getChannelData("codex"),
       "openai-compat": this.getChannelData("openai-compat"),
@@ -807,7 +861,8 @@ export class DashboardPanel {
     const statusData = {
       bridge: this.bridge.state === "running" ? "Running" : this.bridge.state,
       port: this.config.port,
-      forwarding: this.network.isForwardingActive(),
+      forwarding: forwardingActive,
+      routingActive: forwardingActive,
       hasCertificates: this.config.hasCertificates(),
       totalAccounts,
       defaultProxyUrl: this.getDefaultProxyUrl(),
@@ -869,7 +924,7 @@ export class DashboardPanel {
           {
             id: "antigravity",
             label: "Antigravity",
-            desc: "Antigravity (Google Cloud Code) backend settings.",
+            desc: "Antigravity (Google Cloud Code) backend settings. Changing these defaults away from the upstream behavior may increase account suspension risk.",
             items: [
               {
                 label: "System Prompt",
@@ -953,6 +1008,58 @@ export class DashboardPanel {
                     .getConfiguration("agentVibes")
                     .get<string>("claudeApiAccountsPath") || "",
                 placeholder: this.config.claudeApiAccountsPath,
+              },
+            ],
+          },
+          {
+            id: "patch",
+            label: "Patch",
+            desc: "Local Cursor repair, redirect, and checksum tools.",
+            items: [
+              {
+                label: "Cursor App Root",
+                desc: "Detected Cursor installation used for local patch operations.",
+                value: cursorChecksumsStatus.appRootPath || "Not found",
+              },
+              {
+                label: "Cursor Build",
+                desc: "Detected Cursor build identity used to scope patch baselines across upgrades.",
+                value: cursorBuildValue,
+              },
+              {
+                label: "Reset All Patches",
+                desc: "One-click restore back to the captured original Cursor baseline.",
+                type: "actions",
+                hint: resetPatchState.hint,
+                actions: [
+                  {
+                    label: "Reset All",
+                    command: CMD.RESET_CURSOR_PATCHES,
+                    tone: "secondary",
+                    disabled: !resetPatchState.canReset,
+                  },
+                ],
+              },
+              {
+                label: "Fix Checksums Next",
+                desc: "Ported from the Fix VSCode Checksums Next extension. Agent Vibes keeps this aligned automatically whenever it applies a core patch.",
+                value: checksumToggleValue ? "On" : "Off",
+                hint: checksumStatusDesc,
+              },
+              {
+                label: "Shell Auto-Run Expanded",
+                desc: "Fixes the Cursor regression where shell command preview cards still default to collapsed even when collapse is disabled.",
+                type: "commandToggle",
+                value: shellAutoRunPatchStatus.isPatched,
+                onCommand: CMD.APPLY_CURSOR_SHELL_AUTORUN_PATCH,
+                offCommand: CMD.RESTORE_CURSOR_SHELL_AUTORUN_PATCH,
+                disabled:
+                  !shellAutoRunPatchStatus.fileExists ||
+                  (!shellAutoRunPatchStatus.isPatched &&
+                    !shellAutoRunPatchStatus.canPatch) ||
+                  (shellAutoRunPatchStatus.isPatched &&
+                    !shellAutoRunPatchStatus.hasBaseline),
+                hint: shellPatchStatusDesc,
               },
             ],
           },

@@ -8,6 +8,7 @@ import {
   IsString,
   ValidateNested,
 } from "class-validator"
+import type { ThinkingIntent } from "../../../llm/shared/thinking-types"
 
 class MessageContentDto {
   @ApiProperty()
@@ -103,20 +104,6 @@ class OutputConfigDto {
   @IsOptional()
   effort?: string
 }
-
-export type ThinkingIntentEffort =
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max"
-
-export type ThinkingIntent =
-  | { mode: "disabled" }
-  | { mode: "adaptive"; effort?: ThinkingIntentEffort }
-  | { mode: "explicit_effort"; effort: ThinkingIntentEffort }
-  | { mode: "explicit_budget"; budgetTokens: number }
 
 export class CreateMessageDto {
   @ApiProperty({ example: "gemini-2.5-flash" })
@@ -266,6 +253,14 @@ export class CreateMessageDto {
    */
   @IsOptional()
   _thinkingIntent?: ThinkingIntent
+
+  /**
+   * Internal flag indicating whether the client explicitly asked to surface
+   * thinking details, not just enable deeper reasoning.
+   */
+  @IsOptional()
+  @IsBoolean()
+  _includeThinkingSummary?: boolean
 
   /**
    * Internal original model identifier before backend routing canonicalizes it.

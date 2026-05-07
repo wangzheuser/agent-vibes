@@ -1,6 +1,6 @@
 import * as path from "path"
 import * as vscode from "vscode"
-import { CMD } from "../constants"
+import { CMD, STATE } from "../constants"
 import { AccountSyncService } from "../services/account-sync"
 import {
   importCodexCpaJsonDirectory,
@@ -9,12 +9,15 @@ import {
 } from "../services/backend-account-sync"
 import { BridgeManager } from "../services/bridge-manager"
 import { CertManager } from "../services/cert-manager"
+import { CursorChecksumsService } from "../services/cursor-checksums"
+import { CursorPatchManagerService } from "../services/cursor-patch-manager"
 import { CertTrustService } from "../services/cert-trust"
 import { ConfigManager } from "../services/config-manager"
 import { ExtensionUpdateService } from "../services/extension-update"
 import { NetworkManager } from "../services/network-manager"
 import { logger } from "../utils/logger"
 import { executePrivileged } from "../utils/terminal"
+import { getCursorInstallFingerprint } from "../utils/platform"
 import { DashboardPanel } from "../views/dashboard-panel"
 
 function pickFirstNonEmptyString(...values: unknown[]): string | undefined {
@@ -113,17 +116,29 @@ export function registerCommands(
   network: NetworkManager,
   updater: ExtensionUpdateService
 ): void {
-  const FORWARDING_RELOAD_PROMPTED_KEY = "agentVibes.forwardingReloadPrompted"
+  const cursorChecksums = new CursorChecksumsService()
+  const cursorPatchManager = new CursorPatchManagerService()
+
+  const setShellAutoRunPatchPreference = async (enabled: boolean) => {
+    await context.globalState.update(
+      STATE.CURSOR_SHELL_AUTORUN_PATCH_PREFERRED,
+      enabled
+    )
+    await context.globalState.update(
+      STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD,
+      enabled ? (getCursorInstallFingerprint() ?? undefined) : undefined
+    )
+  }
 
   const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
-    if (context.globalState.get<boolean>(FORWARDING_RELOAD_PROMPTED_KEY)) {
+    if (context.globalState.get<boolean>(STATE.FORWARDING_RELOAD_PROMPTED)) {
       return
     }
 
     const becameActive = await network.waitForForwardingActive()
     if (!becameActive) return
 
-    await context.globalState.update(FORWARDING_RELOAD_PROMPTED_KEY, true)
+    await context.globalState.update(STATE.FORWARDING_RELOAD_PROMPTED, true)
 
     const action = await vscode.window.showInformationMessage(
       "Forwarding is enabled. Fully restart Cursor to apply DNS/hosts changes.",
@@ -177,6 +192,131 @@ export function registerCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.RESTART_SERVER, async () => {
       await bridge.restart()
+    })
+  )
+
+  // ── Cursor patch helpers ─────────────────────────────────────────
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.APPLY_CURSOR_SHELL_AUTORUN_PATCH,
+      async () => {
+        const result = cursorPatchManager.applyShellAutoRunPatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || "Unknown error"
+          void vscode.window.showErrorMessage(
+            result.rolledBack
+              ? `Failed to apply shell auto-run patch, but the partial change was rolled back: ${detail}`
+              : `Failed to apply shell auto-run patch: ${detail}`
+          )
+          return
+        }
+
+        await setShellAutoRunPatchPreference(true)
+
+        const patchMessage = result.updated
+          ? "Applied shell auto-run expanded patch"
+          : "Shell auto-run expanded patch is already applied"
+        const checksumMessage =
+          result.checksumUpdated > 0
+            ? `updated ${result.checksumUpdated} Cursor checksum(s) automatically`
+            : "Cursor checksums already matched the current core files"
+        const action = await vscode.window.showInformationMessage(
+          `${patchMessage}; ${checksumMessage}. Fully restart Cursor to apply.`,
+          "Quit Cursor Now",
+          "Later"
+        )
+        if (action === "Quit Cursor Now") {
+          await vscode.commands.executeCommand("workbench.action.quit")
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.RESTORE_CURSOR_SHELL_AUTORUN_PATCH,
+      async () => {
+        const result = cursorPatchManager.restoreShellAutoRunPatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || "Unknown error"
+          void vscode.window.showErrorMessage(
+            `Failed to restore shell auto-run patch: ${detail}`
+          )
+          return
+        }
+
+        await setShellAutoRunPatchPreference(false)
+
+        const patchMessage = result.updated
+          ? "Restored the original shell auto-run behavior"
+          : "Shell auto-run patch was already off"
+        const checksumMessage =
+          result.checksumUpdated > 0
+            ? "restored the original Cursor checksum baseline automatically"
+            : "Cursor checksums were already at the original baseline"
+        const action = await vscode.window.showInformationMessage(
+          `${patchMessage}; ${checksumMessage}. Fully restart Cursor to apply.`,
+          "Quit Cursor Now",
+          "Later"
+        )
+        if (action === "Quit Cursor Now") {
+          await vscode.commands.executeCommand("workbench.action.quit")
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.APPLY_CURSOR_CHECKSUMS, async () => {
+      const result = cursorChecksums.apply()
+      if (!result.success) {
+        const detail = result.errors.join("; ") || "Unknown error"
+        void vscode.window.showErrorMessage(
+          `Failed to update Cursor checksums: ${detail}`
+        )
+        return
+      }
+
+      const message =
+        result.updated > 0
+          ? `Updated ${result.updated} Cursor checksum(s). Fully restart Cursor to apply.`
+          : "Cursor checksums already match the current core files."
+      const action = await vscode.window.showInformationMessage(
+        message,
+        "Quit Cursor Now",
+        "Later"
+      )
+      if (action === "Quit Cursor Now") {
+        await vscode.commands.executeCommand("workbench.action.quit")
+      }
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.RESET_CURSOR_PATCHES, async () => {
+      const result = cursorPatchManager.resetAllPatches()
+      if (!result.success) {
+        const detail = result.errors.join("; ") || "Unknown error"
+        void vscode.window.showErrorMessage(
+          `Failed to reset Cursor patches: ${detail}`
+        )
+        return
+      }
+
+      await setShellAutoRunPatchPreference(false)
+
+      const parts: string[] = []
+      parts.push(`Reset ${result.restored} Cursor file(s)`)
+
+      const action = await vscode.window.showInformationMessage(
+        `${parts.join(", ")}. Fully restart Cursor to apply.`,
+        "Quit Cursor Now",
+        "Later"
+      )
+      if (action === "Quit Cursor Now") {
+        await vscode.commands.executeCommand("workbench.action.quit")
+      }
     })
   )
 

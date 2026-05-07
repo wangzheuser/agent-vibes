@@ -1,12 +1,15 @@
 import * as vscode from "vscode"
 import { registerCommands } from "./commands"
-import { CMD, type ServerState } from "./constants"
+import { CMD, STATE, type ServerState } from "./constants"
 import { BridgeManager } from "./services/bridge-manager"
 import { CertManager } from "./services/cert-manager"
 import { ConfigManager } from "./services/config-manager"
+import { CursorPatchManagerService } from "./services/cursor-patch-manager"
+import { CursorShellAutoRunPatchService } from "./services/cursor-shell-autorun-patch"
 import { ExtensionUpdateService } from "./services/extension-update"
 import { NetworkManager } from "./services/network-manager"
 import { logger } from "./utils/logger"
+import { getCursorInstallFingerprint } from "./utils/platform"
 import { executePrivileged } from "./utils/terminal"
 import { StatusIndicator } from "./views/status-indicator"
 
@@ -33,6 +36,8 @@ export async function activate(
   network.setPort(config.port)
   const cert = new CertManager(config)
   const updater = new ExtensionUpdateService(context)
+  const cursorPatchManager = new CursorPatchManagerService()
+  const cursorShellAutoRunPatch = new CursorShellAutoRunPatchService()
 
   // Create UI
   statusIndicator = new StatusIndicator()
@@ -45,10 +50,124 @@ export async function activate(
   // Register all commands
   registerCommands(context, bridge, config, cert, network, updater)
 
+  const promptRestartAfterShellPatch = async (
+    message: string
+  ): Promise<void> => {
+    const action = await vscode.window.showInformationMessage(
+      message,
+      "Quit Cursor Now",
+      "Later"
+    )
+    if (action === "Quit Cursor Now") {
+      await vscode.commands.executeCommand("workbench.action.quit")
+    }
+  }
+
+  const currentCursorBuild = getCursorInstallFingerprint()
+  const storedShellPatchPreference = context.globalState.get<boolean>(
+    STATE.CURSOR_SHELL_AUTORUN_PATCH_PREFERRED
+  )
+  if (storedShellPatchPreference === undefined) {
+    const shellStatus = cursorShellAutoRunPatch.getStatus()
+    const inferredPreference = shellStatus.isPatched && shellStatus.hasBaseline
+    await context.globalState.update(
+      STATE.CURSOR_SHELL_AUTORUN_PATCH_PREFERRED,
+      inferredPreference
+    )
+    if (inferredPreference && currentCursorBuild) {
+      await context.globalState.update(
+        STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD,
+        currentCursorBuild
+      )
+    }
+  }
+
+  const ensurePreferredShellAutoRunPatch = async (): Promise<void> => {
+    const preferred =
+      context.globalState.get<boolean>(
+        STATE.CURSOR_SHELL_AUTORUN_PATCH_PREFERRED
+      ) ?? false
+    if (!preferred) return
+
+    const lastPatchedBuild = context.globalState.get<string>(
+      STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD
+    )
+    const buildChanged =
+      Boolean(currentCursorBuild) && currentCursorBuild !== lastPatchedBuild
+    const shellStatus = cursorShellAutoRunPatch.getStatus()
+
+    if (shellStatus.isPatched) {
+      if (currentCursorBuild && currentCursorBuild !== lastPatchedBuild) {
+        await context.globalState.update(
+          STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD,
+          currentCursorBuild ?? undefined
+        )
+      }
+      return
+    }
+
+    if (!shellStatus.fileExists) {
+      logger.warn(
+        "Skipping preferred shell auto-run patch because the Cursor workbench file was not found"
+      )
+      return
+    }
+
+    if (!shellStatus.canPatch) {
+      logger.warn(
+        "Skipping preferred shell auto-run patch because this Cursor build does not match the known patch target"
+      )
+      if (buildChanged) {
+        await context.globalState.update(
+          STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD,
+          currentCursorBuild ?? undefined
+        )
+        void vscode.window.showWarningMessage(
+          "Cursor updated, but Agent Vibes could not re-apply Shell Auto-Run Expanded because this build no longer matches the known patch target."
+        )
+      }
+      return
+    }
+
+    const result = cursorPatchManager.applyShellAutoRunPatch()
+    if (!result.success) {
+      logger.warn(
+        `Failed to auto-apply preferred shell auto-run patch: ${result.errors.join("; ") || "Unknown error"}`
+      )
+      if (buildChanged) {
+        await context.globalState.update(
+          STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD,
+          currentCursorBuild ?? undefined
+        )
+        void vscode.window.showWarningMessage(
+          `Cursor updated, but Agent Vibes failed to re-apply Shell Auto-Run Expanded automatically: ${result.errors.join("; ") || "Unknown error"}`
+        )
+      }
+      return
+    }
+
+    await context.globalState.update(
+      STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD,
+      currentCursorBuild ?? undefined
+    )
+
+    if (result.updated) {
+      logger.info("Automatically re-applied preferred shell auto-run patch")
+      await promptRestartAfterShellPatch(
+        result.checksumUpdated > 0
+          ? "Cursor updated and Agent Vibes automatically re-applied Shell Auto-Run Expanded. Fully restart Cursor once more to activate the patch."
+          : "Cursor updated and Agent Vibes confirmed Shell Auto-Run Expanded for this build. Fully restart Cursor once more to activate the patch."
+      )
+    }
+  }
+
+  await ensurePreferredShellAutoRunPatch()
+
   let currentPort = config.port
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (event) => {
-      if (!event.affectsConfiguration("agentVibes.port")) return
+      const portChanged = event.affectsConfiguration("agentVibes.port")
+      if (!portChanged) return
 
       const nextPort = config.port
       if (nextPort === currentPort) return
@@ -139,18 +258,16 @@ export async function activate(
     }
   }
 
-  const FORWARDING_RELOAD_PROMPTED_KEY = "agentVibes.forwardingReloadPrompted"
-
   const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
     if (!network) return
-    if (context.globalState.get<boolean>(FORWARDING_RELOAD_PROMPTED_KEY)) {
+    if (context.globalState.get<boolean>(STATE.FORWARDING_RELOAD_PROMPTED)) {
       return
     }
 
     const becameActive = await network.waitForForwardingActive()
     if (!becameActive) return
 
-    await context.globalState.update(FORWARDING_RELOAD_PROMPTED_KEY, true)
+    await context.globalState.update(STATE.FORWARDING_RELOAD_PROMPTED, true)
 
     const action = await vscode.window.showInformationMessage(
       "Forwarding is enabled. Fully restart Cursor to apply DNS/hosts changes.",

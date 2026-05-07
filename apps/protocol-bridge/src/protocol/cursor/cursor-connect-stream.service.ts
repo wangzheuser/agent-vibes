@@ -1,7 +1,15 @@
 import { fromBinary } from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
+import { spawnSync } from "child_process"
 import * as crypto from "crypto"
-import { closeSync, openSync, readFileSync, readSync, statSync } from "fs"
+import {
+  closeSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "fs"
 import * as path from "path"
 import {
   type ContextAttachmentSnapshot,
@@ -35,6 +43,7 @@ import {
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
 } from "../../llm/anthropic/anthropic-api.service"
 import { GoogleService } from "../../llm/google/google.service"
+import { type CodexExecutionRequest } from "../../llm/openai/codex-request-builder"
 import { CodexService } from "../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
 import { UpstreamRequestAbortedError } from "../../llm/shared/abort-signal"
@@ -87,6 +96,8 @@ import {
 } from "./tools/cursor-request-parser"
 import {
   buildToolsForApi,
+  getDefaultCodexImplicitAgentToolNames,
+  matchesImplicitDefaultAgentToolNames,
   resolveCursorToolDefinitionKey,
   type ToolDefinition,
 } from "./tools/cursor-tool-mapper"
@@ -128,12 +139,21 @@ interface SseDelta {
   signature?: string
 }
 
+interface CursorToolCapabilityOptionsForRoute {
+  webSearchEnabled?: boolean
+  webFetchEnabled?: boolean
+}
+
 /**
  * SSE Event data structure
  */
 interface SseEventData {
   content_block?: SseContentBlock
   delta?: SseDelta
+  message?: {
+    id?: string
+    [key: string]: unknown
+  }
   index?: number
   usage?: {
     input_tokens?: number
@@ -182,7 +202,7 @@ interface ToolUseContentItem {
 interface ToolResultContentItem {
   type: "tool_result"
   tool_use_id: string
-  content: string
+  content: string | Array<Record<string, unknown>>
   [key: string]: unknown
 }
 
@@ -263,9 +283,12 @@ type DeferredToolFamily =
   | "command_status"
   | "read_todos"
   | "update_todos"
+  | "update_plan"
   | "get_mcp_tools"
+  | "list_mcp_resource_templates"
   | "read_url_content"
   | "view_content_chunk"
+  | "view_image"
   | "fetch"
   | "record_screen"
   | "computer_use"
@@ -273,12 +296,19 @@ type DeferredToolFamily =
   | "start_grind_execution"
   | "start_grind_planning"
   | "ask_question"
+  | "request_user_input"
   | "create_plan"
   | "switch_mode"
   | "exa_search"
   | "exa_fetch"
   | "setup_vm_environment"
   | "task"
+  | "spawn_agent"
+  | "send_input"
+  | "resume_agent"
+  | "wait_agent"
+  | "close_agent"
+  | "apply_patch"
   | "apply_agent_diff"
   | "generate_image"
   | "report_bugfix_results"
@@ -297,16 +327,47 @@ type DeferredToolFamily =
   | "fix_lints"
   | "go_to_definition"
   | "await_task"
+  | "ai_attribution"
+  | "await"
+  | "mcp_auth"
   | "read_project"
   | "update_project"
+  // 新增 proto 更新后的 Exec 工具
+  | "force_background_shell"
+  | "force_background_subagent"
+  | "canvas_get_url"
+  | "canvas_destroy"
+  | "canvas_register"
+  | "mcp_state_exec"
+  | "subagent_await"
+  // 新增交互工具
+  | "communicate_update"
+  | "send_final_summary"
+  | "blame_by_file_path"
+  | "report_bug"
+  | "set_active_branch"
+  // ExecServerMessage 补齐
+  | "request_context"
+  | "redacted_read"
+  // InteractionQuery 补齐
+  | "pr_management"
 
 const DEFERRED_INTERACTION_QUERY_FAMILIES: ReadonlySet<DeferredToolFamily> =
   new Set<DeferredToolFamily>([
     "web_search",
     "web_fetch",
     "ask_question",
+    "request_user_input",
     "create_plan",
     "switch_mode",
+    "exa_search",
+    "exa_fetch",
+    "setup_vm_environment",
+    // 新增 proto 更新后的 InteractionQuery 工具
+    "generate_image",
+    "mcp_auth",
+    // InteractionQuery 补齐
+    "pr_management",
   ])
 
 const UNSUPPORTED_DEFERRED_TOOL_MESSAGES: Partial<
@@ -355,11 +416,8 @@ interface HandleToolResultOptions {
 
 interface BackendStreamOptions {
   buildDtoForRoute?: (route: ModelRouteResult) => CreateMessageDto
+  buildCodexRequestForRoute?: (route: ModelRouteResult) => CodexExecutionRequest
   abortSignal?: AbortSignal
-  initialRoute?: {
-    backend: BackendType
-    model: string
-  }
   streamAbortBinding?: {
     conversationId: string
     streamId: string
@@ -378,6 +436,7 @@ interface PreparedToolInvocation {
   input: Record<string, unknown>
   historyToolName: string
   historyToolInput: Record<string, unknown>
+  codexToolCallType: "function" | "custom"
   deferredToolFamily?: DeferredToolFamily
   execDispatchTarget?: ExecDispatchTarget
   dispatchErrorMessage?: string
@@ -448,6 +507,19 @@ interface LegacyWebDocument {
 interface ExecDispatchResolution {
   target?: ExecDispatchTarget
   errorMessage?: string
+}
+
+interface SyntheticCodexAgentState {
+  agentId: string
+  conversationId: string
+  status: "running" | "completed" | "closed"
+  createdAt: number
+  updatedAt: number
+  nickname?: string
+  agentType?: string
+  model?: string
+  message?: string
+  lastInput?: string
 }
 
 interface ToolCompletedExtraData {
@@ -581,6 +653,7 @@ interface JsonSchemaProperty {
 @Injectable()
 export class CursorConnectStreamService {
   private readonly logger = new Logger(CursorConnectStreamService.name)
+  private readonly codexInstallationId = crypto.randomUUID()
   private readonly backendStreamAbortRegistry = new BackendStreamAbortRegistry()
   private lastHeartbeatLog = 0
   private readonly HEARTBEAT_LOG_INTERVAL = 60000 // Log heartbeat once per minute
@@ -692,6 +765,10 @@ export class CursorConnectStreamService {
     string,
     Map<string, LegacyWebDocument>
   >()
+  private readonly syntheticCodexAgents = new Map<
+    string,
+    SyntheticCodexAgentState
+  >()
   private modelCallIdCounter = 0
 
   /**
@@ -719,7 +796,18 @@ export class CursorConnectStreamService {
     private readonly tokenCounter: TokenCounterService,
     private readonly toolIntegrity: ToolIntegrityService,
     private readonly knowledgeBaseService: KnowledgeBaseService
-  ) {}
+  ) {
+    // Register provider adapter cleanup on session expiry/deletion.
+    // This ensures provider resources (Codex WS connections, warmup caches) are released.
+    this.sessionManager.registerSessionCleanupHandler(
+      (conversationId, session) => {
+        const backend = session.lastAssistantBackend
+        if (backend) {
+          this.resolveProviderAdapter(backend)?.dispose(conversationId)
+        }
+      }
+    )
+  }
 
   /**
    * 包装后端 SSE 流，在等待后端响应期间自动发送心跳
@@ -735,42 +823,55 @@ export class CursorConnectStreamService {
   ): AsyncGenerator<{ type: "data"; value: string } | { type: "heartbeat" }> {
     const iterator = stream[Symbol.asyncIterator]()
     let done = false
+    try {
+      while (!done) {
+        // 启动一次 next() 获取后端数据
+        const dataPromise = iterator.next()
 
-    while (!done) {
-      // 启动一次 next() 获取后端数据
-      const dataPromise = iterator.next()
+        // 循环等待，期间每隔 intervalMs 发送心跳
+        let resolved = false
+        while (!resolved) {
+          let timeoutId: NodeJS.Timeout | undefined
+          const timer = new Promise<"timeout">((resolve) => {
+            timeoutId = setTimeout(() => resolve("timeout"), intervalMs)
+          })
 
-      // 循环等待，期间每隔 intervalMs 发送心跳
-      let resolved = false
-      while (!resolved) {
-        const timer = new Promise<"timeout">((resolve) =>
-          setTimeout(() => resolve("timeout"), intervalMs)
-        )
+          const race = await Promise.race([
+            dataPromise.then((r) => ({ source: "data" as const, result: r })),
+            timer.then((t) => ({ source: t })),
+          ])
+          if (timeoutId) {
+            clearTimeout(timeoutId)
+          }
 
-        const race = await Promise.race([
-          dataPromise.then((r) => ({ source: "data" as const, result: r })),
-          timer.then((t) => ({ source: t })),
-        ])
-
-        if (race.source === "data") {
-          // 后端返回了数据
-          resolved = true
-          if (race.result.done) {
-            done = true
+          if (race.source === "data") {
+            // 后端返回了数据
+            resolved = true
+            if (race.result.done) {
+              done = true
+            } else {
+              const value = String(race.result.value ?? "")
+              yield { type: "data" as const, value }
+            }
           } else {
-            const value = String(race.result.value ?? "")
-            yield { type: "data" as const, value }
+            // 超时，发送心跳并继续等待同一个 dataPromise
+            const now = Date.now()
+            if (now - this.lastHeartbeatLog > this.HEARTBEAT_LOG_INTERVAL) {
+              this.logger.debug(
+                "Sending keepalive heartbeat while waiting for backend (logging once per minute)"
+              )
+              this.lastHeartbeatLog = now
+            }
+            yield { type: "heartbeat" as const }
           }
-        } else {
-          // 超时，发送心跳并继续等待同一个 dataPromise
-          const now = Date.now()
-          if (now - this.lastHeartbeatLog > this.HEARTBEAT_LOG_INTERVAL) {
-            this.logger.debug(
-              "Sending keepalive heartbeat while waiting for backend (logging once per minute)"
-            )
-            this.lastHeartbeatLog = now
-          }
-          yield { type: "heartbeat" as const }
+        }
+      }
+    } finally {
+      if (!done && typeof iterator.return === "function") {
+        try {
+          await iterator.return()
+        } catch {
+          // Ignore cleanup errors from upstream iterators.
         }
       }
     }
@@ -1194,19 +1295,12 @@ export class CursorConnectStreamService {
   }
 
   private async *executeBackendStreamWithFallback(
-    dto: CreateMessageDto,
+    model: string,
     route: ModelRouteResult,
     attemptedBackends: Set<string> = new Set(),
     options?: BackendStreamOptions
   ): AsyncGenerator<string, void, unknown> {
     attemptedBackends.add(route.backend)
-    const canReuseInitialDto =
-      options?.initialRoute?.backend === route.backend &&
-      options?.initialRoute?.model === route.model
-    const routedDto =
-      canReuseInitialDto || !options?.buildDtoForRoute
-        ? { ...dto, model: route.model }
-        : options.buildDtoForRoute(route)
     // Buffer envelope events (message_start, ping) AND structural events
     // (content_block_start, content_block_stop) so we can discard them on
     // fallback.  Only once a content_block_delta arrives (i.e., actual
@@ -1235,58 +1329,11 @@ export class CursorConnectStreamService {
     }
 
     try {
-      if (route.backend === "claude-api") {
-        this.logger.log(
-          `Routing to Claude API backend for model: ${route.model}`
-        )
-        for await (const event of this.anthropicApiService.sendClaudeMessageStream(
-          routedDto,
-          {},
-          options?.abortSignal
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        return
-      }
-
-      if (route.backend === "openai-compat") {
-        this.logger.log(
-          `Routing to OpenAI-compat backend for model: ${route.model}`
-        )
-        for await (const event of this.openaiCompatService.sendClaudeMessageStream(
-          routedDto,
-          options?.abortSignal
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        return
-      }
-
-      if (route.backend === "codex") {
-        this.logger.log(`Routing to Codex backend for model: ${route.model}`)
-        for await (const event of this.codexService.sendClaudeMessageStream(
-          routedDto,
-          options?.abortSignal
-        )) {
-          yield* handleEvent(event)
-        }
-        if (!emittedAny) {
-          for (const b of buffer) yield b
-        }
-        return
-      }
-
-      this.logger.log(`Routing to Google backend for model: ${route.model}`)
-      for await (const event of this.googleService.sendClaudeMessageStream(
-        routedDto,
-        options?.abortSignal
-      )) {
+      const backendStream = this.resolveBackendStream(route, options)
+      this.logger.log(
+        `Routing to ${route.backend} backend for model: ${route.model}`
+      )
+      for await (const event of backendStream) {
         yield* handleEvent(event)
       }
       if (!emittedAny) {
@@ -1296,10 +1343,7 @@ export class CursorConnectStreamService {
       if (error instanceof UpstreamRequestAbortedError) {
         throw error
       }
-      const fallback = this.modelRouter.getFallbackRoute(
-        dto.model,
-        route.backend
-      )
+      const fallback = this.modelRouter.getFallbackRoute(model, route.backend)
       const canFallback =
         !emittedAny &&
         !!fallback &&
@@ -1312,12 +1356,12 @@ export class CursorConnectStreamService {
 
       if (canFallback && fallback) {
         this.logger.warn(
-          `Backend ${route.backend} failed for ${dto.model}: ${this.summarizeBackendError(
+          `Backend ${route.backend} failed for ${model}: ${this.summarizeBackendError(
             error
           )}; falling back to ${fallback.backend}`
         )
         yield* this.executeBackendStreamWithFallback(
-          dto,
+          model,
           fallback,
           attemptedBackends,
           options
@@ -1334,10 +1378,10 @@ export class CursorConnectStreamService {
    * Uses ModelRouterService for centralized routing logic
    */
   private async *getBackendStream(
-    dto: CreateMessageDto,
+    model: string,
     options?: BackendStreamOptions
   ): AsyncGenerator<string, void, unknown> {
-    const route = this.modelRouter.resolveModel(dto.model)
+    const route = this.modelRouter.resolveModel(model)
     const registration = options?.streamAbortBinding
       ? this.backendStreamAbortRegistry.register(
           options.streamAbortBinding.conversationId,
@@ -1346,12 +1390,8 @@ export class CursorConnectStreamService {
       : null
 
     try {
-      yield* this.executeBackendStreamWithFallback(dto, route, new Set(), {
+      yield* this.executeBackendStreamWithFallback(model, route, new Set(), {
         ...options,
-        initialRoute: {
-          backend: route.backend,
-          model: route.model,
-        },
         abortSignal: registration?.controller.signal ?? options?.abortSignal,
       })
     } finally {
@@ -1383,6 +1423,7 @@ export class CursorConnectStreamService {
       conversationId,
       session,
       thinkingLevel: session.thinkingLevel,
+      thinkingDetailsRequested: session.thinkingDetailsRequested,
       buildMessages: (budget) => {
         const compacted = this.contextManager.buildBackendMessagesFromMessages(
           ctx.messages.map((message) => ({
@@ -1416,6 +1457,7 @@ export class CursorConnectStreamService {
       additionalSystemPrompt?: string
       pendingToolUseIds?: string[]
       thinkingLevel?: number
+      thinkingDetailsRequested?: boolean
       buildMessages: (budget: {
         maxTokens: number
         systemPromptTokens: number
@@ -1494,6 +1536,7 @@ export class CursorConnectStreamService {
       )
       applyThinkingIntentToDto(dto, thinkingIntent)
     }
+    dto._includeThinkingSummary = options.thinkingDetailsRequested === true
 
     const requestedServiceTier = this.resolveRequestedCodexServiceTier(
       options.session?.requestedModelParameters
@@ -1504,10 +1547,241 @@ export class CursorConnectStreamService {
 
     this.logger.debug(
       `Prompt assembly for ${route.backend}: protectedContextMessages=${contextMessages.length}, ` +
-        `historyMessages=${historyMessages.length}, historyTokens=${historyTokens}, totalMessageTokens=${totalMessageTokens}`
+        `historyMessages=${historyMessages.length}, historyTokens=${historyTokens}, totalMessageTokens=${totalMessageTokens}, ` +
+        `thinkingSummary=${dto._includeThinkingSummary === true}`
     )
 
     return dto
+  }
+
+  private buildCodexStreamingRequestForRoute(
+    route: ModelRouteResult,
+    options: {
+      model: string
+      promptContext: PromptContext
+      conversationId?: string
+      session?: ChatSession
+      toolDefinitions?: ToolDefinition[]
+      additionalSystemPrompt?: string
+      pendingToolUseIds?: string[]
+      thinkingLevel?: number
+      thinkingDetailsRequested?: boolean
+      buildMessages: (budget: {
+        maxTokens: number
+        systemPromptTokens: number
+        maxOutputTokens: number
+      }) => CodexExecutionRequest["messages"]
+    }
+  ): CodexExecutionRequest {
+    const systemPrompt = this.buildCodexSystemPrompt(options.promptContext)
+    const effectiveSystemPrompt = options.additionalSystemPrompt
+      ? [systemPrompt, options.additionalSystemPrompt]
+          .filter((part) => typeof part === "string" && part.trim().length > 0)
+          .join("\n\n")
+      : systemPrompt
+    const budget = this.resolveMessageBudget(route.backend, {
+      session: options.session,
+      protectedContextTokens: 0,
+      systemPrompt: effectiveSystemPrompt,
+      toolDefinitions: options.toolDefinitions,
+      model: options.model,
+    })
+    const historyMessages = options.buildMessages(budget)
+    const requestedReasoningEffort = this.resolveRequestedReasoningEffort(
+      options.session?.requestedModelParameters
+    )
+    const thinkingIntent =
+      (options.thinkingLevel || 0) > 0 || requestedReasoningEffort
+        ? this.buildCursorThinkingIntent(
+            options.thinkingLevel || 0,
+            route.model,
+            requestedReasoningEffort
+          )
+        : undefined
+    // previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
+    // 不再在这里管理。对标官方 prepare_websocket_request() 设计。
+    const historyTokens = historyMessages.length
+      ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
+      : 0
+    const totalMessageTokens = historyMessages.length
+      ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
+      : 0
+
+    const request: CodexExecutionRequest = {
+      model: route.model,
+      system: effectiveSystemPrompt || undefined,
+      messages: historyMessages,
+      conversationId: options.conversationId,
+      pendingToolUseIds:
+        options.pendingToolUseIds && options.pendingToolUseIds.length > 0
+          ? options.pendingToolUseIds
+          : undefined,
+      includeThinkingSummary: options.thinkingDetailsRequested === true,
+      serviceTier: this.resolveRequestedCodexServiceTier(
+        options.session?.requestedModelParameters
+      ),
+      clientMetadata: this.buildCodexClientMetadata(
+        options.session,
+        options.conversationId
+      ),
+      textVerbosity: "low",
+    }
+
+    if (options.toolDefinitions && options.toolDefinitions.length > 0) {
+      request.tools = options.toolDefinitions
+    }
+
+    if (thinkingIntent) {
+      request.thinkingIntent = thinkingIntent
+    }
+
+    this.logger.debug(
+      `Prompt assembly for codex-native: protectedContextMessages=0, ` +
+        `historyMessages=${historyMessages.length}, historyTokens=${historyTokens}, totalMessageTokens=${totalMessageTokens}, ` +
+        `thinkingSummary=${request.includeThinkingSummary === true}, ` +
+        `inputMessages=${request.messages.length}`
+    )
+
+    return request
+  }
+
+  /**
+   * Fire-and-forget warmup via the ProviderAdapter interface.
+   * Resolved adapter determines provider-specific behavior:
+   *   - Codex: establish WebSocket + optional generate:false prompt cache warmup
+   *   - Claude/Gemini: no-op (HTTP transport, no prewarming needed)
+   */
+  private startProviderWarmup(
+    route: ModelRouteResult,
+    conversationId: string | undefined,
+    reason: string,
+    options?: {
+      pendingToolUseIds?: string[]
+    }
+  ): void {
+    this.resolveProviderAdapter(route.backend)?.warmup({
+      model: route.model,
+      conversationId,
+      reason,
+      pendingToolUseIds: options?.pendingToolUseIds,
+    })
+  }
+
+  /**
+   * Resolve the ProviderAdapter for a given backend type.
+   * Returns undefined for backends that don't have an adapter yet.
+   */
+  private resolveProviderAdapter(
+    backend: BackendType
+  ):
+    | import("../../llm/shared/provider-adapter.interface").ProviderAdapter
+    | undefined {
+    switch (backend) {
+      case "codex":
+        return this.codexService
+      case "claude-api":
+        return this.anthropicApiService
+      case "google":
+        return this.googleService
+      default:
+        return undefined
+    }
+  }
+
+  /**
+   * Resolve the backend-specific SSE stream for a given route.
+   * Centralizes the request-type resolution + stream creation that was
+   * previously scattered across the if-else chain in executeBackendStreamWithFallback.
+   *
+   * All backends return AsyncGenerator<string> (Claude-compatible SSE events).
+   */
+  private resolveBackendStream(
+    route: ModelRouteResult,
+    options?: BackendStreamOptions
+  ): AsyncGenerator<string, void, unknown> {
+    switch (route.backend) {
+      case "codex": {
+        const codexRequest = options?.buildCodexRequestForRoute?.(route)
+        if (!codexRequest) {
+          throw new Error(
+            `Missing Codex request builder for backend ${route.backend} (${route.model})`
+          )
+        }
+        return this.codexService.sendMessageStream(
+          codexRequest,
+          options?.abortSignal
+        )
+      }
+      case "claude-api": {
+        const routedDto = options?.buildDtoForRoute?.(route)
+        if (!routedDto) {
+          throw new Error(
+            `Missing DTO builder for backend ${route.backend} (${route.model})`
+          )
+        }
+        return this.anthropicApiService.sendClaudeMessageStream(
+          routedDto,
+          {},
+          options?.abortSignal
+        )
+      }
+      case "openai-compat": {
+        const routedDto = options?.buildDtoForRoute?.(route)
+        if (!routedDto) {
+          throw new Error(
+            `Missing DTO builder for backend ${route.backend} (${route.model})`
+          )
+        }
+        return this.openaiCompatService.sendClaudeMessageStream(
+          routedDto,
+          options?.abortSignal
+        )
+      }
+      case "google":
+      default: {
+        const routedDto = options?.buildDtoForRoute?.(route)
+        if (!routedDto) {
+          throw new Error(
+            `Missing DTO builder for backend ${route.backend} (${route.model})`
+          )
+        }
+        return this.googleService.sendClaudeMessageStream(
+          routedDto,
+          options?.abortSignal
+        )
+      }
+    }
+  }
+
+  private buildCodexClientMetadata(
+    session: ChatSession | undefined,
+    conversationId?: string
+  ): Record<string, string> | undefined {
+    const normalizedConversationId = conversationId?.trim()
+    if (!normalizedConversationId) {
+      return undefined
+    }
+
+    const requestOrdinal = Math.max(1, (session?.turns.length || 0) + 1)
+    const turnMetadata: Record<string, unknown> = {
+      session_id: normalizedConversationId,
+      thread_source: "user",
+      turn_id: `${normalizedConversationId}:${requestOrdinal}`,
+      sandbox: "none",
+    }
+
+    const rootPath = session?.projectContext?.rootPath?.trim()
+    if (rootPath) {
+      turnMetadata.workspaces = {
+        [rootPath]: {},
+      }
+    }
+
+    return {
+      "x-codex-window-id": `${normalizedConversationId}:${requestOrdinal}`,
+      "x-codex-turn-metadata": JSON.stringify(turnMetadata),
+      "x-codex-installation-id": this.codexInstallationId,
+    }
   }
 
   private normalizePositiveInteger(value: unknown): number | undefined {
@@ -2260,8 +2534,9 @@ export class CursorConnectStreamService {
     toolCallId: string,
     toolName: string,
     toolInput: Record<string, unknown>,
-    toolResultContent: string,
-    structuredContent?: Record<string, unknown>
+    toolResultContent: string | Array<Record<string, unknown>>,
+    structuredContent?: Record<string, unknown>,
+    toolCallType: "function" | "custom" = "function"
   ): void {
     const appendPlan = findToolResultAppendPlan(
       session.messages as Array<{
@@ -2295,6 +2570,7 @@ export class CursorConnectStreamService {
               type: "tool_result",
               tool_use_id: toolCallId,
               content: toolResultContent,
+              tool_call_type: toolCallType,
               ...(structuredContent ? { structuredContent } : {}),
             })
             return {
@@ -2317,6 +2593,7 @@ export class CursorConnectStreamService {
           type: "tool_result" as const,
           tool_use_id: toolCallId,
           content: toolResultContent,
+          tool_call_type: toolCallType,
           ...(structuredContent ? { structuredContent } : {}),
         },
       ])
@@ -2343,6 +2620,7 @@ export class CursorConnectStreamService {
           id: toolCallId,
           name: toolName || "unknown_tool",
           input: toolInput || {},
+          tool_call_type: toolCallType,
         },
       ]
       this.sessionManager.addMessage(
@@ -2357,6 +2635,7 @@ export class CursorConnectStreamService {
         type: "tool_result" as const,
         tool_use_id: toolCallId,
         content: toolResultContent,
+        tool_call_type: toolCallType,
         ...(structuredContent ? { structuredContent } : {}),
       },
     ])
@@ -2811,6 +3090,39 @@ ${raw}
       requestedModelParameters: session.requestedModelParameters,
       mcpToolDefs: session.mcpToolDefs,
     }
+  }
+
+  private optimizeImplicitCodexTools(
+    backend: BackendType,
+    toolNames: string[],
+    options?: CursorToolCapabilityOptionsForRoute
+  ): string[] {
+    if (backend !== "codex" || toolNames.length === 0) {
+      return toolNames
+    }
+
+    const toolCapabilityOptions = {
+      webSearchEnabled: options?.webSearchEnabled,
+      webFetchEnabled: options?.webFetchEnabled,
+    }
+
+    if (
+      !matchesImplicitDefaultAgentToolNames(toolNames, toolCapabilityOptions)
+    ) {
+      return toolNames
+    }
+
+    const optimized = getDefaultCodexImplicitAgentToolNames(
+      toolCapabilityOptions
+    )
+    if (optimized.length === 0 || optimized.length >= toolNames.length) {
+      return toolNames
+    }
+
+    this.logger.debug(
+      `Optimized implicit Codex tool profile: ${toolNames.length} -> ${optimized.length}`
+    )
+    return optimized
   }
 
   private tryParseJsonRecord(value: string): Record<string, unknown> | null {
@@ -3306,194 +3618,37 @@ ${raw}
       yield this.grpcService.createHeartbeatResponse()
     }
 
-    for await (const item of this.streamWithHeartbeat(stream)) {
+    const heartbeatStream = this.streamWithHeartbeat(stream)
+    const heartbeatIterator = heartbeatStream[Symbol.asyncIterator]()
+    let assistantStreamClosed = false
+    const closeAssistantStream = async (): Promise<void> => {
       if (
-        this.shouldAbortSupersededStream(
-          conversationId,
-          streamId,
-          streamAbortContext
-        )
+        assistantStreamClosed ||
+        typeof heartbeatIterator.return !== "function"
       ) {
-        return {
-          kind: "aborted",
-          accumulatedText,
-          finalUsage,
-          toolCallCount: preparedTools.length,
+        assistantStreamClosed = true
+        return
+      }
+      assistantStreamClosed = true
+      try {
+        await heartbeatIterator.return(undefined)
+      } catch {
+        // Ignore cleanup errors from upstream iterators during tool continuation.
+      }
+    }
+
+    try {
+      while (true) {
+        const nextItem = await heartbeatIterator.next()
+        if (nextItem.done) {
+          break
         }
-      }
-
-      if (item.type === "heartbeat") {
-        yield this.grpcService.createHeartbeatResponse()
-        continue
-      }
-
-      const event = this.parseSseEvent(item.value)
-      if (!event) continue
-
-      if (event.type === "content_block_start") {
-        const contentBlock = event.data.content_block
-        if (
-          contentBlock?.type === "tool_use" &&
-          contentBlock.id &&
-          contentBlock.name
-        ) {
-          const modelCallId = this.generateModelCallId(
-            modelCallBaseId,
-            toolCallIndex++
-          )
-          currentToolCall = {
-            id: contentBlock.id,
-            name: contentBlock.name,
-            inputJson: "",
-            modelCallId,
-          }
-          if (this.isEditToolInvocation(currentToolCall.name)) {
-            editStreamState = {
-              markerFound: false,
-              contentStartIdx: 0,
-              lastSentRawLen: 0,
-            }
-          } else {
-            editStreamState = null
-          }
-          this.logger.debug(
-            `Tool call started: ${currentToolCall.name} (${currentToolCall.id}) modelCallId: ${modelCallId}`
-          )
-        } else if (contentBlock?.type === "thinking") {
-          isInThinkingBlock = true
-          thinkingStartTime = Date.now()
-          currentThinkingBlock = this.startAssistantThinkingBlock(
-            assistantBlocks,
-            contentBlock.signature
-          )
-          this.logger.debug("Thinking block started")
-        }
-        continue
-      }
-
-      if (event.type === "content_block_delta") {
-        const delta = event.data.delta
-        if (delta?.type === "text_delta" && delta.text) {
-          yield this.grpcService.createAgentTextResponse(delta.text)
-          accumulatedText += delta.text
-          this.appendAssistantTextBlock(assistantBlocks, delta.text)
-
-          if (emitTokenDeltas) {
-            const { estimateTokenCount } = await import("./tools/agent-helpers")
-            const outputTokens = estimateTokenCount(delta.text)
-            if (outputTokens > 0) {
-              yield this.grpcService.createTokenDeltaResponse(0, outputTokens)
-            }
-          }
-        } else if (delta?.type === "input_json_delta" && currentToolCall) {
-          currentToolCall.inputJson += delta.partial_json || ""
-
-          if (editStreamState) {
-            const json = currentToolCall.inputJson
-            if (!editStreamState.markerFound) {
-              for (const key of [
-                '"new_text":"',
-                '"new_text": "',
-                '"file_text":"',
-                '"file_text": "',
-              ]) {
-                const idx = json.indexOf(key)
-                if (idx >= 0) {
-                  editStreamState.markerFound = true
-                  editStreamState.contentStartIdx = idx + key.length
-                  this.logger.debug(
-                    `Edit stream: found content marker at idx=${editStreamState.contentStartIdx}`
-                  )
-                  break
-                }
-              }
-            }
-            if (editStreamState.markerFound) {
-              const rawContent = json.substring(editStreamState.contentStartIdx)
-              let safeEnd = rawContent.length
-              if (rawContent.endsWith("\\")) safeEnd--
-              if (safeEnd > editStreamState.lastSentRawLen) {
-                const newRaw = rawContent.substring(
-                  editStreamState.lastSentRawLen,
-                  safeEnd
-                )
-                editStreamState.lastSentRawLen = safeEnd
-                const unescaped = newRaw
-                  .replace(/\\n/g, "\n")
-                  .replace(/\\t/g, "\t")
-                  .replace(/\\r/g, "\r")
-                  .replace(/\\\\/g, "\\")
-                  .replace(/\\"/g, '"')
-                if (unescaped) {
-                  const toolCallDelta =
-                    this.grpcService.createToolCallDeltaResponse(
-                      currentToolCall.id,
-                      currentToolCall.name,
-                      "stream_content",
-                      unescaped,
-                      currentToolCall.modelCallId
-                    )
-                  if (toolCallDelta.length > 0) {
-                    yield toolCallDelta
-                  }
-                }
-              }
-            }
-          }
-        } else if (delta?.type === "thinking_delta") {
-          this.appendAssistantThinkingDelta(
-            currentThinkingBlock,
-            delta.thinking || ""
-          )
-          if (typeof delta.thinking === "string" && delta.thinking.length > 0) {
-            yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
-          }
-        } else if (delta?.type === "signature_delta") {
-          this.setAssistantThinkingSignature(
-            currentThinkingBlock,
-            delta.signature
-          )
-        }
-        continue
-      }
-
-      if (event.type === "message_delta") {
-        finalUsage = this.extractUsageSnapshot(event) || finalUsage
-        continue
-      }
-
-      if (event.type === "content_block_stop") {
-        if (isInThinkingBlock) {
-          const thinkingDurationMs = Date.now() - thinkingStartTime
-          yield this.grpcService.createThinkingCompletedResponse(
-            thinkingDurationMs
-          )
-          isInThinkingBlock = false
-          currentThinkingBlock = null
-        }
-
-        if (currentToolCall) {
-          const preparedTool = this.buildPreparedToolInvocation(
-            session,
-            currentToolCall
-          )
-          this.appendPreparedToolUseBlock(assistantBlocks, preparedTool)
-          preparedTools.push(preparedTool)
-          this.logger.log(
-            `Tool call completed: ${preparedTool.protocolToolName}, queued for batched dispatch`
-          )
-          currentToolCall = null
-          editStreamState = null
-        }
-        continue
-      }
-
-      if (event.type === "message_stop") {
+        const item = nextItem.value
         if (
           this.shouldAbortSupersededStream(
             conversationId,
             streamId,
-            messageStopAbortContext
+            streamAbortContext
           )
         ) {
           return {
@@ -3504,85 +3659,291 @@ ${raw}
           }
         }
 
-        if (preparedTools.length > 0) {
-          const dispatchOutcome = yield* this.dispatchPreparedToolBatch(
+        if (item.type === "heartbeat") {
+          yield this.grpcService.createHeartbeatResponse()
+          continue
+        }
+
+        const event = this.parseSseEvent(item.value)
+        if (!event) continue
+
+        if (event.type === "message_start") {
+          const backend = this.modelRouter.resolveModel(session.model).backend
+          const messageId =
+            event.data.message && typeof event.data.message.id === "string"
+              ? event.data.message.id
+              : undefined
+          this.sessionManager.markAssistantBackend(
             conversationId,
-            session,
-            streamId,
-            checkpointModel,
-            workspaceRootPath,
-            assistantBlocks,
-            preparedTools
+            backend,
+            backend === "codex" ? messageId : undefined
           )
+          continue
+        }
+
+        if (event.type === "content_block_start") {
+          const contentBlock = event.data.content_block
+          if (
+            contentBlock?.type === "tool_use" &&
+            contentBlock.id &&
+            contentBlock.name
+          ) {
+            const modelCallId = this.generateModelCallId(
+              modelCallBaseId,
+              toolCallIndex++
+            )
+            currentToolCall = {
+              id: contentBlock.id,
+              name: contentBlock.name,
+              inputJson: "",
+              modelCallId,
+            }
+            if (this.isEditToolInvocation(currentToolCall.name)) {
+              editStreamState = {
+                markerFound: false,
+                contentStartIdx: 0,
+                lastSentRawLen: 0,
+              }
+            } else {
+              editStreamState = null
+            }
+            this.logger.debug(
+              `Tool call started: ${currentToolCall.name} (${currentToolCall.id}) modelCallId: ${modelCallId}`
+            )
+          } else if (contentBlock?.type === "thinking") {
+            isInThinkingBlock = true
+            thinkingStartTime = Date.now()
+            currentThinkingBlock = this.startAssistantThinkingBlock(
+              assistantBlocks,
+              contentBlock.signature
+            )
+            this.logger.debug("Thinking block started")
+          }
+          continue
+        }
+
+        if (event.type === "content_block_delta") {
+          const delta = event.data.delta
+          if (delta?.type === "text_delta" && delta.text) {
+            yield this.grpcService.createAgentTextResponse(delta.text)
+            accumulatedText += delta.text
+            this.appendAssistantTextBlock(assistantBlocks, delta.text)
+
+            if (emitTokenDeltas) {
+              const { estimateTokenCount } =
+                await import("./tools/agent-helpers")
+              const outputTokens = estimateTokenCount(delta.text)
+              if (outputTokens > 0) {
+                yield this.grpcService.createTokenDeltaResponse(0, outputTokens)
+              }
+            }
+          } else if (delta?.type === "input_json_delta" && currentToolCall) {
+            currentToolCall.inputJson += delta.partial_json || ""
+
+            if (editStreamState) {
+              const json = currentToolCall.inputJson
+              if (!editStreamState.markerFound) {
+                for (const key of [
+                  '"new_text":"',
+                  '"new_text": "',
+                  '"file_text":"',
+                  '"file_text": "',
+                ]) {
+                  const idx = json.indexOf(key)
+                  if (idx >= 0) {
+                    editStreamState.markerFound = true
+                    editStreamState.contentStartIdx = idx + key.length
+                    this.logger.debug(
+                      `Edit stream: found content marker at idx=${editStreamState.contentStartIdx}`
+                    )
+                    break
+                  }
+                }
+              }
+              if (editStreamState.markerFound) {
+                const rawContent = json.substring(
+                  editStreamState.contentStartIdx
+                )
+                let safeEnd = rawContent.length
+                if (rawContent.endsWith("\\")) safeEnd--
+                if (safeEnd > editStreamState.lastSentRawLen) {
+                  const newRaw = rawContent.substring(
+                    editStreamState.lastSentRawLen,
+                    safeEnd
+                  )
+                  editStreamState.lastSentRawLen = safeEnd
+                  const unescaped = newRaw
+                    .replace(/\\n/g, "\n")
+                    .replace(/\\t/g, "\t")
+                    .replace(/\\r/g, "\r")
+                    .replace(/\\\\/g, "\\")
+                    .replace(/\\"/g, '"')
+                  if (unescaped) {
+                    const toolCallDelta =
+                      this.grpcService.createToolCallDeltaResponse(
+                        currentToolCall.id,
+                        currentToolCall.name,
+                        "stream_content",
+                        unescaped,
+                        currentToolCall.modelCallId
+                      )
+                    if (toolCallDelta.length > 0) {
+                      yield toolCallDelta
+                    }
+                  }
+                }
+              }
+            }
+          } else if (delta?.type === "thinking_delta") {
+            this.appendAssistantThinkingDelta(
+              currentThinkingBlock,
+              delta.thinking || ""
+            )
+            if (
+              typeof delta.thinking === "string" &&
+              delta.thinking.length > 0
+            ) {
+              yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
+            }
+          } else if (delta?.type === "signature_delta") {
+            this.setAssistantThinkingSignature(
+              currentThinkingBlock,
+              delta.signature
+            )
+          }
+          continue
+        }
+
+        if (event.type === "message_delta") {
+          finalUsage = this.extractUsageSnapshot(event) || finalUsage
+          continue
+        }
+
+        if (event.type === "content_block_stop") {
+          if (isInThinkingBlock) {
+            const thinkingDurationMs = Date.now() - thinkingStartTime
+            yield this.grpcService.createThinkingCompletedResponse(
+              thinkingDurationMs
+            )
+            isInThinkingBlock = false
+            currentThinkingBlock = null
+          }
+
+          if (currentToolCall) {
+            const preparedTool = this.buildPreparedToolInvocation(
+              session,
+              currentToolCall
+            )
+            this.appendPreparedToolUseBlock(assistantBlocks, preparedTool)
+            preparedTools.push(preparedTool)
+            this.logger.log(
+              `Tool call completed: ${preparedTool.protocolToolName}, queued for batched dispatch`
+            )
+            currentToolCall = null
+            editStreamState = null
+          }
+          continue
+        }
+
+        if (event.type === "message_stop") {
+          if (
+            this.shouldAbortSupersededStream(
+              conversationId,
+              streamId,
+              messageStopAbortContext
+            )
+          ) {
+            return {
+              kind: "aborted",
+              accumulatedText,
+              finalUsage,
+              toolCallCount: preparedTools.length,
+            }
+          }
+
+          if (preparedTools.length > 0) {
+            await closeAssistantStream()
+            const dispatchOutcome = yield* this.dispatchPreparedToolBatch(
+              conversationId,
+              session,
+              streamId,
+              checkpointModel,
+              workspaceRootPath,
+              assistantBlocks,
+              preparedTools
+            )
+            return {
+              kind:
+                dispatchOutcome === "waiting_for_result"
+                  ? "waiting_for_results"
+                  : "completed",
+              accumulatedText,
+              finalUsage,
+              toolCallCount: preparedTools.length,
+            }
+          }
+
+          if (mode === "initial") {
+            yield* this.finalizeInitialAssistantTurn(
+              session,
+              conversationId,
+              accumulatedText,
+              finalUsage
+            )
+          } else {
+            this.logger.log(
+              "Agent mode: no more tool calls, sending turn_ended signal"
+            )
+            yield* this.finalizeAssistantContinuationTurn(
+              session,
+              conversationId,
+              accumulatedText || undefined,
+              finalUsage
+            )
+            this.logger.log("Sent conversationCheckpointUpdate (continuation)")
+          }
+
           return {
-            kind:
-              dispatchOutcome === "waiting_for_result"
-                ? "waiting_for_results"
-                : "completed",
+            kind: "completed",
             accumulatedText,
             finalUsage,
-            toolCallCount: preparedTools.length,
+            toolCallCount: 0,
           }
         }
+      }
 
-        if (mode === "initial") {
-          yield* this.finalizeInitialAssistantTurn(
-            session,
-            conversationId,
-            accumulatedText,
-            finalUsage
-          )
-        } else {
-          this.logger.log(
-            "Agent mode: no more tool calls, sending turn_ended signal"
-          )
-          yield* this.finalizeAssistantContinuationTurn(
-            session,
-            conversationId,
-            accumulatedText || undefined,
-            finalUsage
-          )
-          this.logger.log("Sent conversationCheckpointUpdate (continuation)")
-        }
-
+      if (preparedTools.length > 0) {
+        this.logger.warn(
+          `Assistant stream exited without message_stop after ${preparedTools.length} tool call(s); dispatching batched tools defensively`
+        )
+        const dispatchOutcome = yield* this.dispatchPreparedToolBatch(
+          conversationId,
+          session,
+          streamId,
+          checkpointModel,
+          workspaceRootPath,
+          assistantBlocks,
+          preparedTools
+        )
         return {
-          kind: "completed",
+          kind:
+            dispatchOutcome === "waiting_for_result"
+              ? "waiting_for_results"
+              : "completed",
           accumulatedText,
           finalUsage,
-          toolCallCount: 0,
+          toolCallCount: preparedTools.length,
         }
       }
-    }
 
-    if (preparedTools.length > 0) {
-      this.logger.warn(
-        `Assistant stream exited without message_stop after ${preparedTools.length} tool call(s); dispatching batched tools defensively`
-      )
-      const dispatchOutcome = yield* this.dispatchPreparedToolBatch(
-        conversationId,
-        session,
-        streamId,
-        checkpointModel,
-        workspaceRootPath,
-        assistantBlocks,
-        preparedTools
-      )
       return {
-        kind:
-          dispatchOutcome === "waiting_for_result"
-            ? "waiting_for_results"
-            : "completed",
+        kind: accumulatedText ? "partial_without_message_stop" : "empty",
         accumulatedText,
         finalUsage,
-        toolCallCount: preparedTools.length,
+        toolCallCount: 0,
       }
-    }
-
-    return {
-      kind: accumulatedText ? "partial_without_message_stop" : "empty",
-      accumulatedText,
-      finalUsage,
-      toolCallCount: 0,
+    } finally {
+      await closeAssistantStream()
     }
   }
 
@@ -3949,6 +4310,7 @@ ${raw}
       normalizedToolName === "run_command" ||
       normalizedToolName === "run_terminal_command" ||
       normalizedToolName === "run_terminal_command_v2" ||
+      normalizedToolName === "exec_command" ||
       normalizedToolName === "shell"
     ) {
       return this.formatShellToolResultForHistory(
@@ -3962,7 +4324,8 @@ ${raw}
 
     if (
       normalizedToolName === "send_command_input" ||
-      normalizedToolName === "write_shell_stdin"
+      normalizedToolName === "write_shell_stdin" ||
+      normalizedToolName === "write_stdin"
     ) {
       return this.formatWriteShellStdinResultForHistory(
         toolName,
@@ -4091,50 +4454,31 @@ ${raw}
         "workingDirectory",
       ]) || ""
 
-    if (toolResultState?.status === "rejected") {
-      return `[${normalizedToolName} rejected] ${toolResultState.message || "request rejected"}`
-    }
-    if (toolResultState && toolResultState.status !== "success") {
-      return `[${normalizedToolName} error] ${toolResultState.message || "request failed"}`
-    }
-
-    const lines = [`[${normalizedToolName} success]`]
-    if (command) {
-      lines.push(
-        `command: ${
-          command.length > 320
-            ? `${command.slice(0, 317).trimEnd()}...`
-            : command
-        }`
-      )
-    }
-    if (cwd) lines.push(`cwd: ${cwd}`)
-    if (typeof shellResult?.shellId === "number") {
-      lines.push(`CommandId: ${shellResult.shellId}`)
-    }
-    if (typeof shellResult?.pid === "number") {
-      lines.push(`pid: ${shellResult.pid}`)
-    }
-    if (typeof shellResult?.msToWait === "number") {
-      lines.push(`ms_to_wait: ${shellResult.msToWait}`)
+    if (!shellResult) {
+      if (toolResultState?.status === "rejected") {
+        return toolResultState.message || content || "request rejected"
+      }
+      if (toolResultState && toolResultState.status !== "success") {
+        return toolResultState.message || content || "request failed"
+      }
     }
 
-    const isBackground =
-      Boolean(shellResult?.isBackground) ||
-      typeof shellResult?.shellId === "number" ||
-      typeof shellResult?.msToWait === "number" ||
-      typeof shellResult?.backgroundReason === "number"
-    lines.push(`status: ${isBackground ? "running" : "completed"}`)
-    if (!isBackground && typeof shellResult?.exitCode === "number") {
-      lines.push(`exit_code: ${shellResult.exitCode}`)
-    }
-
-    const compact = content.replace(/\s+/g, " ").trim()
-    if (!isBackground && compact) {
-      lines.push("", compact.slice(0, 1200))
-    }
-
-    return lines.join("\n")
+    return this.formatCodexUnifiedExecToolResultForHistory(content, {
+      wallTimeMs:
+        shellResult?.localExecutionTimeMs ?? shellResult?.executionTime ?? 0,
+      sessionId: shellResult?.shellId,
+      exitCode:
+        shellResult?.isBackground === true ? undefined : shellResult?.exitCode,
+      fallbackSessionId:
+        toolResultState?.status === "success"
+          ? undefined
+          : shellResult?.shellId,
+      fallbackText:
+        toolResultState?.message ||
+        (command || cwd
+          ? `${normalizedToolName} failed${command ? ` while running ${command}` : ""}${cwd ? ` in ${cwd}` : ""}`
+          : undefined),
+    })
   }
 
   private formatWriteShellStdinResultForHistory(
@@ -4144,8 +4488,6 @@ ${raw}
     toolResultState?: { status: ToolResultStatus; message?: string },
     writeShellStdinSuccess?: ToolCompletedExtraData["writeShellStdinSuccess"]
   ): string {
-    const normalizedToolName =
-      (toolName || "send_command_input").trim() || "send_command_input"
     const commandId =
       this.pickFirstString(toolInput, [
         "CommandId",
@@ -4155,34 +4497,83 @@ ${raw}
         "shell_id",
       ]) || ""
 
-    if (toolResultState?.status === "rejected") {
-      return `[${normalizedToolName} rejected] ${toolResultState.message || "request rejected"}`
-    }
-    if (toolResultState && toolResultState.status !== "success") {
-      return `[${normalizedToolName} error] ${toolResultState.message || "request failed"}`
-    }
-
-    const lines = [`[${normalizedToolName} success]`]
-    if (commandId) {
-      lines.push(`CommandId: ${commandId}`)
-    } else if (typeof writeShellStdinSuccess?.shellId === "number") {
-      lines.push(`CommandId: ${writeShellStdinSuccess.shellId}`)
+    if (!writeShellStdinSuccess && toolResultState?.status === "rejected") {
+      return toolResultState.message || content || "request rejected"
     }
     if (
-      typeof writeShellStdinSuccess?.terminalFileLengthBeforeInputWritten ===
-      "number"
+      !writeShellStdinSuccess &&
+      toolResultState &&
+      toolResultState.status !== "success"
     ) {
-      lines.push(
-        `terminal_length_before_input: ${writeShellStdinSuccess.terminalFileLengthBeforeInputWritten}`
-      )
+      return toolResultState.message || content || "request failed"
     }
 
-    const compact = content.replace(/\s+/g, " ").trim()
-    if (compact) {
-      lines.push("", compact.slice(0, 600))
+    const resolvedSessionId =
+      (commandId ? Number.parseInt(commandId, 10) : undefined) ??
+      writeShellStdinSuccess?.shellId
+
+    return this.formatCodexUnifiedExecToolResultForHistory(content, {
+      wallTimeMs: 0,
+      sessionId:
+        typeof resolvedSessionId === "number" &&
+        Number.isFinite(resolvedSessionId)
+          ? resolvedSessionId
+          : undefined,
+      fallbackText: toolResultState?.message,
+    })
+  }
+
+  private formatCodexUnifiedExecToolResultForHistory(
+    output: string,
+    options: {
+      wallTimeMs?: number
+      sessionId?: number
+      exitCode?: number
+      originalTokenCount?: number
+      fallbackSessionId?: number
+      fallbackText?: string
+    } = {}
+  ): string {
+    const wallTimeMs =
+      typeof options.wallTimeMs === "number" &&
+      Number.isFinite(options.wallTimeMs)
+        ? Math.max(0, options.wallTimeMs)
+        : 0
+    const sections = [`Wall time: ${(wallTimeMs / 1000).toFixed(4)} seconds`]
+
+    if (
+      typeof options.exitCode === "number" &&
+      Number.isFinite(options.exitCode)
+    ) {
+      sections.push(`Process exited with code ${options.exitCode}`)
     }
 
-    return lines.join("\n")
+    const sessionId =
+      typeof options.sessionId === "number" &&
+      Number.isFinite(options.sessionId)
+        ? options.sessionId
+        : typeof options.fallbackSessionId === "number" &&
+            Number.isFinite(options.fallbackSessionId)
+          ? options.fallbackSessionId
+          : undefined
+
+    if (
+      sessionId != null &&
+      (options.exitCode == null || !Number.isFinite(options.exitCode))
+    ) {
+      sections.push(`Process running with session ID ${sessionId}`)
+    }
+
+    if (
+      typeof options.originalTokenCount === "number" &&
+      Number.isFinite(options.originalTokenCount)
+    ) {
+      sections.push(`Original token count: ${options.originalTokenCount}`)
+    }
+
+    sections.push("Output:")
+    sections.push(output || options.fallbackText || "")
+    return sections.join("\n")
   }
 
   private formatMutatingFileToolResultForHistory(
@@ -5865,6 +6256,170 @@ ${raw}
     )
   }
 
+  private extractCodexAgentTextFromItems(items: unknown): string {
+    if (!Array.isArray(items)) {
+      return ""
+    }
+
+    return items
+      .flatMap((item) => {
+        if (!item || typeof item !== "object") return []
+        const record = item as Record<string, unknown>
+        const text = this.pickFirstString(record, [
+          "text",
+          "path",
+          "name",
+          "image_url",
+        ])
+        return text ? [text] : []
+      })
+      .join("\n")
+      .trim()
+  }
+
+  private buildSyntheticCodexAgentMessage(
+    input: Record<string, unknown>
+  ): string {
+    const message = this.pickFirstString(input, ["message"]) || ""
+    const itemsText = this.extractCodexAgentTextFromItems(input.items)
+    return [message, itemsText]
+      .filter((part) => part.trim().length > 0)
+      .join("\n\n")
+  }
+
+  private buildSyntheticCodexAgentPayload(
+    agent: SyntheticCodexAgentState
+  ): Record<string, unknown> {
+    const payload: Record<string, unknown> = {
+      id: agent.agentId,
+      agent_id: agent.agentId,
+      status: agent.status,
+      created_at: agent.createdAt,
+      updated_at: agent.updatedAt,
+    }
+    if (agent.nickname) {
+      payload.nickname = agent.nickname
+    }
+    if (agent.agentType) {
+      payload.agent_type = agent.agentType
+    }
+    if (agent.model) {
+      payload.model = agent.model
+    }
+    if (agent.message) {
+      payload.message = agent.message
+    }
+    if (agent.lastInput) {
+      payload.last_input = agent.lastInput
+    }
+    return payload
+  }
+
+  private canonicalizeCodexCliToolInvocation(
+    toolName: string,
+    input: Record<string, unknown>
+  ): CanonicalToolInvocation | null {
+    const normalized = toolName.trim().toLowerCase()
+
+    if (normalized === "exec_command") {
+      const command = this.pickFirstString(input, ["cmd", "command"]) || ""
+      const cwd =
+        this.pickFirstString(input, ["workdir", "cwd", "workingDirectory"]) ||
+        ""
+      const timeout =
+        this.pickFirstNumber(input, ["yield_time_ms", "yieldTimeMs"]) || 0
+      return {
+        toolName: "run_terminal_command",
+        input: {
+          command,
+          cwd,
+          timeout,
+          description:
+            this.pickFirstString(input, ["justification", "description"]) || "",
+          enableWriteShellStdinTool: true,
+          shell: this.pickFirstString(input, ["shell"]) || "",
+          closeStdin: false,
+          tty: this.pickFirstBoolean(input, ["tty"]) || false,
+        },
+        historyToolName: "exec_command",
+        historyToolInput: input,
+      }
+    }
+
+    if (normalized === "write_stdin") {
+      const shellId =
+        this.pickFirstNumber(input, ["session_id", "sessionId", "shellId"]) || 0
+      const chars =
+        this.pickFirstString(input, ["chars", "data", "input"]) || ""
+      return {
+        toolName: "write_shell_stdin",
+        input: {
+          shellId,
+          chars,
+          data: chars,
+        },
+        historyToolName: "write_stdin",
+        historyToolInput: input,
+      }
+    }
+
+    if (normalized === "list_mcp_resources") {
+      return {
+        toolName: "list_mcp_resources",
+        input: {
+          serverName:
+            this.pickFirstString(input, ["server", "serverName"]) || "",
+          cursor: this.pickFirstString(input, ["cursor"]) || "",
+        },
+        historyToolName: "list_mcp_resources",
+        historyToolInput: input,
+      }
+    }
+
+    if (normalized === "list_mcp_resource_templates") {
+      return {
+        toolName: "list_mcp_resource_templates",
+        input,
+        historyToolName: "list_mcp_resource_templates",
+        historyToolInput: input,
+      }
+    }
+
+    if (normalized === "read_mcp_resource") {
+      return {
+        toolName: "read_mcp_resource",
+        input: {
+          serverName:
+            this.pickFirstString(input, ["server", "serverName"]) || "",
+          uri: this.pickFirstString(input, ["uri"]) || "",
+        },
+        historyToolName: "read_mcp_resource",
+        historyToolInput: input,
+      }
+    }
+
+    if (
+      normalized === "update_plan" ||
+      normalized === "request_user_input" ||
+      normalized === "view_image" ||
+      normalized === "spawn_agent" ||
+      normalized === "send_input" ||
+      normalized === "resume_agent" ||
+      normalized === "wait_agent" ||
+      normalized === "close_agent" ||
+      normalized === "apply_patch"
+    ) {
+      return {
+        toolName: normalized,
+        input,
+        historyToolName: normalized,
+        historyToolInput: input,
+      }
+    }
+
+    return null
+  }
+
   private canonicalizeToolInvocation(
     toolName: string,
     input: Record<string, unknown>
@@ -5873,6 +6428,14 @@ ${raw}
       this.canonicalizeOfficialAntigravityToolInvocation(toolName, input)
     if (antigravityInvocation) {
       return antigravityInvocation
+    }
+
+    const codexCliInvocation = this.canonicalizeCodexCliToolInvocation(
+      toolName,
+      input
+    )
+    if (codexCliInvocation) {
+      return codexCliInvocation
     }
 
     const family = this.normalizeDeferredToolFamily(toolName)
@@ -6473,6 +7036,12 @@ ${raw}
           return "go_to_definition"
         case "CLIENT_SIDE_TOOL_V2_READ_PROJECT":
           return "read_project"
+        case "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION":
+          return "ai_attribution"
+        case "CLIENT_SIDE_TOOL_V2_AWAIT":
+          return "await"
+        case "CLIENT_SIDE_TOOL_V2_MCP_AUTH":
+          return "mcp_auth"
       }
     }
 
@@ -6484,6 +7053,39 @@ ${raw}
 
     if (snake.includes("command_status") || compact.includes("commandstatus")) {
       return "command_status"
+    }
+    if (snake === "update_plan" || compact === "updateplan") {
+      return "update_plan"
+    }
+    if (snake === "request_user_input" || compact === "requestuserinput") {
+      return "request_user_input"
+    }
+    if (
+      snake === "list_mcp_resource_templates" ||
+      compact === "listmcpresourcetemplates"
+    ) {
+      return "list_mcp_resource_templates"
+    }
+    if (snake === "view_image" || compact === "viewimage") {
+      return "view_image"
+    }
+    if (snake === "spawn_agent" || compact === "spawnagent") {
+      return "spawn_agent"
+    }
+    if (snake === "send_input" || compact === "sendinput") {
+      return "send_input"
+    }
+    if (snake === "resume_agent" || compact === "resumeagent") {
+      return "resume_agent"
+    }
+    if (snake === "wait_agent" || compact === "waitagent") {
+      return "wait_agent"
+    }
+    if (snake === "close_agent" || compact === "closeagent") {
+      return "close_agent"
+    }
+    if (snake === "apply_patch" || compact === "applypatch") {
+      return "apply_patch"
     }
     if (snake.includes("ask_question") || compact.includes("askquestion")) {
       return "ask_question"
@@ -6647,6 +7249,87 @@ ${raw}
     }
     if (snake.includes("update_project") || compact.includes("updateproject")) {
       return "update_project"
+    }
+    // 新增 proto 更新后的 Exec 工具模糊匹配
+    if (
+      snake.includes("force_background_shell") ||
+      compact.includes("forcebackgroundshell")
+    ) {
+      return "force_background_shell"
+    }
+    if (
+      snake.includes("force_background_subagent") ||
+      compact.includes("forcebackgroundsubagent")
+    ) {
+      return "force_background_subagent"
+    }
+    if (snake.includes("canvas_get_url") || compact.includes("canvasgeturl")) {
+      return "canvas_get_url"
+    }
+    if (snake.includes("canvas_destroy") || compact.includes("canvasdestroy")) {
+      return "canvas_destroy"
+    }
+    if (
+      snake.includes("canvas_register") ||
+      compact.includes("canvasregister")
+    ) {
+      return "canvas_register"
+    }
+    if (snake.includes("mcp_state_exec") || compact.includes("mcpstateexec")) {
+      return "mcp_state_exec"
+    }
+    if (snake.includes("subagent_await") || compact.includes("subagentawait")) {
+      return "subagent_await"
+    }
+    // 新增交互工具模糊匹配
+    if (
+      snake.includes("communicate_update") ||
+      compact.includes("communicateupdate")
+    ) {
+      return "communicate_update"
+    }
+    if (
+      snake.includes("send_final_summary") ||
+      compact.includes("sendfinalsummary")
+    ) {
+      return "send_final_summary"
+    }
+    if (
+      snake.includes("blame_by_file_path") ||
+      compact.includes("blamebyfilepath")
+    ) {
+      return "blame_by_file_path"
+    }
+    if (snake.includes("report_bug") || compact.includes("reportbug")) {
+      // 避免与 report_bugfix_results 冲突
+      if (!snake.includes("bugfix") && !compact.includes("bugfix")) {
+        return "report_bug"
+      }
+    }
+    if (
+      snake.includes("set_active_branch") ||
+      compact.includes("setactivebranch")
+    ) {
+      return "set_active_branch"
+    }
+    // ExecServerMessage 补齐模糊匹配
+    if (
+      snake.includes("request_context") ||
+      compact.includes("requestcontext")
+    ) {
+      return "request_context"
+    }
+    if (snake.includes("redacted_read") || compact.includes("redactedread")) {
+      return "redacted_read"
+    }
+    // InteractionQuery 补齐模糊匹配
+    if (
+      snake.includes("pr_management") ||
+      compact.includes("prmanagement") ||
+      snake.includes("create_pr") ||
+      compact.includes("createpr")
+    ) {
+      return "pr_management"
     }
     return undefined
   }
@@ -7337,6 +8020,93 @@ ${raw}
       asyncOriginalToolCallId: runAsync
         ? explicitAsyncOriginalToolCallId || toolCallId
         : explicitAsyncOriginalToolCallId,
+    }
+  }
+
+  private normalizeRequestUserInputInteractionArgs(
+    input: Record<string, unknown>,
+    toolCallId: string
+  ): {
+    title: string
+    questions: AskQuestionInteractionQuestion[]
+    runAsync: boolean
+    asyncOriginalToolCallId: string
+  } {
+    const rawQuestions = Array.isArray(input.questions) ? input.questions : []
+    const questions: AskQuestionInteractionQuestion[] = []
+
+    for (const [index, entry] of rawQuestions.entries()) {
+      if (!entry || typeof entry !== "object") continue
+      const question = entry as Record<string, unknown>
+      const prompt =
+        this.pickFirstString(question, [
+          "question",
+          "prompt",
+          "header",
+          "title",
+        ]) || `Question ${index + 1}`
+      const id =
+        this.pickFirstString(question, ["id", "questionId", "question_id"]) ||
+        `q${index + 1}`
+      const rawOptions = Array.isArray(question.options) ? question.options : []
+      const options: AskQuestionInteractionOption[] = []
+      const seenOptionIds = new Set<string>()
+
+      for (const [optionIndex, optionEntry] of rawOptions.entries()) {
+        let optionId = ""
+        let label = ""
+        if (typeof optionEntry === "string") {
+          label = optionEntry.trim()
+        } else if (optionEntry && typeof optionEntry === "object") {
+          const option = optionEntry as Record<string, unknown>
+          optionId =
+            this.pickFirstString(option, ["id", "optionId", "option_id"]) || ""
+          label =
+            this.pickFirstString(option, [
+              "label",
+              "title",
+              "name",
+              "value",
+              "text",
+              "description",
+            ]) || ""
+        }
+
+        if (!label && !optionId) continue
+        if (!optionId) {
+          optionId = this.normalizeAskQuestionOptionId(
+            label,
+            `opt_${index + 1}_${optionIndex + 1}`
+          )
+        }
+        if (!label) {
+          label = optionId
+        }
+        if (seenOptionIds.has(optionId)) continue
+        seenOptionIds.add(optionId)
+        options.push({ id: optionId, label })
+      }
+
+      questions.push({
+        id,
+        prompt,
+        options,
+        allowMultiple: false,
+      })
+    }
+
+    if (questions.length === 0) {
+      return this.normalizeAskQuestionInteractionArgs(input, toolCallId)
+    }
+
+    return {
+      title:
+        this.pickFirstString(input, ["title", "prompt"]) ||
+        questions[0]?.prompt ||
+        "User input required",
+      questions,
+      runAsync: false,
+      asyncOriginalToolCallId: toolCallId,
     }
   }
 
@@ -8722,8 +9492,37 @@ ${raw}
           streamRoute
         )
 
+      const buildSubAgentCodexRequestForRoute = (
+        streamRoute: ModelRouteResult
+      ): CodexExecutionRequest =>
+        this.buildCodexStreamingRequestForRoute(streamRoute, {
+          model: ctx.model,
+          promptContext: this.buildPromptContextFromSession(session),
+          conversationId,
+          session,
+          thinkingLevel: session.thinkingLevel,
+          thinkingDetailsRequested: session.thinkingDetailsRequested,
+          buildMessages: (budget) => {
+            const compacted =
+              this.contextManager.buildBackendMessagesFromMessages(
+                ctx.messages.map((message) => ({
+                  role: message.role,
+                  content: message.content as UnifiedMessage["content"],
+                })) as UnifiedMessage[],
+                this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
+                {
+                  maxTokens: budget.maxTokens,
+                  systemPromptTokens: budget.systemPromptTokens,
+                  strategy: "auto",
+                }
+              )
+
+            return compacted.messages as CodexExecutionRequest["messages"]
+          },
+        })
+
       const route = this.modelRouter.resolveModel(ctx.model)
-      const dto = buildSubAgentDtoForRoute(route)
+      const streamModel = route.model
 
       let fullText = ""
       const toolCalls: Array<{
@@ -8738,8 +9537,9 @@ ${raw}
       } | null = null
 
       try {
-        const stream = this.getBackendStream(dto, {
+        const stream = this.getBackendStream(streamModel, {
           buildDtoForRoute: buildSubAgentDtoForRoute,
+          buildCodexRequestForRoute: buildSubAgentCodexRequestForRoute,
         })
 
         for await (const sseEventStr of stream) {
@@ -9267,6 +10067,30 @@ ${raw}
       : path.resolve(normalizedRoot, filePath)
   }
 
+  private resolvePathForWorkspaceBoundaryCheck(candidatePath: string): string {
+    try {
+      return realpathSync(candidatePath)
+    } catch {
+      return path.resolve(candidatePath)
+    }
+  }
+
+  private isPathWithinWorkspaceRoot(
+    conversationId: string,
+    candidatePath: string
+  ): boolean {
+    const normalizedRoot = this.resolvePathForWorkspaceBoundaryCheck(
+      this.resolveWorkspaceRoot(conversationId)
+    )
+    const normalizedCandidate =
+      this.resolvePathForWorkspaceBoundaryCheck(candidatePath)
+    const relative = path.relative(normalizedRoot, normalizedCandidate)
+    return (
+      relative === "" ||
+      (!relative.startsWith("..") && !path.isAbsolute(relative))
+    )
+  }
+
   private async collectWorkspacePaths(
     rootPath: string,
     options?: { maxFiles?: number; maxDepth?: number }
@@ -9696,6 +10520,401 @@ ${raw}
     return {
       content:
         "[reapply success] patch request acknowledged; automatic patch replay is not enabled in this proxy runtime",
+      state: { status: "success" },
+    }
+  }
+
+  private executeInlineApplyPatch(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const patch = this.pickFirstString(input, ["patch", "diff", "input"]) || ""
+    if (!patch) {
+      return {
+        content: "[apply_patch error] Missing patch payload",
+        state: { status: "error", message: "missing patch" },
+      }
+    }
+
+    const result = spawnSync("apply_patch", {
+      cwd: this.resolveWorkspaceRoot(conversationId),
+      input: patch,
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 120_000,
+    })
+
+    if (result.error) {
+      const message = result.error.message || "failed to execute apply_patch"
+      input.applied = false
+      input.exit_code = result.status ?? null
+      input.stderr = message
+      return {
+        content: `[apply_patch error] ${message}`,
+        state: { status: "error", message },
+      }
+    }
+
+    const stdout = typeof result.stdout === "string" ? result.stdout.trim() : ""
+    const stderr = typeof result.stderr === "string" ? result.stderr.trim() : ""
+    const succeeded = result.status === 0
+    input.applied = succeeded
+    input.exit_code = result.status ?? null
+    input.stdout = stdout
+    input.stderr = stderr
+
+    const body =
+      stdout ||
+      stderr ||
+      (succeeded ? "Patch applied successfully" : "Patch failed")
+    return {
+      content: body,
+      state: {
+        status: succeeded ? "success" : "error",
+        message: succeeded ? undefined : body,
+      },
+    }
+  }
+
+  private executeInlineUpdatePlan(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const rawPlan = Array.isArray(input.plan) ? input.plan : []
+    const nowTs = Date.now()
+    const todos = rawPlan.flatMap((entry, index) => {
+      if (!entry || typeof entry !== "object") return []
+      const item = entry as Record<string, unknown>
+      const step =
+        this.pickFirstString(item, ["step", "content", "title", "name"]) || ""
+      if (!step) return []
+      return [
+        {
+          id:
+            this.pickFirstString(item, ["id", "todo_id", "todoId"]) ||
+            `plan_${index + 1}`,
+          content: step,
+          status: this.normalizeTodoStatus(item.status),
+          createdAt: nowTs,
+          updatedAt: nowTs,
+          dependencies: this.pickStringArray(item, [
+            "dependencies",
+            "depends_on",
+            "dependsOn",
+          ]),
+        },
+      ]
+    })
+
+    if (todos.length === 0) {
+      return {
+        content: "[update_plan error] Missing required plan items",
+        state: { status: "error", message: "missing plan items" },
+      }
+    }
+
+    const todoWriteInput: Record<string, unknown> = {
+      merge: false,
+      todos,
+    }
+    const todoWriteResult = this.executeInlineTodoWrite(
+      conversationId,
+      todoWriteInput
+    )
+    input.explanation = this.pickFirstString(input, ["explanation"]) || ""
+    input.todos = todoWriteInput.todos
+    input.updated_todos = todoWriteInput.updated_todos
+    input.updatedTodos = todoWriteInput.updatedTodos
+    input.total_count = todoWriteInput.total_count
+    input.totalCount = todoWriteInput.totalCount
+
+    return {
+      content:
+        todoWriteResult.state.status === "success"
+          ? "Plan updated"
+          : todoWriteResult.content,
+      state: todoWriteResult.state,
+    }
+  }
+
+  private executeInlineListMcpResourceTemplates(
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const server =
+      this.pickFirstString(input, ["server", "serverName", "server_name"]) || ""
+    input.server = server
+    input.templates = []
+    input.total_count = 0
+    input.totalCount = 0
+    return {
+      content: JSON.stringify(
+        {
+          total: 0,
+          templates: [],
+          ...(server ? { server } : {}),
+        },
+        null,
+        2
+      ),
+      state: { status: "success" },
+    }
+  }
+
+  private executeInlineViewImage(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    historyContent?: ParsedToolResult["inlineHistoryContent"]
+  } {
+    const requestedPath = this.pickFirstString(input, ["path"]) || ""
+    if (!requestedPath) {
+      return {
+        content: "[view_image error] Missing required path",
+        state: { status: "error", message: "missing path" },
+      }
+    }
+
+    const requestedDetail = this.pickFirstString(input, ["detail"]) || undefined
+    if (requestedDetail && requestedDetail !== "original") {
+      return {
+        content:
+          "view_image.detail only supports `original`; omit `detail` for default resized behavior",
+        state: {
+          status: "error",
+          message:
+            "view_image.detail only supports `original`; omit `detail` for default resized behavior",
+        },
+      }
+    }
+
+    const resolvedPath = this.resolveWorkspaceFilePath(
+      conversationId,
+      requestedPath
+    )
+    if (!this.isPathWithinWorkspaceRoot(conversationId, resolvedPath)) {
+      return {
+        content: `[view_image error] Path must stay within the active workspace: ${requestedPath}`,
+        state: {
+          status: "permission_denied",
+          message: "path outside active workspace",
+        },
+      }
+    }
+    try {
+      const stats = statSync(resolvedPath)
+      if (!stats.isFile()) {
+        return {
+          content: `[view_image error] Not a file: ${resolvedPath}`,
+          state: { status: "invalid_file", message: "not a file" },
+        }
+      }
+      const imageBytes = readFileSync(resolvedPath)
+      const imageBase64 = imageBytes.toString("base64")
+      const mediaType = this.resolveImageMediaType(resolvedPath, imageBytes)
+      input.path = resolvedPath
+      input.exists = true
+      input.file_size = stats.size
+      if (requestedDetail === "original") {
+        input.detail = "original"
+      }
+      return {
+        content: `[view_image success] path=${resolvedPath}\nsize=${stats.size}`,
+        state: { status: "success" },
+        historyContent: [
+          {
+            type: "image",
+            ...(requestedDetail === "original" ? { detail: "original" } : {}),
+            source: {
+              type: "base64",
+              media_type: mediaType,
+              data: imageBase64,
+            },
+          },
+        ],
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        content: `[view_image error] ${message}`,
+        state: { status: "file_not_found", message },
+      }
+    }
+  }
+
+  private executeInlineSpawnAgent(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const message = this.buildSyntheticCodexAgentMessage(input)
+    if (!message) {
+      return {
+        content: "[spawn_agent error] Missing required message/items",
+        state: { status: "error", message: "missing message/items" },
+      }
+    }
+
+    const agentId = `codex-agent-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`
+    const now = Date.now()
+    const agentType =
+      this.pickFirstString(input, ["agent_type", "agentType"]) || "default"
+    const nickname =
+      this.pickFirstString(input, ["nickname"]) ||
+      `${agentType}-agent-${agentId.slice(-4)}`
+    const model = this.pickFirstString(input, ["model"]) || ""
+
+    const agent: SyntheticCodexAgentState = {
+      agentId,
+      conversationId,
+      status: "completed",
+      createdAt: now,
+      updatedAt: now,
+      nickname,
+      agentType,
+      model: model || undefined,
+      message:
+        "Asynchronous sub-agent execution is not available in this proxy runtime.",
+      lastInput: message,
+    }
+    this.syntheticCodexAgents.set(agentId, agent)
+
+    input.agent_id = agentId
+    input.id = agentId
+    input.nickname = nickname
+    return {
+      content:
+        `[spawn_agent success]\n` +
+        JSON.stringify(this.buildSyntheticCodexAgentPayload(agent), null, 2),
+      state: { status: "success" },
+    }
+  }
+
+  private executeInlineSendAgentInput(input: Record<string, unknown>): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const target = this.pickFirstString(input, ["target"]) || ""
+    const agent = this.syntheticCodexAgents.get(target)
+    if (!agent) {
+      return {
+        content: `[send_input error] Agent not found: ${target}`,
+        state: { status: "error", message: "agent not found" },
+      }
+    }
+    if (agent.status === "closed") {
+      return {
+        content: `[send_input error] Agent is closed: ${target}`,
+        state: { status: "error", message: "agent is closed" },
+      }
+    }
+
+    agent.lastInput = this.buildSyntheticCodexAgentMessage(input)
+    agent.updatedAt = Date.now()
+    this.syntheticCodexAgents.set(target, agent)
+    return {
+      content:
+        `[send_input success]\n` +
+        JSON.stringify(this.buildSyntheticCodexAgentPayload(agent), null, 2),
+      state: { status: "success" },
+    }
+  }
+
+  private executeInlineResumeAgent(input: Record<string, unknown>): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const id = this.pickFirstString(input, ["id"]) || ""
+    const agent = this.syntheticCodexAgents.get(id)
+    if (!agent) {
+      return {
+        content: `[resume_agent error] Agent not found: ${id}`,
+        state: { status: "error", message: "agent not found" },
+      }
+    }
+    if (agent.status === "closed") {
+      agent.status = "completed"
+    }
+    agent.updatedAt = Date.now()
+    this.syntheticCodexAgents.set(id, agent)
+    return {
+      content:
+        `[resume_agent success]\n` +
+        JSON.stringify(this.buildSyntheticCodexAgentPayload(agent), null, 2),
+      state: { status: "success" },
+    }
+  }
+
+  private executeInlineWaitAgent(input: Record<string, unknown>): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const targets = this.pickStringArray(input, ["targets", "target"])
+    const matchedAgents = targets
+      .map((target) => this.syntheticCodexAgents.get(target))
+      .filter((agent): agent is SyntheticCodexAgentState => !!agent)
+
+    if (matchedAgents.length === 0) {
+      return {
+        content: "[wait_agent error] Agent not found",
+        state: { status: "error", message: "agent not found" },
+      }
+    }
+
+    const completedAgent = matchedAgents.find(
+      (agent) => agent.status === "completed" || agent.status === "closed"
+    )
+    if (!completedAgent) {
+      return {
+        content: `[wait_agent success]\n${JSON.stringify({ status: "" }, null, 2)}`,
+        state: { status: "success" },
+      }
+    }
+
+    return {
+      content:
+        `[wait_agent success]\n` +
+        JSON.stringify(
+          this.buildSyntheticCodexAgentPayload(completedAgent),
+          null,
+          2
+        ),
+      state: { status: "success" },
+    }
+  }
+
+  private executeInlineCloseAgent(input: Record<string, unknown>): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const target = this.pickFirstString(input, ["target"]) || ""
+    const agent = this.syntheticCodexAgents.get(target)
+    if (!agent) {
+      return {
+        content: `[close_agent error] Agent not found: ${target}`,
+        state: { status: "error", message: "agent not found" },
+      }
+    }
+
+    agent.status = "closed"
+    agent.updatedAt = Date.now()
+    this.syntheticCodexAgents.set(target, agent)
+    return {
+      content:
+        `[close_agent success]\n` +
+        JSON.stringify(this.buildSyntheticCodexAgentPayload(agent), null, 2),
       state: { status: "success" },
     }
   }
@@ -10226,6 +11445,7 @@ ${raw}
     content: string
     state: { status: ToolResultStatus; message?: string }
     projection?: ParsedToolResult["inlineProjection"]
+    historyContent?: ParsedToolResult["inlineHistoryContent"]
   }> {
     if (family === "command_status") {
       return this.executeInlineCommandStatus(conversationId, input)
@@ -10236,14 +11456,25 @@ ${raw}
     if (family === "update_todos") {
       return Promise.resolve(this.executeInlineTodoWrite(conversationId, input))
     }
+    if (family === "update_plan") {
+      return Promise.resolve(
+        this.executeInlineUpdatePlan(conversationId, input)
+      )
+    }
     if (family === "web_search" || family === "web_fetch") {
       return this.executeInlineWebTool(conversationId, toolName, input)
+    }
+    if (family === "list_mcp_resource_templates") {
+      return Promise.resolve(this.executeInlineListMcpResourceTemplates(input))
     }
     if (family === "read_url_content") {
       return this.executeInlineReadUrlContent(conversationId, input)
     }
     if (family === "view_content_chunk") {
       return this.executeInlineViewContentChunk(conversationId, input)
+    }
+    if (family === "view_image") {
+      return Promise.resolve(this.executeInlineViewImage(conversationId, input))
     }
     if (family === "fetch") {
       return this.executeInlineFetch(input)
@@ -10275,6 +11506,28 @@ ${raw}
           message: "wrong dispatch path",
         },
       }
+    }
+    if (family === "spawn_agent") {
+      return Promise.resolve(
+        this.executeInlineSpawnAgent(conversationId, input)
+      )
+    }
+    if (family === "send_input") {
+      return Promise.resolve(this.executeInlineSendAgentInput(input))
+    }
+    if (family === "resume_agent") {
+      return Promise.resolve(this.executeInlineResumeAgent(input))
+    }
+    if (family === "wait_agent") {
+      return Promise.resolve(this.executeInlineWaitAgent(input))
+    }
+    if (family === "close_agent") {
+      return Promise.resolve(this.executeInlineCloseAgent(input))
+    }
+    if (family === "apply_patch") {
+      return Promise.resolve(
+        this.executeInlineApplyPatch(conversationId, input)
+      )
     }
     if (family === "apply_agent_diff") {
       return this.executeInlineApplyAgentDiff(input)
@@ -10357,7 +11610,8 @@ ${raw}
     state: { status: ToolResultStatus; message?: string },
     inlineProjection?: ParsedToolResult["inlineProjection"],
     resultCase = "inline_tool_result",
-    inlineExtraData?: ParsedToolResult["inlineExtraData"]
+    inlineExtraData?: ParsedToolResult["inlineExtraData"],
+    inlineHistoryContent?: ParsedToolResult["inlineHistoryContent"]
   ): ParsedCursorRequest {
     return {
       conversation: [],
@@ -10375,6 +11629,7 @@ ${raw}
           resultCase,
           resultData: Buffer.alloc(0),
           inlineContent: content,
+          inlineHistoryContent,
           inlineState: state,
           inlineProjection,
           inlineExtraData,
@@ -10391,7 +11646,8 @@ ${raw}
     inlineProjection?: ParsedToolResult["inlineProjection"],
     resultCase = "inline_tool_result",
     inlineExtraData?: ParsedToolResult["inlineExtraData"],
-    options: HandleToolResultOptions = {}
+    options: HandleToolResultOptions = {},
+    inlineHistoryContent?: ParsedToolResult["inlineHistoryContent"]
   ): AsyncGenerator<Buffer> {
     const syntheticRequest = this.buildSyntheticInlineToolRequest(
       toolCallId,
@@ -10399,7 +11655,8 @@ ${raw}
       state,
       inlineProjection,
       resultCase,
-      inlineExtraData
+      inlineExtraData,
+      inlineHistoryContent
     )
     yield* this.handleToolResult(conversationId, syntheticRequest, options)
   }
@@ -10497,7 +11754,9 @@ ${raw}
 
     const parsed = this.extractInteractionResultCase(rawResponse)
 
-    if (family === "ask_question") {
+    if (family === "ask_question" || family === "request_user_input") {
+      const interactionFamily =
+        family === "request_user_input" ? "request_user_input" : "ask_question"
       switch (parsed.resultCase) {
         case "success": {
           const answers = this.normalizeAskQuestionProjectionAnswers(
@@ -10505,8 +11764,8 @@ ${raw}
           )
           const content =
             answers.length > 0
-              ? `[ask_question success] ${JSON.stringify(answers)}`
-              : "[ask_question success]"
+              ? `[${interactionFamily} success] ${JSON.stringify(answers)}`
+              : `[${interactionFamily} success]`
           yield* this.emitInlineToolResult(
             conversationId,
             toolCallId,
@@ -10527,7 +11786,7 @@ ${raw}
           yield* this.emitInlineToolResult(
             conversationId,
             toolCallId,
-            "[ask_question async] waiting for async completion",
+            `[${interactionFamily} async] waiting for async completion`,
             { status: "success", message: "async response" },
             {
               askQuestionResult: {
@@ -10541,7 +11800,7 @@ ${raw}
           yield* this.emitInlineToolResult(
             conversationId,
             toolCallId,
-            `[ask_question rejected] ${reason}`,
+            `[${interactionFamily} rejected] ${reason}`,
             { status: "rejected", message: reason },
             {
               askQuestionResult: {
@@ -10557,7 +11816,7 @@ ${raw}
           yield* this.emitInlineToolResult(
             conversationId,
             toolCallId,
-            `[ask_question error] ${message}`,
+            `[${interactionFamily} error] ${message}`,
             { status: "error", message },
             {
               askQuestionResult: {
@@ -10688,7 +11947,10 @@ ${raw}
         ? "web_search_inline_result"
         : family === "web_fetch"
           ? "web_fetch_inline_result"
-          : "inline_tool_result"
+          : "inline_tool_result",
+      undefined,
+      {},
+      result.historyContent
     )
     return true
   }
@@ -10738,6 +12000,21 @@ ${raw}
 
     if (family === "ask_question") {
       const askQuestionArgs = this.normalizeAskQuestionInteractionArgs(
+        input,
+        toolCallId
+      )
+      return this.grpcService.createInteractionQueryResponse(
+        interactionQueryId,
+        "askQuestionInteractionQuery",
+        {
+          args: askQuestionArgs,
+          toolCallId,
+        }
+      )
+    }
+
+    if (family === "request_user_input") {
+      const askQuestionArgs = this.normalizeRequestUserInputInteractionArgs(
         input,
         toolCallId
       )
@@ -10868,6 +12145,72 @@ ${raw}
           startCommand:
             this.pickFirstString(input, ["startCommand", "start_command"]) ||
             "",
+        }
+      )
+    }
+
+    // 新增 proto 更新后的 InteractionQuery 构建
+    if (family === "generate_image") {
+      return this.grpcService.createInteractionQueryResponse(
+        interactionQueryId,
+        "generateImageRequestQuery",
+        {
+          prompt: this.pickFirstString(input, ["prompt", "description"]) || "",
+          toolCallId,
+        }
+      )
+    }
+
+    if (family === "mcp_auth") {
+      return this.grpcService.createInteractionQueryResponse(
+        interactionQueryId,
+        "mcpAuthRequestQuery",
+        {
+          serverName:
+            this.pickFirstString(input, [
+              "serverName",
+              "server_name",
+              "server",
+            ]) || "",
+          url: this.pickFirstString(input, ["url"]) || "",
+          toolCallId,
+        }
+      )
+    }
+
+    // InteractionQuery 补齐：pr_management
+    if (family === "pr_management") {
+      return this.grpcService.createInteractionQueryResponse(
+        interactionQueryId,
+        "prManagementRequestQuery",
+        {
+          args: {
+            toolCallId,
+            action: {
+              case:
+                this.pickFirstString(input, ["action_type", "actionType"]) ===
+                "update_pr"
+                  ? "updatePr"
+                  : "createPr",
+              value: {
+                title: this.pickFirstString(input, ["title"]) || "",
+                body:
+                  this.pickFirstString(input, ["body", "description"]) || "",
+                baseBranch:
+                  this.pickFirstString(input, [
+                    "baseBranch",
+                    "base_branch",
+                    "base",
+                  ]) || "",
+                headBranch:
+                  this.pickFirstString(input, [
+                    "headBranch",
+                    "head_branch",
+                    "head",
+                  ]) || "",
+              },
+            },
+          },
         }
       )
     }
@@ -11037,6 +12380,134 @@ ${raw}
       }
     }
 
+    if (family === "update_plan") {
+      const planItems = Array.isArray(input.plan) ? input.plan : []
+      if (planItems.length === 0) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[update_plan error] Missing required plan items",
+          { status: "error", message: "missing plan items" }
+        )
+        return true
+      }
+    }
+
+    if (family === "request_user_input") {
+      const questions = Array.isArray(input.questions) ? input.questions : []
+      if (questions.length === 0) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[request_user_input error] Missing required questions",
+          { status: "error", message: "missing questions" }
+        )
+        return true
+      }
+    }
+
+    if (family === "view_image") {
+      const imagePath = this.pickFirstString(input, ["path"]) || ""
+      if (!imagePath) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[view_image error] Missing required path",
+          { status: "error", message: "missing path" }
+        )
+        return true
+      }
+    }
+
+    if (family === "apply_patch") {
+      const patch =
+        this.pickFirstString(input, ["patch", "diff", "input"]) || ""
+      if (!patch) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[apply_patch error] Missing required patch payload",
+          { status: "error", message: "missing patch" }
+        )
+        return true
+      }
+    }
+
+    if (family === "spawn_agent") {
+      const message = this.buildSyntheticCodexAgentMessage(input)
+      if (!message) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[spawn_agent error] Missing required message/items",
+          { status: "error", message: "missing message/items" }
+        )
+        return true
+      }
+    }
+
+    if (family === "send_input") {
+      const target = this.pickFirstString(input, ["target"]) || ""
+      const message = this.buildSyntheticCodexAgentMessage(input)
+      if (!target) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[send_input error] Missing required target",
+          { status: "error", message: "missing target" }
+        )
+        return true
+      }
+      if (!message) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[send_input error] Missing required message/items",
+          { status: "error", message: "missing message/items" }
+        )
+        return true
+      }
+    }
+
+    if (family === "resume_agent") {
+      const id = this.pickFirstString(input, ["id"]) || ""
+      if (!id) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[resume_agent error] Missing required id",
+          { status: "error", message: "missing id" }
+        )
+        return true
+      }
+    }
+
+    if (family === "wait_agent") {
+      const targets = this.pickStringArray(input, ["targets", "target"])
+      if (targets.length === 0) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[wait_agent error] Missing required targets",
+          { status: "error", message: "missing targets" }
+        )
+        return true
+      }
+    }
+
+    if (family === "close_agent") {
+      const target = this.pickFirstString(input, ["target"]) || ""
+      if (!target) {
+        yield* this.emitInlineToolResult(
+          conversationId,
+          toolCallId,
+          "[close_agent error] Missing required target",
+          { status: "error", message: "missing target" }
+        )
+        return true
+      }
+    }
+
     if (family === "go_to_definition") {
       const symbol = this.pickFirstString(input, ["symbol", "query"]) || ""
       if (!symbol) {
@@ -11062,7 +12533,11 @@ ${raw}
         toolCallId,
         result.content,
         result.state,
-        result.projection
+        result.projection,
+        "inline_tool_result",
+        undefined,
+        {},
+        result.historyContent
       )
 
       return true
@@ -11210,13 +12685,20 @@ ${raw}
       : execDispatchTarget && canonicalToolName === "generate_image"
         ? undefined
         : this.normalizeDeferredToolFamily(canonicalToolName)
+    const historyToolName =
+      canonicalInvocation.historyToolName || canonicalToolName
 
     return {
       activeToolCall: toolCall,
       canonicalToolName,
       input,
-      historyToolName: canonicalInvocation.historyToolName || canonicalToolName,
+      historyToolName,
       historyToolInput: canonicalInvocation.historyToolInput || input,
+      codexToolCallType: this.resolveCodexToolCallType(
+        historyToolName,
+        canonicalToolName,
+        execDispatchTarget?.toolName
+      ),
       deferredToolFamily,
       execDispatchTarget: execDispatchTarget || undefined,
       dispatchErrorMessage:
@@ -11237,7 +12719,25 @@ ${raw}
       id: preparedTool.activeToolCall.id,
       name: preparedTool.historyToolName,
       input: preparedTool.historyToolInput,
+      tool_call_type: preparedTool.codexToolCallType,
     })
+  }
+
+  private resolveCodexToolCallType(
+    ...toolNames: Array<string | undefined>
+  ): "function" | "custom" {
+    for (const rawToolName of toolNames) {
+      const normalizedToolName = (rawToolName || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+      if (normalizedToolName === "apply_patch") {
+        return "custom"
+      }
+    }
+
+    return "function"
   }
 
   private persistAssistantToolBatchMessage(
@@ -11497,6 +12997,13 @@ ${raw}
       }
     }
 
+    if (dominantTool === "exec_command") {
+      const command = this.pickShellCommand(firstTool?.input)
+      if (command) {
+        return `Ran ${this.truncateForToolSummary(command, 36)}`
+      }
+    }
+
     if (dominantTool === "read_lints") {
       return "Read lint diagnostics"
     }
@@ -11525,7 +13032,7 @@ ${raw}
       }
     }
 
-    if (toolName === "run_terminal_command") {
+    if (toolName === "run_terminal_command" || toolName === "exec_command") {
       const command = this.pickShellCommand(input)
       if (command) {
         return `command=${this.truncateForToolSummary(command, 60)}`
@@ -11623,6 +13130,8 @@ ${raw}
       case "web_fetch":
       case "command_status":
         return true
+      case "exec_command":
+        return this.isReadOnlyShellCommand(this.pickShellCommand(input))
       case "run_terminal_command":
       case "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2":
       case "run_terminal_command_v2":
@@ -11967,7 +13476,8 @@ ${raw}
       preparedTool.protocolToolFamilyHint,
       activeToolCall.modelCallId,
       preparedTool.historyToolName,
-      preparedTool.historyToolInput
+      preparedTool.historyToolInput,
+      preparedTool.codexToolCallType
     )
 
     if (this.isEditToolInvocation(preparedTool.protocolToolName)) {
@@ -12530,6 +14040,80 @@ ${raw}
             if (shouldEndStream) {
               return
             }
+          } else if (
+            parsed.agentControlType === "prewarm" &&
+            parsed.model.trim().length > 0
+          ) {
+            try {
+              const route = this.modelRouter.resolveModel(parsed.model)
+              this.startProviderWarmup(
+                route,
+                parsed.conversationId || conversationId,
+                "protocol-prewarm"
+              )
+            } catch (error) {
+              this.logger.debug(
+                `Skipped protocol prewarm for model=${parsed.model}: ${error instanceof Error ? error.message : String(error)}`
+              )
+            }
+          } else if (
+            parsed.agentControlType === "summarizeAction" &&
+            conversationId
+          ) {
+            this.logger.log(`ConversationAction.summarize: ${conversationId}`)
+          } else if (
+            parsed.agentControlType === "shellCommandAction" &&
+            conversationId
+          ) {
+            const cmd = parsed.agentControlShellCommand
+            this.logger.log(
+              `ConversationAction.shellCommand: ${conversationId} command="${(cmd?.command || "").substring(0, 80)}" execId=${cmd?.execId || "(none)"}`
+            )
+          } else if (
+            parsed.agentControlType === "startPlanAction" &&
+            conversationId
+          ) {
+            this.logger.log(`ConversationAction.startPlan: ${conversationId}`)
+          } else if (
+            parsed.agentControlType === "executePlanAction" &&
+            conversationId
+          ) {
+            this.logger.log(`ConversationAction.executePlan: ${conversationId}`)
+          } else if (
+            parsed.agentControlType === "asyncAskQuestionCompletionAction" &&
+            conversationId
+          ) {
+            this.logger.log(
+              `ConversationAction.asyncAskQuestionCompletion: ${conversationId} toolCallId=${parsed.agentControlToolCallId || "(none)"}`
+            )
+          } else if (
+            parsed.agentControlType === "cancelSubagentAction" &&
+            conversationId
+          ) {
+            this.logger.log(
+              `ConversationAction.cancelSubagent: ${conversationId} subagentId=${parsed.agentControlSubagentId || "(none)"}`
+            )
+          } else if (
+            parsed.agentControlType === "backgroundTaskCompletionAction" &&
+            conversationId
+          ) {
+            this.logger.log(
+              `ConversationAction.backgroundTaskCompletion: ${conversationId}`
+            )
+          } else if (
+            parsed.agentControlType === "backgroundShellAction" &&
+            conversationId
+          ) {
+            this.logger.log(
+              `ConversationAction.backgroundShell: ${conversationId} toolCallId=${parsed.agentControlToolCallId || "(none)"}`
+            )
+          } else if (
+            parsed.agentControlType === "backgroundSubagentAction" &&
+            conversationId
+          ) {
+            this.logger.log(
+              `ConversationAction.backgroundSubagent: ${conversationId} toolCallId=${parsed.agentControlToolCallId || "(none)"}`
+            )
           } else {
             this.logger.debug(
               `Agent control message: ${parsed.agentControlType}`
@@ -12926,6 +14510,7 @@ ${raw}
     this.logger.debug(
       `Mapped Cursor model "${parsed.model}" to backend model "${backendModel}" (backend=${route.backend})`
     )
+    this.startProviderWarmup(route, conversationId, "initial-chat")
 
     // Build message history
     // For multi-turn conversations, use session.messages (which includes history)
@@ -13045,11 +14630,19 @@ ${raw}
       )
     }
 
+    toolsToUse = this.optimizeImplicitCodexTools(route.backend, toolsToUse, {
+      webSearchEnabled: parsed.useWeb,
+      webFetchEnabled: parsed.useWeb,
+    })
+
     const mcpToolDefs =
       parsed.mcpToolDefs && parsed.mcpToolDefs.length > 0
         ? parsed.mcpToolDefs
         : session.mcpToolDefs
-    const apiTools = buildToolsForApi(toolsToUse, { mcpToolDefs })
+    const apiTools = buildToolsForApi(toolsToUse, {
+      mcpToolDefs,
+      backend: route.backend,
+    })
 
     // Apply truncation to stay within token limits
     const budget = this.resolveMessageBudget(route.backend, {
@@ -13104,6 +14697,7 @@ ${raw}
         toolDefinitions: apiTools,
         pendingToolUseIds,
         thinkingLevel: parsed.thinkingLevel,
+        thinkingDetailsRequested: parsed.thinkingDetailsRequested,
         buildMessages: (routeBudget) =>
           this.truncateMessagesForBackend(
             session,
@@ -13120,14 +14714,40 @@ ${raw}
           ) as CreateMessageDto["messages"],
       })
 
-    const dto = buildChatDtoForRoute(route)
+    const buildChatCodexRequestForRoute = (streamRoute: ModelRouteResult) =>
+      this.buildCodexStreamingRequestForRoute(streamRoute, {
+        model: session.model,
+        promptContext: parsed,
+        conversationId,
+        session,
+        toolDefinitions: apiTools,
+        pendingToolUseIds,
+        thinkingLevel: parsed.thinkingLevel,
+        thinkingDetailsRequested: parsed.thinkingDetailsRequested,
+        buildMessages: (routeBudget) =>
+          this.truncateMessagesForBackend(
+            session,
+            streamRoute.backend,
+            {
+              maxTokens: routeBudget.maxTokens,
+              systemPromptTokens: routeBudget.systemPromptTokens,
+            },
+            {
+              contextLabel: `chat pre-send: ${conversationId}`,
+              pendingToolUseIds,
+              strategy: "auto",
+            }
+          ) as CodexExecutionRequest["messages"],
+      })
+
     yield* this.emitPendingContextSummaryUiUpdate(conversationId)
     this.logger.debug(`Added ${apiTools.length} tool definition(s) to request`)
 
     // Call backend API (routed based on model name)
     try {
-      const stream = this.getBackendStream(dto, {
+      const stream = this.getBackendStream(route.model, {
         buildDtoForRoute: buildChatDtoForRoute,
+        buildCodexRequestForRoute: buildChatCodexRequestForRoute,
         streamAbortBinding:
           streamId && conversationId
             ? {
@@ -13763,7 +15383,9 @@ ${raw}
         toolCallId,
         pendingToolCall.toolName,
         pendingToolCall.toolInput,
-        adaptedToolResultContent
+        adaptedToolResultContent,
+        undefined,
+        pendingToolCall.codexToolCallType || "function"
       )
 
       if (
@@ -13782,6 +15404,9 @@ ${raw}
       const backendLabel = route.backend
       const remainingPendingToolUseIds =
         this.sessionManager.getPendingToolCallIds(conversationId)
+      this.startProviderWarmup(route, conversationId, "shell-continuation", {
+        pendingToolUseIds: remainingPendingToolUseIds,
+      })
 
       if (
         this.shouldDeferToolBatchContinuation(
@@ -13802,7 +15427,14 @@ ${raw}
           `shell continuation bootstrap: ${conversationId}`
         )
 
-      const toolsToUse = activeSession.supportedTools || []
+      const toolsToUse = this.optimizeImplicitCodexTools(
+        route.backend,
+        activeSession.supportedTools || [],
+        {
+          webSearchEnabled: activeSession.useWeb,
+          webFetchEnabled: activeSession.useWeb,
+        }
+      )
       if (toolsToUse.length === 0) {
         this.logger.warn(
           "Tool-result continuation running with empty supportedTools (strict mode)"
@@ -13811,6 +15443,7 @@ ${raw}
 
       const apiTools = buildToolsForApi(toolsToUse, {
         mcpToolDefs: activeSession.mcpToolDefs,
+        backend: route.backend,
       })
 
       const normalizedShellHistory = this.normalizeHistoryForBackend(
@@ -13841,6 +15474,7 @@ ${raw}
           toolDefinitions: apiTools,
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
+          thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
           buildMessages: (routeBudget) =>
             this.truncateMessagesForBackend(
               activeSession,
@@ -13857,12 +15491,40 @@ ${raw}
             ) as CreateMessageDto["messages"],
         })
 
-      const dto = buildShellContinuationDtoForRoute(route)
+      const buildShellContinuationCodexRequestForRoute = (
+        streamRoute: ModelRouteResult
+      ) =>
+        this.buildCodexStreamingRequestForRoute(streamRoute, {
+          model: activeSession.model,
+          promptContext: activeSession,
+          conversationId,
+          session: activeSession,
+          toolDefinitions: apiTools,
+          pendingToolUseIds: remainingPendingToolUseIds,
+          thinkingLevel: activeSession.thinkingLevel,
+          thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
+          buildMessages: (routeBudget) =>
+            this.truncateMessagesForBackend(
+              activeSession,
+              streamRoute.backend,
+              {
+                maxTokens: routeBudget.maxTokens,
+                systemPromptTokens: routeBudget.systemPromptTokens,
+              },
+              {
+                contextLabel: `shell continuation: ${conversationId}`,
+                pendingToolUseIds: remainingPendingToolUseIds,
+                strategy: "reactive",
+              }
+            ) as CodexExecutionRequest["messages"],
+        })
+
       yield* this.emitPendingContextSummaryUiUpdate(conversationId)
 
       try {
-        const stream = this.getBackendStream(dto, {
+        const stream = this.getBackendStream(route.model, {
           buildDtoForRoute: buildShellContinuationDtoForRoute,
+          buildCodexRequestForRoute: buildShellContinuationCodexRequestForRoute,
           streamAbortBinding: pendingToolCall.streamId
             ? {
                 conversationId,
@@ -14513,7 +16175,10 @@ ${raw}
           ExecClientMessageSchema,
           toolResult.resultData
         )
-        if (execMsg.message.case === "readResult") {
+        if (
+          execMsg.message.case === "readResult" ||
+          execMsg.message.case === "redactedReadResult"
+        ) {
           const readResult = execMsg.message.value.result
           if (readResult.case === "success") {
             const output = readResult.value.output
@@ -14837,6 +16502,8 @@ ${raw}
       toolResultState,
       extraData
     )
+    const historyToolResultPayload =
+      toolResult.inlineHistoryContent ?? historyToolResultContent
     const historyToolStructuredContent = this.buildStructuredHistoryToolResult(
       pendingToolCall,
       historyToolResultContent,
@@ -14852,8 +16519,9 @@ ${raw}
       toolCallId,
       historyToolName,
       historyToolInput,
-      historyToolResultContent,
-      historyToolStructuredContent
+      historyToolResultPayload,
+      historyToolStructuredContent,
+      pendingToolCall.codexToolCallType || "function"
     )
 
     const completedBatchSummary = this.recordCompletedToolResultInTopLevelState(
@@ -14894,6 +16562,9 @@ ${raw}
       const backendModel = route.model
       const remainingPendingToolUseIds =
         this.sessionManager.getPendingToolCallIds(conversationId)
+      this.startProviderWarmup(route, conversationId, "tool-continuation", {
+        pendingToolUseIds: remainingPendingToolUseIds,
+      })
       this.logger.debug(
         `Mapped Cursor model "${session.model}" to backend model "${backendModel}" for tool result continuation (backend=${route.backend})`
       )
@@ -14922,7 +16593,14 @@ ${raw}
         conversationId
       )
       topLevelTurnState.llmTurnCount += 1
-      const toolsForContinuation = activeSession.supportedTools || []
+      const toolsForContinuation = this.optimizeImplicitCodexTools(
+        route.backend,
+        activeSession.supportedTools || [],
+        {
+          webSearchEnabled: activeSession.useWeb,
+          webFetchEnabled: activeSession.useWeb,
+        }
+      )
       if (toolsForContinuation.length === 0) {
         this.logger.warn(
           "Continuation generation running with empty supportedTools (strict mode)"
@@ -14931,6 +16609,7 @@ ${raw}
 
       const allContinuationTools = buildToolsForApi(toolsForContinuation, {
         mcpToolDefs: activeSession.mcpToolDefs,
+        backend: route.backend,
       })
       const normalizedContinuationHistory = this.normalizeHistoryForBackend(
         activeSession.messages as Array<{
@@ -15009,6 +16688,7 @@ ${raw}
           additionalSystemPrompt,
           pendingToolUseIds: remainingPendingToolUseIds,
           thinkingLevel: activeSession.thinkingLevel,
+          thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
           buildMessages: (routeBudget) =>
             this.truncateMessagesForBackend(
               activeSession,
@@ -15025,12 +16705,41 @@ ${raw}
             ) as CreateMessageDto["messages"],
         })
 
-      const dto = buildContinuationDtoForRoute(route)
+      const buildContinuationCodexRequestForRoute = (
+        streamRoute: ModelRouteResult
+      ) =>
+        this.buildCodexStreamingRequestForRoute(streamRoute, {
+          model: activeSession.model,
+          promptContext: activeSession,
+          conversationId,
+          session: activeSession,
+          toolDefinitions: continuationTools,
+          additionalSystemPrompt,
+          pendingToolUseIds: remainingPendingToolUseIds,
+          thinkingLevel: activeSession.thinkingLevel,
+          thinkingDetailsRequested: activeSession.thinkingDetailsRequested,
+          buildMessages: (routeBudget) =>
+            this.truncateMessagesForBackend(
+              activeSession,
+              streamRoute.backend,
+              {
+                maxTokens: routeBudget.maxTokens,
+                systemPromptTokens: routeBudget.systemPromptTokens,
+              },
+              {
+                contextLabel: `tool continuation: ${conversationId}`,
+                pendingToolUseIds: remainingPendingToolUseIds,
+                strategy: "reactive",
+              }
+            ) as CodexExecutionRequest["messages"],
+        })
+
       yield* this.emitPendingContextSummaryUiUpdate(conversationId)
 
       // Stream the continuation - may include more tool calls (routed based on model)
-      const stream = this.getBackendStream(dto, {
+      const stream = this.getBackendStream(route.model, {
         buildDtoForRoute: buildContinuationDtoForRoute,
+        buildCodexRequestForRoute: buildContinuationCodexRequestForRoute,
         streamAbortBinding: options.streamId
           ? {
               conversationId,
@@ -15059,8 +16768,9 @@ ${raw}
 
         // Retry: rebuild and resend the same continuation request
         try {
-          const retryStream = this.getBackendStream(dto, {
+          const retryStream = this.getBackendStream(route.model, {
             buildDtoForRoute: buildContinuationDtoForRoute,
+            buildCodexRequestForRoute: buildContinuationCodexRequestForRoute,
             streamAbortBinding: options.streamId
               ? {
                   conversationId,
@@ -15260,12 +16970,20 @@ ${raw}
       case "approved":
       case "startSuccess":
       case "backgrounded":
+      // falls through — SubagentAwaitResult: complete、RecordScreenResult: saveSuccess/discardSuccess
+      case "complete":
+      case "stillRunning":
+      case "saveSuccess":
+      case "discardSuccess":
         return { status: "success", message }
       case "failure":
         return { status: "failure", message }
       case "error":
       case "fileBusy":
       case "noSpace":
+      // falls through — McpResult: toolNotFound、SubagentAwaitResult: notFound
+      case "toolNotFound":
+      case "notFound":
         return { status: "error", message }
       case "timeout":
         return { status: "timeout", message }
@@ -15276,7 +16994,6 @@ ${raw}
       case "spawnError":
         return { status: "spawn_error", message }
       case "fileNotFound":
-      case "notFound":
         return { status: "file_not_found", message }
       case "invalidFile":
       case "notFile":
@@ -15568,7 +17285,7 @@ ${raw}
         }
       }
 
-      if (msgCase === "readResult") {
+      if (msgCase === "readResult" || msgCase === "redactedReadResult") {
         const readCase = execMsg.message.value.result.case
         switch (readCase) {
           case "success":
@@ -15655,6 +17372,37 @@ ${raw}
       if (genericStatus) {
         return genericStatus
       }
+
+      // 非标准结构 Result：没有 oneOf result 字段，generic 路径无法处理
+      if (
+        msgCase === "forceBackgroundShellResult" ||
+        msgCase === "forceBackgroundSubagentResult"
+      ) {
+        // ForceBackgroundShellResult { status: enum(0=UNSPECIFIED, 1=ACCEPTED, 2=NOT_FOUND) }
+        const statusEnum = (execMsg.message.value as { status?: number }).status
+        if (statusEnum === 1) return { status: "success" }
+        if (statusEnum === 2) return { status: "error", message: "not found" }
+        return { status: "error", message: "unspecified status" }
+      }
+      if (msgCase === "canvasGetUrlResult") {
+        // CanvasGetUrlResult { url?: string }
+        const url = (execMsg.message.value as { url?: string }).url
+        return url
+          ? { status: "success" }
+          : { status: "error", message: "no url returned" }
+      }
+      if (msgCase === "canvasDestroyResult") {
+        // CanvasDestroyResult { success: bool, stopped_server: bool }
+        const success = (execMsg.message.value as { success?: boolean }).success
+        return success
+          ? { status: "success" }
+          : { status: "error", message: "canvas destroy failed" }
+      }
+      if (msgCase === "executeHookResult") {
+        // ExecuteHookResult { response: ExecuteHookResponse }
+        // 有 response 就表示成功
+        return { status: "success" }
+      }
     } catch (error) {
       this.logger.debug(
         `Failed to derive tool result state from buffer: ${String(error)}`
@@ -15707,8 +17455,8 @@ ${raw}
         return this.formatShellStreamTyped(execMsg.message.value)
       }
 
-      // ──── Read Result ────
-      if (msgCase === "readResult") {
+      // ──── Read Result / Redacted Read Result ────
+      if (msgCase === "readResult" || msgCase === "redactedReadResult") {
         return this.formatReadResultTyped(execMsg.message.value)
       }
 
@@ -15740,6 +17488,51 @@ ${raw}
       // ──── Background Shell Spawn Result ────
       if (msgCase === "backgroundShellSpawnResult") {
         return this.formatBgShellSpawnTyped(execMsg.message.value)
+      }
+
+      // ──── 非标准结构 Result 专门格式化 ────
+
+      // ForceBackgroundShellResult / ForceBackgroundSubagentResult: { status: enum }
+      if (
+        msgCase === "forceBackgroundShellResult" ||
+        msgCase === "forceBackgroundSubagentResult"
+      ) {
+        const statusEnum = (execMsg.message.value as { status?: number }).status
+        const label =
+          msgCase === "forceBackgroundShellResult"
+            ? "forceBackgroundShell"
+            : "forceBackgroundSubagent"
+        if (statusEnum === 1) return `[${label}] accepted`
+        if (statusEnum === 2) return `[${label}] not found`
+        return `[${label}] status=${statusEnum ?? "unspecified"}`
+      }
+
+      // CanvasGetUrlResult: { url?: string }
+      if (msgCase === "canvasGetUrlResult") {
+        const url = (execMsg.message.value as { url?: string }).url
+        return url
+          ? `[canvasGetUrl] url=${url}`
+          : "[canvasGetUrl] no url returned"
+      }
+
+      // CanvasDestroyResult: { success: bool, stopped_server: bool }
+      if (msgCase === "canvasDestroyResult") {
+        const payload = execMsg.message.value as {
+          success?: boolean
+          stoppedServer?: boolean
+        }
+        return payload.success
+          ? `[canvasDestroy] success (stoppedServer=${payload.stoppedServer ?? false})`
+          : "[canvasDestroy] failed"
+      }
+
+      // ExecuteHookResult: { response: ExecuteHookResponse }
+      if (msgCase === "executeHookResult") {
+        const payload = execMsg.message.value as {
+          response?: { response?: { case?: string; value?: unknown } }
+        }
+        const hookCase = payload.response?.response?.case || "(unknown)"
+        return `[executeHook] response=${hookCase}`
       }
 
       const generic = this.formatGenericExecResult(
@@ -15907,6 +17700,53 @@ ${raw}
     }
     if (r.case === "permissionDenied") return "[permission denied]"
     return "Command completed"
+  }
+
+  private resolveImageMediaType(
+    filePath: string,
+    fileBytes?: Uint8Array
+  ): string {
+    const ext = path.extname(filePath).toLowerCase()
+    if (ext === ".png") return "image/png"
+    if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg"
+    if (ext === ".gif") return "image/gif"
+    if (ext === ".webp") return "image/webp"
+    if (ext === ".svg") return "image/svg+xml"
+
+    if (fileBytes && fileBytes.length >= 12) {
+      if (
+        fileBytes[0] === 0x89 &&
+        fileBytes[1] === 0x50 &&
+        fileBytes[2] === 0x4e &&
+        fileBytes[3] === 0x47
+      ) {
+        return "image/png"
+      }
+      if (fileBytes[0] === 0xff && fileBytes[1] === 0xd8) {
+        return "image/jpeg"
+      }
+      if (
+        fileBytes[0] === 0x47 &&
+        fileBytes[1] === 0x49 &&
+        fileBytes[2] === 0x46
+      ) {
+        return "image/gif"
+      }
+      if (
+        fileBytes[0] === 0x52 &&
+        fileBytes[1] === 0x49 &&
+        fileBytes[2] === 0x46 &&
+        fileBytes[3] === 0x46 &&
+        fileBytes[8] === 0x57 &&
+        fileBytes[9] === 0x45 &&
+        fileBytes[10] === 0x42 &&
+        fileBytes[11] === 0x50
+      ) {
+        return "image/webp"
+      }
+    }
+
+    return "application/octet-stream"
   }
 
   private formatShellStreamTyped(stream: ShellStream): string {
@@ -16219,6 +18059,60 @@ ${raw}
     return parts.join("\n\n")
   }
 
+  private buildCodexSystemPrompt(context: PromptContext): string {
+    const parts: string[] = []
+
+    if (context.customSystemPrompt) {
+      parts.push(context.customSystemPrompt)
+    }
+
+    parts.push(this.buildCodexToolUsageSection())
+
+    const cursorRulesSection = this.buildCursorRulesSection(
+      this.resolveEffectiveRuleContents(context.cursorRules)
+    )
+    if (cursorRulesSection) {
+      parts.push(cursorRulesSection)
+    }
+
+    if (context.cursorCommands && context.cursorCommands.length > 0) {
+      const commandBlocks = context.cursorCommands.map((command) =>
+        [`/${command.name}`, command.content].join("\n")
+      )
+      parts.push("Selected Cursor Commands:\n" + commandBlocks.join("\n\n"))
+    }
+
+    if (context.explicitContext) {
+      parts.push("Explicit Context:\n" + context.explicitContext)
+    }
+
+    if (context.projectContext) {
+      const workspaceInfo = [
+        `Current working directory: ${context.projectContext.rootPath}`,
+      ]
+      if (context.projectContext.directories.length > 1) {
+        workspaceInfo.push(
+          `Open workspaces: ${context.projectContext.directories.join(", ")}`
+        )
+      }
+      parts.push(workspaceInfo.join("\n"))
+    }
+
+    if (context.codeChunks && context.codeChunks.length > 0) {
+      const chunkTexts = context.codeChunks.map((chunk) => {
+        const lineInfo = chunk.startLine
+          ? `:${chunk.startLine}-${chunk.endLine}`
+          : ""
+        return `--- ${chunk.path}${lineInfo} ---\n${chunk.content}`
+      })
+      parts.push("Code Context:\n" + chunkTexts.join("\n\n"))
+    }
+
+    parts.push(CursorConnectStreamService.LANGUAGE_INSTRUCTION)
+
+    return parts.join("\n\n")
+  }
+
   private buildGoogleSystemPrompt(context: PromptContext): string {
     const parts: string[] = []
     if (context.customSystemPrompt) {
@@ -16243,6 +18137,23 @@ ${raw}
       "- To discover files or inspect directory contents, use glob_search, file_search, or list_directory instead of find or ls.",
       "- To edit existing files, use edit_file_v2 instead of sed, awk, perl, python, or shell patching.",
       "- Before editing, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
+      "- If the task already requires a report, artifact, or file edit and you have enough evidence, perform that write now instead of only saying that you will do it next.",
+      "- Reserve run_terminal_command for build/test execution, system commands, or tasks where no structured tool can express the work.",
+      "- If multiple tool calls are independent, make them in parallel. If one depends on another, run them sequentially.",
+    ].join("\n")
+  }
+
+  private buildCodexToolUsageSection(): string {
+    return [
+      "Using your tools:",
+      "- Do NOT use run_terminal_command when a relevant dedicated tool is available. This is critical because dedicated tools keep the session structured and reviewable.",
+      "- To inspect file contents, use read_file instead of cat, sed, head, or tail.",
+      "- To search file contents, use grep_search instead of grep or rg.",
+      "- To discover files or inspect directory contents, use glob_search, file_search, or list_directory instead of find or ls.",
+      "- To edit existing files, use edit_file_v2 instead of sed, awk, perl, python, or shell patching.",
+      "- Before editing, read the file in the current conversation and copy a small unique search snippet verbatim from read_file output. Do not include any display-only line number prefixes.",
+      "- If you need to continue an existing shell session, use write_shell_stdin instead of starting a fresh run_terminal_command.",
+      "- Prefer MCP resources over web_search when the required context is available from a configured MCP server.",
       "- If the task already requires a report, artifact, or file edit and you have enough evidence, perform that write now instead of only saying that you will do it next.",
       "- Reserve run_terminal_command for build/test execution, system commands, or tasks where no structured tool can express the work.",
       "- If multiple tool calls are independent, make them in parallel. If one depends on another, run them sequentially.",
@@ -16659,8 +18570,9 @@ ${raw}
   private resolveRequestedCodexServiceTier(
     requestedModelParameters?: Record<string, string>
   ): string | undefined {
+    const defaultServiceTier = this.codexService.getDefaultServiceTier()
     if (!requestedModelParameters) {
-      return undefined
+      return defaultServiceTier
     }
 
     const normalizeValue = (rawValue?: string): string | undefined => {
@@ -16708,7 +18620,7 @@ ${raw}
       }
     }
 
-    return undefined
+    return defaultServiceTier
   }
 
   private normalizeRequestedReasoningEffort(

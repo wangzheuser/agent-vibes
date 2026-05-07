@@ -146,6 +146,26 @@
         "icon": "$(gear)"
       },
       {
+        "command": "agentVibes.applyCursorShellAutoRunPatch",
+        "title": "Apply Cursor Shell Auto-Run Patch",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.restoreCursorShellAutoRunPatch",
+        "title": "Restore Cursor Shell Auto-Run Patch",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.applyCursorChecksums",
+        "title": "Apply Cursor Checksums Fix",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.resetCursorPatches",
+        "title": "Reset Cursor Patches",
+        "category": "Agent Vibes"
+      },
+      {
         "command": "agentVibes.checkExtensionUpdates",
         "title": "Check Extension Updates",
         "category": "Agent Vibes",

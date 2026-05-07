@@ -13,7 +13,10 @@ import {
   toOfficialAntigravityToolName as toOfficialAntigravityToolNameFromContract,
 } from "../../shared/official-antigravity-tools"
 import { UsageStatsService } from "../../usage"
-import { UpstreamRequestAbortedError } from "../shared/abort-signal"
+import {
+  combineAbortSignals,
+  UpstreamRequestAbortedError,
+} from "../shared/abort-signal"
 import { BackendApiError } from "../shared/backend-errors"
 import {
   DEFAULT_CLAUDE_MODEL,
@@ -127,8 +130,13 @@ class FatalCloudCodeRequestError extends Error {
  * - Google Search grounding for web_search tool
  * - Response format conversion
  */
+import type {
+  ProviderAdapter,
+  ProviderWarmupHint,
+} from "../shared/provider-adapter.interface"
+
 @Injectable()
-export class GoogleService {
+export class GoogleService implements ProviderAdapter {
   private readonly logger = new Logger(GoogleService.name)
   private readonly ANTIGRAVITY_IDE_VERSION = "1.22.2"
 
@@ -1779,6 +1787,10 @@ export class GoogleService {
       )
       return false
     }
+  }
+
+  isLocallyConfigured(): boolean {
+    return this.processPool.isConfigured()
   }
 
   /**
@@ -4630,7 +4642,7 @@ export class GoogleService {
           currentAttemptSawProgress = false
           attemptAbortController = new AbortController()
           const streamAbortSignal = abortSignal
-            ? AbortSignal.any([abortSignal, attemptAbortController.signal])
+            ? combineAbortSignals([abortSignal, attemptAbortController.signal])
             : attemptAbortController.signal
 
           const streamPromise = this.processPool.generateStream(
@@ -5322,5 +5334,17 @@ export class GoogleService {
       firstMessageDurationNs,
       totalDurationNs,
     })
+  }
+
+  // ── ProviderAdapter Interface ────────────────────────────────────────
+
+  /** No-op — Cloud Code uses HTTP transport with its own worker pool; no prewarming needed. */
+  warmup(_hint: ProviderWarmupHint): void {
+    // Intentionally empty.
+  }
+
+  /** No-op — Cloud Code manages conversation sessions internally via processPool. */
+  dispose(_conversationId: string): void {
+    // Intentionally empty.
   }
 }

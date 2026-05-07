@@ -1,6 +1,9 @@
 import { PersistenceService } from "../../persistence"
 
-export type BackendAccountStateNamespace = "claude-api" | "openai-compat"
+export type BackendAccountStateNamespace =
+  | "claude-api"
+  | "openai-compat"
+  | "codex"
 
 export interface PersistedBackendAccountModelState {
   model: string

@@ -399,6 +399,12 @@ const CODEX_MODELS: Record<
     isThinking: true,
     thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
   },
+  "gpt-5.5": {
+    cloudCodeId: "gpt-5.5",
+    displayName: "GPT-5.5",
+    isThinking: true,
+    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+  },
   "gpt-5.4": {
     cloudCodeId: "gpt-5.4",
     displayName: "GPT-5.4",
@@ -489,6 +495,7 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2",
       "gpt-5.2-codex",
       "gpt-5.3-codex",
+      "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
     ],
@@ -503,6 +510,7 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2",
       "gpt-5.2-codex",
       "gpt-5.3-codex",
+      "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
     ],
@@ -518,6 +526,7 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2-codex",
       "gpt-5.3-codex",
       "gpt-5.3-codex-spark",
+      "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
     ],
@@ -533,6 +542,7 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2-codex",
       "gpt-5.3-codex",
       "gpt-5.3-codex-spark",
+      "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
     ],
@@ -682,6 +692,11 @@ const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
     createdAt: 1770912000,
     ownedBy: "openai",
     displayName: "GPT 5.3 Codex Spark",
+  },
+  "gpt-5.5": {
+    createdAt: 1778112000,
+    ownedBy: "openai",
+    displayName: "GPT 5.5",
   },
   "gpt-5.4": {
     createdAt: 1772668800,
@@ -1042,6 +1057,7 @@ export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
 ]
 
 const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
+  "gpt-5.5",
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5.3-codex",
@@ -1049,6 +1065,13 @@ const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
 ])
 
 export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+  {
+    name: "gpt-5.5",
+    displayName: "GPT-5.5",
+    shortName: "GPT-5.5",
+    family: "gpt",
+    isThinking: true,
+  },
   {
     name: "gpt-5.4",
     displayName: "GPT-5.4",

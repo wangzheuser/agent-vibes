@@ -53,6 +53,10 @@ type GoogleQuotaSortBy = "state" | "remaining" | "resetTime" | "requestCount"
 @ApiTags("Health")
 @Controller()
 export class HealthController {
+  /** reloadAccounts throttle: prevent frequent account config file reads within a short window */
+  private lastReloadAt = 0
+  private readonly RELOAD_THROTTLE_MS = 15_000 // 15 seconds
+
   constructor(
     private readonly processPool: ProcessPoolService,
     private readonly codexService: CodexService,
@@ -61,6 +65,15 @@ export class HealthController {
     private readonly usageStats: UsageStatsService,
     private readonly chatSessions: ChatSessionManager
   ) {}
+
+  /** Throttled reloadAccounts: executes at most once per 15 seconds */
+  private async throttledReload(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastReloadAt > this.RELOAD_THROTTLE_MS) {
+      await this.processPool.reloadAccounts()
+      this.lastReloadAt = now
+    }
+  }
 
   @Get("health")
   @ApiOperation({ summary: "Health check endpoint" })
@@ -74,7 +87,7 @@ export class HealthController {
   @Get("pool/status")
   @ApiOperation({ summary: "Get all backend pool statuses" })
   async getPoolStatus() {
-    await this.processPool.reloadAccounts()
+    await this.throttledReload()
     const timestamp = new Date().toISOString()
     const nativeSummary = this.summarizeNativePoolStatus(
       this.processPool.getStatus()
@@ -102,7 +115,7 @@ export class HealthController {
   @Get("pool/status/native")
   @ApiOperation({ summary: "Get redacted native process pool status" })
   async getNativePoolStatus() {
-    await this.processPool.reloadAccounts()
+    await this.throttledReload()
     return this.redactBackendPoolStatus(this.processPool.getPoolStatus())
   }
 
@@ -114,7 +127,7 @@ export class HealthController {
     @Query("sortBy") sortBy?: string,
     @Query("force") force?: string
   ) {
-    await this.processPool.reloadAccounts()
+    await this.throttledReload()
     const normalizedModel = typeof model === "string" ? model.trim() : ""
     const parsedLimit = Number.parseInt(limit || "10", 10)
     const effectiveLimit = Number.isFinite(parsedLimit)

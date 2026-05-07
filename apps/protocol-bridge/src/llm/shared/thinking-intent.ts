@@ -1,8 +1,5 @@
-import type {
-  CreateMessageDto,
-  ThinkingIntent,
-  ThinkingIntentEffort,
-} from "../../protocol/anthropic/dto/create-message.dto"
+import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
+import type { ThinkingIntent, ThinkingIntentEffort } from "./thinking-types"
 import { parseModelRequest } from "./model-request"
 
 export type RequestedThinkingEffort = "none" | "auto" | ThinkingIntentEffort
@@ -201,12 +198,8 @@ function normalizeInternalThinkingIntent(
 export function resolveThinkingIntentFromDto(
   dto: Pick<
     CreateMessageDto,
-    | "model"
-    | "thinking"
-    | "output_config"
-    | "_thinkingIntent"
-    | "_requestedModel"
-  >
+    "model" | "thinking" | "output_config" | "_requestedModel"
+  > & { _thinkingIntent?: ThinkingIntent }
 ): ThinkingIntent | null {
   const requestedModel = dto._requestedModel || dto.model
   const requestModel = parseModelRequest(requestedModel || "")

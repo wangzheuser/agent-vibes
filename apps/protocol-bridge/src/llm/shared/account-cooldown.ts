@@ -160,6 +160,11 @@ export function markAccountCooldown(
   retryAfterHeader?: string,
   accountLabel?: string
 ): void {
+  // 已永久禁用的账号不需要再设置 cooldown，避免产生无意义的日志噪音
+  if (isAccountDisabled(account)) {
+    return
+  }
+
   const now = Date.now()
   const label = accountLabel || "unknown"
 

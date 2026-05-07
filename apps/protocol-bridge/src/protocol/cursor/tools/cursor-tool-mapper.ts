@@ -917,6 +917,105 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
+  /**
+   * AI 代码归因工具 — 对齐 Cursor proto agent/v1.proto AiAttributionArgs。
+   * 用于在指定文件/行范围内查找 AI 生成的代码片段。
+   */
+  CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION: {
+    name: "ai_attribution",
+    description:
+      "Check AI attribution for code in specified files and line ranges",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "File paths to check for AI attribution",
+        },
+        start_line: {
+          type: "number",
+          description: "Optional start line number",
+        },
+        end_line: {
+          type: "number",
+          description: "Optional end line number",
+        },
+        commit_hashes: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional commit hashes to check",
+        },
+        output_mode: {
+          type: "string",
+          description: "Output mode for attribution results",
+        },
+        max_commits: {
+          type: "number",
+          description: "Maximum number of commits to analyze",
+        },
+        include_line_ranges: {
+          type: "boolean",
+          description: "Whether to include line ranges in output",
+        },
+      },
+      required: [],
+    },
+  },
+
+  /**
+   * 通用异步等待工具 — 对齐 Cursor proto agent/v1.proto AwaitArgs。
+   * AWAIT_TASK 的升级版，支持 block_until_ms 超时和 regex 匹配。
+   */
+  CLIENT_SIDE_TOOL_V2_AWAIT: {
+    name: "await",
+    description:
+      "Wait for a background task to complete, with optional timeout and output regex matching",
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: {
+          type: "string",
+          description: "ID of the background task to await",
+        },
+        block_until_ms: {
+          type: "number",
+          description:
+            "Maximum time in milliseconds to block waiting for completion",
+        },
+        regex: {
+          type: "string",
+          description: "Optional regex pattern to match against task output",
+        },
+      },
+      required: ["task_id"],
+    },
+  },
+
+  /**
+   * MCP 认证工具 — 对齐 Cursor proto agent/v1.proto McpAuthArgs。
+   * 用于触发 MCP 服务器的认证流程。
+   */
+  CLIENT_SIDE_TOOL_V2_MCP_AUTH: {
+    name: "mcp_auth",
+    description:
+      "Authenticate with an MCP server to enable access to its tools and resources",
+    input_schema: {
+      type: "object",
+      properties: {
+        server_identifier: {
+          type: "string",
+          description: "Identifier of the MCP server to authenticate with",
+        },
+        tool_call_id: {
+          type: "string",
+          description: "ID of the tool call that triggered the auth request",
+        },
+      },
+      required: ["server_identifier"],
+    },
+  },
+
   CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION: {
     name: "start_grind_execution",
     description: "Start grind execution workflow",
@@ -1008,6 +1107,9 @@ const PREFERRED_CURSOR_KEY_BY_TOOL_NAME: Record<string, string> = {
   fix_lints: "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
   go_to_definition: "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
   await_task: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+  await: "CLIENT_SIDE_TOOL_V2_AWAIT",
+  ai_attribution: "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
+  mcp_auth: "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
   read_project: "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
   update_project: "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
   reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
@@ -1046,6 +1148,9 @@ const TOOL_KEY_ALIASES: Record<string, string> = {
   client_side_tool_v2_fix_lints: "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
   client_side_tool_v2_go_to_definition: "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
   client_side_tool_v2_await_task: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+  client_side_tool_v2_await: "CLIENT_SIDE_TOOL_V2_AWAIT",
+  client_side_tool_v2_ai_attribution: "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
+  client_side_tool_v2_mcp_auth: "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
   client_side_tool_v2_read_project: "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
   client_side_tool_v2_update_project: "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
   client_side_tool_v2_reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
@@ -1090,6 +1195,9 @@ const TOOL_KEY_ALIASES: Record<string, string> = {
   fix_lints: "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
   go_to_definition: "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
   await_task: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+  await: "CLIENT_SIDE_TOOL_V2_AWAIT",
+  ai_attribution: "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
+  mcp_auth: "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
   read_project: "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
   update_project: "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
   reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
@@ -1115,6 +1223,9 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
   "CLIENT_SIDE_TOOL_V2_TASK_V2",
   "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+  "CLIENT_SIDE_TOOL_V2_AWAIT",
+  "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
+  "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
   "CLIENT_SIDE_TOOL_V2_TODO_READ",
   "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
   "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
@@ -1146,6 +1257,31 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
   "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
   "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
+  "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
+  "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
+] as const
+
+const DEFAULT_CODEX_IMPLICIT_CURSOR_TOOLS = [
+  "CLIENT_SIDE_TOOL_V2_READ_FILE_V2",
+  "CLIENT_SIDE_TOOL_V2_LIST_DIR_V2",
+  "CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH",
+  "CLIENT_SIDE_TOOL_V2_FILE_SEARCH",
+  "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH",
+  "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2",
+  "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2",
+  "CLIENT_SIDE_TOOL_V2_DELETE_FILE",
+  "CLIENT_SIDE_TOOL_V2_READ_LINTS",
+  "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
+  "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
+  "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
+  "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
+  "CLIENT_SIDE_TOOL_V2_TODO_READ",
+  "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
+  "CLIENT_SIDE_TOOL_V2_CREATE_PLAN",
+  "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
+  "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
+  "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
+  "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
   "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
   "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
 ] as const
@@ -1286,6 +1422,40 @@ export function getDefaultAgentToolNames(
   )
 }
 
+function normalizeToolSet(toolNames: string[]): string[] {
+  return Array.from(
+    new Set(
+      toolNames
+        .map((toolName) => resolveToolDefinitionKey(toolName) || toolName)
+        .filter(Boolean)
+    )
+  ).sort()
+}
+
+export function matchesImplicitDefaultAgentToolNames(
+  toolNames: string[],
+  options?: CursorBuiltInToolCapabilityOptions
+): boolean {
+  const normalizedActual = normalizeToolSet(toolNames)
+  const normalizedDefault = normalizeToolSet(getDefaultAgentToolNames(options))
+
+  if (normalizedActual.length !== normalizedDefault.length) {
+    return false
+  }
+
+  return normalizedActual.every(
+    (toolName, index) => toolName === normalizedDefault[index]
+  )
+}
+
+export function getDefaultCodexImplicitAgentToolNames(
+  options?: CursorBuiltInToolCapabilityOptions
+): string[] {
+  return DEFAULT_CODEX_IMPLICIT_CURSOR_TOOLS.filter((toolName) =>
+    shouldIncludeBuiltInTool(toolName, options)
+  )
+}
+
 export function isCursorBuiltInToolAllowed(
   toolName: string,
   options?: CursorBuiltInToolCapabilityOptions
@@ -1307,6 +1477,7 @@ export interface McpToolDefinitionForApi {
 
 export interface BuildToolsForApiOptions {
   mcpToolDefs?: McpToolDefinitionForApi[]
+  backend?: string
 }
 
 export interface CursorBuiltInToolCapabilityOptions {
@@ -1316,10 +1487,14 @@ export interface CursorBuiltInToolCapabilityOptions {
 }
 
 export interface ToolDefinition {
-  type: "function"
+  type: "function" | "custom" | "web_search"
   name: string
   description: string
-  input_schema: Record<string, unknown>
+  input_schema?: Record<string, unknown>
+  strict?: boolean
+  format?: Record<string, unknown>
+  external_web_access?: boolean
+  search_content_types?: string[]
 }
 
 function normalizeToolInputSchema(
@@ -1348,6 +1523,771 @@ function normalizeToolInputSchema(
   }
 }
 
+const CODEX_APPLY_PATCH_GRAMMAR = `start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+`
+
+function cloneToolDefinition(tool: ToolDefinition): ToolDefinition {
+  return JSON.parse(JSON.stringify(tool)) as ToolDefinition
+}
+
+const CODEX_NATIVE_TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    type: "function",
+    name: "exec_command",
+    description:
+      "Run a shell command and return output or a session id for continued interaction.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cmd: { type: "string", description: "Shell command to execute." },
+        justification: {
+          type: "string",
+          description:
+            "Optional explanation shown when the command requires elevated permissions.",
+        },
+        login: {
+          type: "boolean",
+          description: "Run the shell with login semantics.",
+        },
+        max_output_tokens: {
+          type: "number",
+          description: "Maximum output tokens to return.",
+        },
+        prefix_rule: {
+          type: "array",
+          description: "Optional reusable command prefix rule.",
+          items: { type: "string" },
+        },
+        sandbox_permissions: {
+          type: "string",
+          description: "Requested sandbox policy for the command.",
+        },
+        shell: {
+          type: "string",
+          description: "Optional shell binary override.",
+        },
+        tty: {
+          type: "boolean",
+          description: "Allocate a TTY for interactive commands.",
+        },
+        workdir: {
+          type: "string",
+          description: "Optional working directory.",
+        },
+        yield_time_ms: {
+          type: "number",
+          description: "How long to wait before yielding output.",
+        },
+      },
+      required: ["cmd"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "write_stdin",
+    description:
+      "Write characters to a running exec session and return recent output.",
+    input_schema: {
+      type: "object",
+      properties: {
+        chars: {
+          type: "string",
+          description: "Bytes to write to stdin. Empty means poll only.",
+        },
+        max_output_tokens: {
+          type: "number",
+          description: "Maximum output tokens to return.",
+        },
+        session_id: {
+          type: "number",
+          description: "Identifier of the running exec session.",
+        },
+        yield_time_ms: {
+          type: "number",
+          description: "How long to wait before yielding output.",
+        },
+      },
+      required: ["session_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_mcp_resources",
+    description: "List resources exposed by configured MCP servers.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cursor: {
+          type: "string",
+          description: "Opaque pagination cursor from a previous result.",
+        },
+        server: {
+          type: "string",
+          description: "Optional MCP server name filter.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_mcp_resource_templates",
+    description: "List MCP resource templates exposed by configured servers.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cursor: {
+          type: "string",
+          description: "Opaque pagination cursor from a previous result.",
+        },
+        server: {
+          type: "string",
+          description: "Optional MCP server name filter.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_mcp_resource",
+    description: "Read a resource from an MCP server by server name and URI.",
+    input_schema: {
+      type: "object",
+      properties: {
+        server: {
+          type: "string",
+          description: "MCP server name exactly as configured.",
+        },
+        uri: {
+          type: "string",
+          description: "Resource URI returned by list_mcp_resources.",
+        },
+      },
+      required: ["server", "uri"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_todos",
+    description:
+      "Read current todo items and optionally filter by status or id.",
+    input_schema: {
+      type: "object",
+      properties: {
+        status_filter: {
+          type: "array",
+          description:
+            "Optional todo status filter (pending/in_progress/completed/cancelled).",
+          items: { type: "string" },
+        },
+        id_filter: {
+          type: "array",
+          description: "Optional todo id filter.",
+          items: { type: "string" },
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_todos",
+    description:
+      "Update todo items and optionally merge them into the current list.",
+    input_schema: {
+      type: "object",
+      properties: {
+        todos: {
+          type: "array",
+          description: "Todo objects to write.",
+          items: {
+            type: "object",
+            properties: {
+              id: {
+                type: "string",
+                description: "Stable todo id.",
+              },
+              content: {
+                type: "string",
+                description: "Human-readable todo text.",
+              },
+              status: {
+                type: "string",
+                description:
+                  "Todo status enum (TODO_STATUS_PENDING/IN_PROGRESS/COMPLETED/CANCELLED).",
+              },
+              dependencies: {
+                type: "array",
+                description: "Optional upstream todo ids.",
+                items: { type: "string" },
+              },
+              createdAt: {
+                type: "string",
+                description: "Optional creation timestamp (unix ms).",
+              },
+              updatedAt: {
+                type: "string",
+                description: "Optional update timestamp (unix ms).",
+              },
+            },
+            required: ["id", "content", "status"],
+            additionalProperties: false,
+          },
+        },
+        merge: {
+          type: "boolean",
+          description: "Whether to merge with existing todos.",
+        },
+      },
+      required: ["todos"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_plan",
+    description: "Update the active task plan and plan item statuses.",
+    input_schema: {
+      type: "object",
+      properties: {
+        explanation: { type: "string" },
+        plan: {
+          type: "array",
+          description: "Plan items in execution order.",
+          items: {
+            type: "object",
+            properties: {
+              status: {
+                type: "string",
+                description: "One of pending, in_progress, or completed.",
+              },
+              step: { type: "string" },
+            },
+            required: ["step", "status"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["plan"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "request_user_input",
+    description: "Ask the user one to three short structured questions.",
+    input_schema: {
+      type: "object",
+      properties: {
+        questions: {
+          type: "array",
+          description: "Structured question list.",
+          items: {
+            type: "object",
+            properties: {
+              header: {
+                type: "string",
+                description: "Short header label shown in the UI.",
+              },
+              id: {
+                type: "string",
+                description: "Stable identifier for the question.",
+              },
+              options: {
+                type: "array",
+                description: "Mutually exclusive answer choices.",
+                items: {
+                  type: "object",
+                  properties: {
+                    description: {
+                      type: "string",
+                      description: "Short impact or tradeoff description.",
+                    },
+                    label: {
+                      type: "string",
+                      description: "User-facing choice label.",
+                    },
+                  },
+                  required: ["label", "description"],
+                  additionalProperties: false,
+                },
+              },
+              question: {
+                type: "string",
+                description: "Single-sentence prompt shown to the user.",
+              },
+            },
+            required: ["id", "header", "question", "options"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["questions"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "custom",
+    name: "apply_patch",
+    description: "Apply a freeform patch using the Codex apply_patch grammar.",
+    format: {
+      type: "grammar",
+      syntax: "lark",
+      definition: CODEX_APPLY_PATCH_GRAMMAR,
+    },
+  },
+  {
+    type: "web_search",
+    name: "web_search",
+    description: "Search the web when local and MCP context is insufficient.",
+    external_web_access: true,
+    search_content_types: ["text", "image"],
+  },
+  {
+    type: "function",
+    name: "view_image",
+    description:
+      "View a local image file by absolute path within the active workspace.",
+    input_schema: {
+      type: "object",
+      properties: {
+        detail: {
+          type: "string",
+          description: "Optional detail override. Supported value: original.",
+        },
+        path: {
+          type: "string",
+          description:
+            "Absolute filesystem path to the image inside the active workspace.",
+        },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "spawn_agent",
+    description: "Spawn a sub-agent for an explicitly delegated task.",
+    input_schema: {
+      type: "object",
+      properties: {
+        agent_type: {
+          type: "string",
+          description:
+            "Optional sub-agent role such as default, explorer, or worker.",
+        },
+        fork_context: {
+          type: "boolean",
+          description: "Fork the current thread history into the new agent.",
+        },
+        items: {
+          type: "array",
+          description: "Structured input items for the sub-agent.",
+          items: {
+            type: "object",
+            properties: {
+              image_url: { type: "string" },
+              name: { type: "string" },
+              path: { type: "string" },
+              text: { type: "string" },
+              type: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+        message: {
+          type: "string",
+          description: "Initial plain-text task for the sub-agent.",
+        },
+        model: {
+          type: "string",
+          description: "Optional model override.",
+        },
+        reasoning_effort: {
+          type: "string",
+          description: "Optional reasoning effort override.",
+        },
+      },
+      required: ["message"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "send_input",
+    description: "Send additional input to an existing sub-agent.",
+    input_schema: {
+      type: "object",
+      properties: {
+        interrupt: {
+          type: "boolean",
+          description: "Interrupt the agent and handle this input immediately.",
+        },
+        items: {
+          type: "array",
+          description: "Structured input items.",
+          items: {
+            type: "object",
+            properties: {
+              image_url: { type: "string" },
+              name: { type: "string" },
+              path: { type: "string" },
+              text: { type: "string" },
+              type: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+        message: {
+          type: "string",
+          description: "Plain-text message for the target agent.",
+        },
+        target: {
+          type: "string",
+          description: "Agent id to message.",
+        },
+      },
+      required: ["target"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "resume_agent",
+    description: "Resume a previously closed agent by id.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Agent id to resume." },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "wait_agent",
+    description: "Wait for one or more agents to reach a final status.",
+    input_schema: {
+      type: "object",
+      properties: {
+        targets: {
+          type: "array",
+          description: "Agent ids to wait on.",
+          items: { type: "string" },
+        },
+        timeout_ms: {
+          type: "number",
+          description: "Optional wait timeout in milliseconds.",
+        },
+      },
+      required: ["targets"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "close_agent",
+    description: "Close an agent and any open descendants.",
+    input_schema: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "Agent id to close." },
+      },
+      required: ["target"],
+      additionalProperties: false,
+    },
+  },
+]
+
+const CODEX_NATIVE_TOOL_BY_NAME = new Map(
+  CODEX_NATIVE_TOOL_DEFINITIONS.map((definition) => [
+    normalizeToolIdentifier(definition.name),
+    definition,
+  ])
+)
+
+const EXPLICIT_CODEX_NATIVE_FALLBACK_NAMES = new Set([
+  "exec_command",
+  "write_stdin",
+  "list_mcp_resources",
+  "list_mcp_resource_templates",
+  "read_mcp_resource",
+  "read_todos",
+  "update_todos",
+  "update_plan",
+  "request_user_input",
+  "apply_patch",
+  "view_image",
+  "spawn_agent",
+  "send_input",
+  "resume_agent",
+  "wait_agent",
+  "close_agent",
+])
+
+function addCodexToolDefinition(
+  tools: ToolDefinition[],
+  seenToolNames: Set<string>,
+  toolName: string
+): void {
+  const normalized = normalizeToolIdentifier(toolName)
+  const definition = CODEX_NATIVE_TOOL_BY_NAME.get(normalized)
+  if (!definition || seenToolNames.has(normalized)) {
+    return
+  }
+
+  seenToolNames.add(normalized)
+  tools.push(cloneToolDefinition(definition))
+}
+
+function buildCodexToolsForApi(
+  supportedTools: string[],
+  options?: BuildToolsForApiOptions
+): ToolDefinition[] {
+  const tools: ToolDefinition[] = []
+  const executableViaExecServerMessage = new Set<string>([
+    "CLIENT_SIDE_TOOL_V2_READ_FILE",
+    "CLIENT_SIDE_TOOL_V2_READ_FILE_V2",
+    "CLIENT_SIDE_TOOL_V2_LIST_DIR",
+    "CLIENT_SIDE_TOOL_V2_LIST_DIR_V2",
+    "CLIENT_SIDE_TOOL_V2_EDIT_FILE",
+    "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2",
+    "CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH",
+    "CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH",
+    "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2",
+    "CLIENT_SIDE_TOOL_V2_DELETE_FILE",
+    "CLIENT_SIDE_TOOL_V2_MCP",
+    "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
+    "CLIENT_SIDE_TOOL_V2_DIAGNOSTICS",
+    "CLIENT_SIDE_TOOL_V2_READ_LINTS",
+    "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
+    "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
+    "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
+    "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
+    "CLIENT_SIDE_TOOL_V2_CREATE_PLAN",
+    "CLIENT_SIDE_TOOL_V2_SWITCH_MODE",
+    "CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN",
+    "CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN",
+    "CLIENT_SIDE_TOOL_V2_RECORD_SCREEN",
+    "CLIENT_SIDE_TOOL_V2_COMPUTER_USE",
+    "CLIENT_SIDE_TOOL_V2_FETCH",
+    "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
+    "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
+    "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
+    "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
+    "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT",
+    "CLIENT_SIDE_TOOL_V2_TASK",
+    "CLIENT_SIDE_TOOL_V2_TASK_V2",
+    "CLIENT_SIDE_TOOL_V2_TODO_READ",
+    "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
+    "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
+    "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
+    "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
+    "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
+    "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
+    "CLIENT_SIDE_TOOL_V2_REAPPLY",
+    "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
+    "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
+    "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP",
+    "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
+    "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
+    "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
+    "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
+    "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
+    "CLIENT_SIDE_TOOL_V2_AWAIT",
+    "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
+    "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
+    "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
+    "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
+    "CLIENT_SIDE_TOOL_V2_REFLECT",
+    "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
+    "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
+    "CLIENT_SIDE_TOOL_V2_FILE_SEARCH",
+    "CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL",
+    "CLIENT_SIDE_TOOL_V2_DEEP_SEARCH",
+    "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH",
+  ])
+  const seenDefinitionKeys = new Set<string>()
+  const seenToolNames = new Set<string>()
+  const resolvedDefinitionKeys = new Set<string>()
+  const normalizedSupported = new Set<string>()
+  const mcpDefByNormalizedName = new Map<string, McpToolDefinitionForApi>()
+
+  const addCursorToolDefinition = (definitionKey: string): void => {
+    if (
+      seenDefinitionKeys.has(definitionKey) ||
+      !executableViaExecServerMessage.has(definitionKey)
+    ) {
+      return
+    }
+
+    const definition = CURSOR_TOOL_DEFINITIONS[definitionKey]
+    if (!definition) {
+      return
+    }
+
+    const normalizedToolName = normalizeToolIdentifier(definition.name)
+    seenDefinitionKeys.add(definitionKey)
+    if (seenToolNames.has(normalizedToolName)) {
+      return
+    }
+
+    seenToolNames.add(normalizedToolName)
+    tools.push({
+      type: "function",
+      ...definition,
+    })
+  }
+
+  for (const supportedTool of supportedTools) {
+    const normalizedSupportedTool = normalizeToolIdentifier(supportedTool)
+    if (normalizedSupportedTool) {
+      normalizedSupported.add(normalizedSupportedTool)
+    }
+
+    const definitionKey = resolveToolDefinitionKey(supportedTool)
+    if (!definitionKey) {
+      continue
+    }
+
+    resolvedDefinitionKeys.add(definitionKey)
+    normalizedSupported.add(normalizeToolIdentifier(definitionKey))
+    const definition = CURSOR_TOOL_DEFINITIONS[definitionKey]
+    if (definition?.name) {
+      normalizedSupported.add(normalizeToolIdentifier(definition.name))
+    }
+  }
+
+  for (const mcpToolDef of options?.mcpToolDefs || []) {
+    if (!mcpToolDef || typeof mcpToolDef.name !== "string") continue
+    const normalizedFullName = normalizeToolIdentifier(mcpToolDef.name)
+    if (normalizedFullName && !mcpDefByNormalizedName.has(normalizedFullName)) {
+      mcpDefByNormalizedName.set(normalizedFullName, mcpToolDef)
+    }
+    if (typeof mcpToolDef.toolName === "string" && mcpToolDef.toolName) {
+      const normalizedToolName = normalizeToolIdentifier(mcpToolDef.toolName)
+      if (
+        normalizedToolName &&
+        !mcpDefByNormalizedName.has(normalizedToolName)
+      ) {
+        mcpDefByNormalizedName.set(normalizedToolName, mcpToolDef)
+      }
+    }
+  }
+
+  for (const supportedTool of supportedTools) {
+    const definitionKey = resolveToolDefinitionKey(supportedTool)
+    if (definitionKey) {
+      if (
+        (definitionKey === "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL" ||
+          definitionKey === "CLIENT_SIDE_TOOL_V2_MCP") &&
+        mcpDefByNormalizedName.size > 0
+      ) {
+        continue
+      }
+      addCursorToolDefinition(definitionKey)
+      continue
+    }
+
+    const normalizedCursorTool = normalizeToolIdentifier(supportedTool)
+    const mcpToolDef = mcpDefByNormalizedName.get(normalizedCursorTool)
+    if (!mcpToolDef || !mcpToolDef.name) continue
+
+    const normalizedMcpName = normalizeToolIdentifier(mcpToolDef.name)
+    if (!normalizedMcpName || seenToolNames.has(normalizedMcpName)) continue
+
+    seenToolNames.add(normalizedMcpName)
+    tools.push({
+      type: "function",
+      name: mcpToolDef.name,
+      description:
+        mcpToolDef.description ||
+        `MCP tool ${mcpToolDef.toolName || mcpToolDef.name}`,
+      input_schema: normalizeToolInputSchema(mcpToolDef.inputSchema),
+    })
+  }
+
+  const hasSupportedTool = (...toolAliases: string[]): boolean =>
+    toolAliases.some((toolAlias) => {
+      if (resolvedDefinitionKeys.has(toolAlias)) {
+        return true
+      }
+      return normalizedSupported.has(normalizeToolIdentifier(toolAlias))
+    })
+
+  if (
+    hasSupportedTool(
+      "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2",
+      "CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN",
+      "run_terminal_command",
+      "run_terminal_command_v2",
+      "background_shell_spawn",
+      "exec_command"
+    )
+  ) {
+    addCursorToolDefinition("CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN")
+  }
+
+  if (
+    hasSupportedTool(
+      "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
+      "CLIENT_SIDE_TOOL_V2_MCP",
+      "mcp",
+      "mcp_tool"
+    )
+  ) {
+    for (const mcpToolDef of options?.mcpToolDefs || []) {
+      if (!mcpToolDef || typeof mcpToolDef.name !== "string") continue
+      const normalizedMcpName = normalizeToolIdentifier(mcpToolDef.name)
+      if (!normalizedMcpName || seenToolNames.has(normalizedMcpName)) continue
+
+      seenToolNames.add(normalizedMcpName)
+      tools.push({
+        type: "function",
+        name: mcpToolDef.name,
+        description:
+          mcpToolDef.description ||
+          `MCP tool ${mcpToolDef.toolName || mcpToolDef.name}`,
+        input_schema: normalizeToolInputSchema(mcpToolDef.inputSchema),
+      })
+    }
+  }
+
+  for (const supportedTool of supportedTools) {
+    const normalizedSupportedTool = normalizeToolIdentifier(supportedTool)
+    if (!EXPLICIT_CODEX_NATIVE_FALLBACK_NAMES.has(normalizedSupportedTool)) {
+      continue
+    }
+    addCodexToolDefinition(tools, seenToolNames, supportedTool)
+  }
+
+  return tools
+}
+
 /**
  * Build tool definitions for the API backend (CreateMessageDto format).
  * This is the single source of truth — replaces the duplicate buildToolDefinitions
@@ -1357,6 +2297,10 @@ export function buildToolsForApi(
   supportedTools: string[],
   options?: BuildToolsForApiOptions
 ): ToolDefinition[] {
+  if (options?.backend === "codex") {
+    return buildCodexToolsForApi(supportedTools, options)
+  }
+
   const tools: ToolDefinition[] = []
   const executableViaExecServerMessage = new Set<string>([
     "CLIENT_SIDE_TOOL_V2_READ_FILE",

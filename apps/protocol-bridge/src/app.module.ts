@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common"
 import { ConfigModule } from "@nestjs/config"
+import * as os from "os"
 import * as path from "path"
 import { GoogleModule } from "./llm/google/google.module"
 import { AnthropicModule } from "./protocol/anthropic/anthropic.module"
@@ -11,6 +12,8 @@ import { PersistenceModule } from "./persistence"
 import { validateEnv } from "./shared/env.validation"
 import { UsageStatsModule } from "./usage"
 
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")
+
 const ENV_FILE_CANDIDATES = [
   path.resolve(process.cwd(), "apps/protocol-bridge/.env.local"),
   path.resolve(process.cwd(), "apps/protocol-bridge/.env"),
@@ -18,6 +21,8 @@ const ENV_FILE_CANDIDATES = [
   path.resolve(process.cwd(), ".env"),
   path.resolve(__dirname, "../.env.local"),
   path.resolve(__dirname, "../.env"),
+  path.join(CODEX_HOME, ".env.local"),
+  path.join(CODEX_HOME, ".env"),
 ]
 
 @Module({

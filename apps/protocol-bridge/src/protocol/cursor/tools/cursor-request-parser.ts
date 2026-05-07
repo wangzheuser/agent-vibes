@@ -35,6 +35,9 @@ export interface ParsedToolResult {
   resultData: Buffer
   // Optional synthetic result content injected by server-side inline tools.
   inlineContent?: string
+  // Optional history payload override for inline tools that need richer
+  // function_call_output bodies than plain text, such as view_image.
+  inlineHistoryContent?: string | Array<Record<string, unknown>>
   inlineState?: {
     status:
       | "success"
@@ -143,6 +146,7 @@ export interface ParsedCursorRequest {
   // 模型信息
   model: string
   thinkingLevel: number
+  thinkingDetailsRequested?: boolean
 
   // 模式和能力
   unifiedMode: "CHAT" | "AGENT" | "EDIT" | "CUSTOM"
@@ -214,10 +218,25 @@ export interface ParsedCursorRequest {
     | "execStreamClose"
     | "execThrow"
     | "cancelAction"
+    | "prewarm"
+    // ConversationAction 补齐
+    | "summarizeAction"
+    | "shellCommandAction"
+    | "startPlanAction"
+    | "executePlanAction"
+    | "asyncAskQuestionCompletionAction"
+    | "cancelSubagentAction"
+    | "backgroundTaskCompletionAction"
+    | "backgroundShellAction"
+    | "backgroundSubagentAction"
     | "other"
   agentControlExecId?: number
   agentControlError?: string
   agentControlStackTrace?: string
+  // ConversationAction 补齐：额外字段
+  agentControlSubagentId?: string
+  agentControlToolCallId?: string
+  agentControlShellCommand?: { command: string; execId: string }
 
   // InteractionQuery 响应（客户端回复服务器查询）
   interactionResponse?: {
@@ -257,6 +276,16 @@ const EXEC_RESULT_CASE_MAP: Record<string, string> = {
   computerUseResult: "computer_use_result",
   writeShellStdinResult: "write_shell_stdin_result",
   executeHookResult: "execute_hook_result",
+  // ExecClientMessage 补齐
+  subagentResult: "subagent_result",
+  redactedReadResult: "redacted_read_result",
+  forceBackgroundShellResult: "force_background_shell_result",
+  forceBackgroundSubagentResult: "force_background_subagent_result",
+  canvasGetUrlResult: "canvas_get_url_result",
+  canvasDestroyResult: "canvas_destroy_result",
+  canvasRegisterResult: "canvas_register_result",
+  mcpStateExecResult: "mcp_state_exec_result",
+  subagentAwaitResult: "subagent_await_result",
 }
 
 /**
@@ -270,18 +299,33 @@ function makeControlMessage(
     | "execStreamClose"
     | "execThrow"
     | "cancelAction"
+    | "prewarm"
+    // ConversationAction 补齐
+    | "summarizeAction"
+    | "shellCommandAction"
+    | "startPlanAction"
+    | "executePlanAction"
+    | "asyncAskQuestionCompletionAction"
+    | "cancelSubagentAction"
+    | "backgroundTaskCompletionAction"
+    | "backgroundShellAction"
+    | "backgroundSubagentAction"
     | "other",
   options?: {
     conversationId?: string
+    model?: string
     execId?: number
     error?: string
     stackTrace?: string
+    subagentId?: string
+    toolCallId?: string
+    shellCommand?: { command: string; execId: string }
   }
 ): ParsedCursorRequest {
   return {
     conversation: [],
     newMessage: "",
-    model: "",
+    model: options?.model || "",
     thinkingLevel: 0,
     unifiedMode: "AGENT",
     isAgentic: true,
@@ -293,6 +337,9 @@ function makeControlMessage(
     agentControlExecId: options?.execId,
     agentControlError: options?.error,
     agentControlStackTrace: options?.stackTrace,
+    agentControlSubagentId: options?.subagentId,
+    agentControlToolCallId: options?.toolCallId,
+    agentControlShellCommand: options?.shellCommand,
   }
 }
 
@@ -387,6 +434,52 @@ export class CursorRequestParser {
     return {
       ...(variantParameters || {}),
       ...(explicitParameters || {}),
+    }
+  }
+
+  private resolveCursorRequestedModel(
+    requestedModelId?: string,
+    modelDetailsModelId?: string,
+    fallbackModel?: string
+  ): {
+    model: string
+    requestedVariantSelection: ReturnType<
+      typeof parseCursorVariantString
+    > | null
+    requestedBaseModel?: string
+    modelDetailsVariantSelection: ReturnType<
+      typeof parseCursorVariantString
+    > | null
+    modelDetailsBaseModel?: string
+  } {
+    const trimmedRequestedModelId = requestedModelId?.trim() || undefined
+    const requestedVariantSelection = trimmedRequestedModelId
+      ? parseCursorVariantString(trimmedRequestedModelId)
+      : null
+    const requestedBaseModel = trimmedRequestedModelId
+      ? parseModelRequest(trimmedRequestedModelId).baseModel
+      : undefined
+    const trimmedModelDetailsModelId = modelDetailsModelId?.trim() || undefined
+    const modelDetailsVariantSelection = trimmedModelDetailsModelId
+      ? parseCursorVariantString(trimmedModelDetailsModelId)
+      : null
+    const modelDetailsBaseModel = trimmedModelDetailsModelId
+      ? parseModelRequest(trimmedModelDetailsModelId).baseModel
+      : undefined
+
+    return {
+      model:
+        requestedVariantSelection?.baseModel ||
+        requestedBaseModel ||
+        modelDetailsVariantSelection?.baseModel ||
+        modelDetailsBaseModel ||
+        trimmedModelDetailsModelId ||
+        fallbackModel ||
+        "claude-sonnet-4-20250514",
+      requestedVariantSelection,
+      requestedBaseModel,
+      modelDetailsVariantSelection,
+      modelDetailsBaseModel,
     }
   }
 
@@ -735,8 +828,86 @@ export class CursorRequestParser {
           })
         }
 
+        // ConversationAction 补齐：逐一识别并路由
+        if (message.value.action.case === "summarizeAction") {
+          this.logger.log("收到 conversationAction.summarizeAction")
+          return makeControlMessage("summarizeAction")
+        }
+        if (message.value.action.case === "shellCommandAction") {
+          const shellAction = message.value.action.value as {
+            shellCommand?: { command?: string }
+            execId?: string
+          }
+          const command = shellAction.shellCommand?.command || ""
+          const execId = shellAction.execId || ""
+          this.logger.log(
+            `收到 conversationAction.shellCommandAction command="${command.substring(0, 80)}" execId=${execId}`
+          )
+          return makeControlMessage("shellCommandAction", {
+            shellCommand: { command, execId },
+          })
+        }
+        if (message.value.action.case === "startPlanAction") {
+          this.logger.log("收到 conversationAction.startPlanAction")
+          return makeControlMessage("startPlanAction")
+        }
+        if (message.value.action.case === "executePlanAction") {
+          this.logger.log("收到 conversationAction.executePlanAction")
+          return makeControlMessage("executePlanAction")
+        }
+        if (message.value.action.case === "asyncAskQuestionCompletionAction") {
+          const asyncAction = message.value.action.value as {
+            originalToolCallId?: string
+          }
+          this.logger.log(
+            `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${asyncAction.originalToolCallId || "(none)"}`
+          )
+          return makeControlMessage("asyncAskQuestionCompletionAction", {
+            toolCallId: asyncAction.originalToolCallId || "",
+          })
+        }
+        if (message.value.action.case === "cancelSubagentAction") {
+          const cancelSub = message.value.action.value as {
+            subagentId?: string
+          }
+          this.logger.log(
+            `收到 conversationAction.cancelSubagentAction subagentId=${cancelSub.subagentId || "(none)"}`
+          )
+          return makeControlMessage("cancelSubagentAction", {
+            subagentId: cancelSub.subagentId || "",
+          })
+        }
+        if (message.value.action.case === "backgroundTaskCompletionAction") {
+          this.logger.log(
+            "收到 conversationAction.backgroundTaskCompletionAction"
+          )
+          return makeControlMessage("backgroundTaskCompletionAction")
+        }
+        if (message.value.action.case === "backgroundShellAction") {
+          const bgShell = message.value.action.value as {
+            toolCallId?: string
+          }
+          this.logger.log(
+            `收到 conversationAction.backgroundShellAction toolCallId=${bgShell.toolCallId || "(none)"}`
+          )
+          return makeControlMessage("backgroundShellAction", {
+            toolCallId: bgShell.toolCallId || "",
+          })
+        }
+        if (message.value.action.case === "backgroundSubagentAction") {
+          const bgSub = message.value.action.value as {
+            toolCallId?: string
+          }
+          this.logger.log(
+            `收到 conversationAction.backgroundSubagentAction toolCallId=${bgSub.toolCallId || "(none)"}`
+          )
+          return makeControlMessage("backgroundSubagentAction", {
+            toolCallId: bgSub.toolCallId || "",
+          })
+        }
+
         this.logger.debug(
-          `收到 conversationAction（非 runRequest） action=${message.value.action.case || "(none)"}`
+          `收到 conversationAction（未识别） action=${message.value.action.case || "(none)"}`
         )
         return makeControlMessage("other")
 
@@ -809,9 +980,29 @@ export class CursorRequestParser {
         }
       }
 
-      case "prewarmRequest":
-        this.logger.debug("收到 prewarmRequest")
-        return makeControlMessage("other")
+      case "prewarmRequest": {
+        const prewarm = (msg.message.value || {}) as {
+          requestedModel?: { modelId?: string }
+          modelDetails?: { modelId?: string }
+          conversationId?: string
+        }
+        const requestedModelId =
+          prewarm.requestedModel?.modelId?.trim() || undefined
+        const modelDetailsModelId =
+          prewarm.modelDetails?.modelId?.trim() || undefined
+        const { model } = this.resolveCursorRequestedModel(
+          requestedModelId,
+          modelDetailsModelId,
+          prewarm.modelDetails?.modelId
+        )
+        this.logger.debug(
+          `收到 prewarmRequest conversation=${prewarm.conversationId || "(none)"} model=${model || "(empty)"}`
+        )
+        return makeControlMessage("prewarm", {
+          conversationId: prewarm.conversationId || undefined,
+          model,
+        })
+      }
 
       case undefined:
         this.logger.debug("AgentClientMessage.message 未设置")
@@ -943,28 +1134,18 @@ export class CursorRequestParser {
     }
 
     const requestedModelId = req.requestedModel?.modelId?.trim() || undefined
-    const requestedVariantSelection = requestedModelId
-      ? parseCursorVariantString(requestedModelId)
-      : null
-    const requestedBaseModel = requestedModelId
-      ? parseModelRequest(requestedModelId).baseModel
-      : undefined
     const modelDetailsModelId = req.modelDetails?.modelId?.trim() || undefined
-    const modelDetailsVariantSelection = modelDetailsModelId
-      ? parseCursorVariantString(modelDetailsModelId)
-      : null
-    const modelDetailsBaseModel = modelDetailsModelId
-      ? parseModelRequest(modelDetailsModelId).baseModel
-      : undefined
-
-    // 提取 model
-    const model =
-      requestedVariantSelection?.baseModel ||
-      requestedBaseModel ||
-      modelDetailsVariantSelection?.baseModel ||
-      modelDetailsBaseModel ||
-      req.modelDetails?.modelId ||
-      "claude-sonnet-4-20250514"
+    const {
+      model,
+      requestedVariantSelection,
+      requestedBaseModel,
+      modelDetailsVariantSelection,
+      modelDetailsBaseModel,
+    } = this.resolveCursorRequestedModel(
+      requestedModelId,
+      modelDetailsModelId,
+      req.modelDetails?.modelId
+    )
 
     // 提取 conversationId
     const conversationId = req.conversationId || undefined
@@ -1424,6 +1605,7 @@ export class CursorRequestParser {
           newMessage: "",
           model,
           thinkingLevel,
+          thinkingDetailsRequested: hasThinkingDetails,
           unifiedMode: "AGENT",
           isAgentic: true,
           supportedTools,
@@ -1470,6 +1652,7 @@ export class CursorRequestParser {
       newMessage: prompt,
       model,
       thinkingLevel,
+      thinkingDetailsRequested: hasThinkingDetails,
       unifiedMode: "AGENT",
       isAgentic: true,
       supportedTools,

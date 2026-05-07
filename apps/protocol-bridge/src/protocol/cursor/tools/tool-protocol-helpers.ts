@@ -75,7 +75,8 @@ function pickFirstBoolean(
   keys: string[]
 ): boolean | undefined {
   for (const key of keys) {
-    if (typeof input[key] === "boolean") return input[key]
+    const candidate = input[key]
+    if (typeof candidate === "boolean") return candidate
   }
   return undefined
 }
@@ -85,7 +86,8 @@ function pickFirstRawString(
   keys: string[]
 ): string | undefined {
   for (const key of keys) {
-    if (typeof input[key] === "string") return input[key]
+    const candidate = input[key]
+    if (typeof candidate === "string") return candidate
   }
   return undefined
 }

@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@anthropic-ai/tokenizer": "^0.0.4",
-    "@bufbuild/protobuf": "^2.10.2",
+    "@bufbuild/protobuf": "2.10.2",
     "@connectrpc/connect": "^2.1.1",
     "@fastify/static": "^9.0.0",
     "@nestjs/common": "^11.1.9",
@@ -48,7 +48,7 @@
   "devDependencies": {
     "@anatine/esbuild-decorators": "^0.2.19",
     "@bufbuild/buf": "^1.63.0",
-    "@bufbuild/protoc-gen-es": "^2.10.2",
+    "@bufbuild/protoc-gen-es": "2.10.2",
     "@nestjs/cli": "^11.0.14",
     "@nestjs/schematics": "^11.0.9",
     "@types/express": "^5.0.0",

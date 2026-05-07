@@ -14,6 +14,10 @@ import {
 import { GoogleModelCacheService } from "../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../llm/google/google.service"
 import {
+  GOOGLE_STARTUP_UPSTREAM_CHECK_ENV,
+  isGoogleStartupUpstreamCheckEnabled,
+} from "../../llm/google/startup-probe-policy"
+import {
   canPublicClaudeModelUseGoogle,
   getCodexPublicModelIds,
   getPublicModelMetadata,
@@ -81,12 +85,29 @@ export class MessagesService implements OnModuleInit {
     return this.codexService.getModelTier()
   }
 
+  private async resolveStartupGoogleAvailability(): Promise<boolean> {
+    if (isGoogleStartupUpstreamCheckEnabled()) {
+      this.logger.log(
+        `Startup Google upstream probe enabled (${GOOGLE_STARTUP_UPSTREAM_CHECK_ENV}=true)`
+      )
+      return this.googleService.checkAvailability()
+    }
+
+    const configured = this.googleService.isLocallyConfigured()
+    this.logger.log(
+      configured
+        ? `Skipping Google upstream probe on startup (${GOOGLE_STARTUP_UPSTREAM_CHECK_ENV}=false); using local worker configuration only`
+        : `Skipping Google upstream probe on startup (${GOOGLE_STARTUP_UPSTREAM_CHECK_ENV}=false); no local Google workers configured`
+    )
+    return configured
+  }
+
   /**
    * Initialize backend availability checks.
    */
   async onModuleInit(): Promise<void> {
     await this.modelRouter.initializeRouting(
-      () => this.googleService.checkAvailability(),
+      () => this.resolveStartupGoogleAvailability(),
       () => this.codexService.checkAvailability(),
       () => this.openaiCompatService.checkAvailability(),
       () => this.anthropicApiService.checkAvailability()

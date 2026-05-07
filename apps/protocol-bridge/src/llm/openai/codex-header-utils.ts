@@ -9,6 +9,7 @@ interface BuildCodexHttpHeadersParams {
   token: string
   isApiKey: boolean
   stream: boolean
+  conversationId?: string
   accountId?: string
   workspaceId?: string
   cacheHeaders?: Record<string, string>
@@ -19,6 +20,7 @@ interface BuildCodexHttpHeadersParams {
 interface BuildCodexWebSocketHeadersParams {
   token: string
   isApiKey: boolean
+  conversationId?: string
   accountId?: string
   workspaceId?: string
   cacheHeaders?: Record<string, string>
@@ -110,6 +112,7 @@ function sanitizeHeaders(
 export function buildCodexHttpHeaders(
   params: BuildCodexHttpHeadersParams
 ): Record<string, string> {
+  const normalizedConversationId = params.conversationId?.trim() || ""
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${params.token}`,
@@ -130,19 +133,24 @@ export function buildCodexHttpHeaders(
   ensureHeader(headers, params.forwardHeaders, "X-Codex-Turn-Metadata", "", [
     "x-codex-turn-metadata",
   ])
-  ensureHeader(headers, params.forwardHeaders, "X-Client-Request-Id", "", [
-    "x-client-request-id",
-  ])
+  ensureHeader(
+    headers,
+    params.forwardHeaders,
+    "X-Client-Request-Id",
+    normalizedConversationId,
+    ["x-client-request-id"]
+  )
   ensureHeader(headers, params.forwardHeaders, "User-Agent", CODEX_USER_AGENT, [
     "user-agent",
   ])
   ensureHeader(
     headers,
     params.forwardHeaders,
-    "Session_id",
-    getExistingHeader(headers, "User-Agent").includes("Mac OS")
-      ? crypto.randomUUID()
-      : "",
+    "session_id",
+    normalizedConversationId ||
+      (getExistingHeader(headers, "User-Agent").includes("Mac OS")
+        ? crypto.randomUUID()
+        : ""),
     ["session_id", "session-id"]
   )
 
@@ -170,6 +178,7 @@ export function buildCodexHttpHeaders(
 export function buildCodexWebSocketHeaders(
   params: BuildCodexWebSocketHeadersParams
 ): Record<string, string> {
+  const normalizedConversationId = params.conversationId?.trim() || ""
   const headers: Record<string, string> = {
     Authorization: `Bearer ${params.token}`,
     ...(params.cacheHeaders || {}),
@@ -189,9 +198,13 @@ export function buildCodexWebSocketHeaders(
   ensureHeader(headers, params.forwardHeaders, "x-codex-turn-metadata", "", [
     "x-codex-turn-metadata",
   ])
-  ensureHeader(headers, params.forwardHeaders, "x-client-request-id", "", [
+  ensureHeader(
+    headers,
+    params.forwardHeaders,
     "x-client-request-id",
-  ])
+    normalizedConversationId,
+    ["x-client-request-id"]
+  )
   ensureHeader(
     headers,
     params.forwardHeaders,
@@ -213,10 +226,11 @@ export function buildCodexWebSocketHeaders(
   ensureHeader(
     headers,
     params.forwardHeaders,
-    "Session_id",
-    getExistingHeader(headers, "User-Agent").includes("Mac OS")
-      ? crypto.randomUUID()
-      : "",
+    "session_id",
+    normalizedConversationId ||
+      (getExistingHeader(headers, "User-Agent").includes("Mac OS")
+        ? crypto.randomUUID()
+        : ""),
     ["session_id", "session-id"]
   )
   delete headers["User-Agent"]

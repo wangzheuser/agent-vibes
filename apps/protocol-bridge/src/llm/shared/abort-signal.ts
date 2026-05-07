@@ -54,6 +54,38 @@ export function toUpstreamRequestAbortedError(
   )
 }
 
+export function combineAbortSignals(
+  signals: readonly AbortSignal[]
+): AbortSignal {
+  if (signals.length === 1) return signals[0]!
+
+  const nativeAny = (
+    AbortSignal as typeof AbortSignal & {
+      any?: (signals: AbortSignal[]) => AbortSignal
+    }
+  ).any
+  if (nativeAny) return nativeAny([...signals])
+
+  const controller = new AbortController()
+  const onAbort = (event: Event) => {
+    const signal = event.target as AbortSignal | null
+    controller.abort(signal?.reason)
+    for (const current of signals) {
+      current.removeEventListener("abort", onAbort)
+    }
+  }
+
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort(signal.reason)
+      return controller.signal
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+  }
+
+  return controller.signal
+}
+
 export function createAbortSignalWithTimeout(
   timeoutMs: number,
   abortSignal?: AbortSignal
@@ -73,7 +105,7 @@ export function createAbortSignalWithTimeout(
 
   return {
     signal: abortSignal
-      ? AbortSignal.any([timeoutController.signal, abortSignal])
+      ? combineAbortSignals([timeoutController.signal, abortSignal])
       : timeoutController.signal,
     cleanup: () => clearTimeout(timeout),
     didTimeout: () => timeoutController.signal.aborted,

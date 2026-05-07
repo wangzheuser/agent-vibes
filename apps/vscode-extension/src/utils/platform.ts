@@ -125,6 +125,94 @@ export function getCursorWorkbenchPath(): string | null {
   return candidates[0] || null
 }
 
+/** Returns the Cursor app resource root that contains product.json and out/ */
+export function getCursorAppRootPath(): string | null {
+  const workbenchPath = getCursorWorkbenchPath()
+  if (!workbenchPath) return null
+
+  const appRootPath = path.resolve(path.dirname(workbenchPath), "../../..")
+  return fs.existsSync(appRootPath) ? appRootPath : null
+}
+
+/** Returns the Cursor product.json path */
+export function getCursorProductJsonPath(): string | null {
+  const appRootPath = getCursorAppRootPath()
+  if (!appRootPath) return null
+
+  const productPath = path.join(appRootPath, "product.json")
+  return fs.existsSync(productPath) ? productPath : null
+}
+
+export type CursorProductMetadata = {
+  version: string | null
+  commit: string | null
+  date: string | null
+}
+
+export function getCursorProductMetadata(): CursorProductMetadata | null {
+  const productPath = getCursorProductJsonPath()
+  if (!productPath) return null
+
+  try {
+    const raw = fs.readFileSync(productPath, "utf-8")
+    const parsed = JSON.parse(raw) as {
+      version?: unknown
+      commit?: unknown
+      date?: unknown
+    }
+    return {
+      version: typeof parsed.version === "string" ? parsed.version : null,
+      commit: typeof parsed.commit === "string" ? parsed.commit : null,
+      date: typeof parsed.date === "string" ? parsed.date : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Returns the Cursor package.json path */
+export function getCursorPackageJsonPath(): string | null {
+  const appRootPath = getCursorAppRootPath()
+  if (!appRootPath) return null
+
+  const packageJsonPath = path.join(appRootPath, "package.json")
+  return fs.existsSync(packageJsonPath) ? packageJsonPath : null
+}
+
+/** Returns the Cursor app version from package.json */
+export function getCursorInstallVersion(): string | null {
+  const product = getCursorProductMetadata()
+  if (product?.version) {
+    return product.version
+  }
+
+  const packageJsonPath = getCursorPackageJsonPath()
+  if (!packageJsonPath) return null
+
+  try {
+    const raw = fs.readFileSync(packageJsonPath, "utf-8")
+    const parsed = JSON.parse(raw) as { version?: unknown }
+    return typeof parsed.version === "string" ? parsed.version : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Returns a stable install fingerprint for backup scoping.
+ * Uses version + commit + build date when available so same-version
+ * repacks do not accidentally reuse an old baseline.
+ */
+export function getCursorInstallFingerprint(): string | null {
+  const product = getCursorProductMetadata()
+  if (product) {
+    return JSON.stringify(product)
+  }
+
+  const version = getCursorInstallVersion()
+  return version ? JSON.stringify({ version, commit: null, date: null }) : null
+}
+
 /**
  * Returns the current platform + arch identifier for selecting the correct
  * SEA binary, e.g. "darwin-arm64", "linux-x64", "win32-x64".

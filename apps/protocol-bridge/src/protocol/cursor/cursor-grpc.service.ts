@@ -6,6 +6,34 @@ import type { KvServerMessage as KvStorageMessage } from "./kv-storage.service"
 import {
   AgentMode,
   AgentServerMessageSchema,
+  // New: Canvas / ForceBackground / McpState / SubagentAwait exec schemas
+  CanvasDestroyArgsSchema,
+  CanvasGetUrlArgsSchema,
+  CanvasRegisterArgsSchema,
+  // CommunicateUpdate 完整工具链
+  CommunicateUpdateArgsSchema,
+  CommunicateUpdateErrorSchema,
+  type CommunicateUpdateResult,
+  CommunicateUpdateResultSchema,
+  CommunicateUpdateSuccessSchema,
+  CommunicateUpdateToolCallSchema,
+  ForceBackgroundShellArgsSchema,
+  ForceBackgroundSubagentArgsSchema,
+  McpStateExecArgsSchema,
+  // SendFinalSummary 完整工具链
+  SendFinalSummaryArgsSchema,
+  SendFinalSummaryErrorSchema,
+  type SendFinalSummaryResult,
+  SendFinalSummaryResultSchema,
+  SendFinalSummarySuccessSchema,
+  SendFinalSummaryToolCallSchema,
+  SubagentAwaitArgsSchema,
+  // InteractionUpdate 补齐
+  ActiveBranchChangeSchema,
+  PostRequestPromptUpdateSchema,
+  PromptSuggestionUpdateSchema,
+  // ExecServerMessage 补齐
+  RequestContextArgsSchema,
   // New v2.6.13 ToolCall schemas
   AiAttributionArgsSchema,
   AiAttributionErrorSchema,
@@ -284,6 +312,7 @@ import {
   SwitchModeToolCallSchema,
   TaskArgsSchema,
   TaskErrorSchema,
+  TaskMode,
   TaskResultSchema,
   TaskSuccessSchema,
   TaskToolCallDeltaSchema,
@@ -793,6 +822,20 @@ type ToolFamily =
   | "blame_by_file_path"
   | "report_bug"
   | "set_active_branch"
+  // 新增 proto 更新后的 Exec 工具
+  | "force_background_shell"
+  | "force_background_subagent"
+  | "canvas_get_url"
+  | "canvas_destroy"
+  | "canvas_register"
+  | "mcp_state_exec"
+  | "subagent_await"
+  // 新增 ToolCall 级工具（有正式 ToolCall oneof case）
+  | "communicate_update"
+  | "send_final_summary"
+  // ExecServerMessage 补齐
+  | "request_context"
+  | "redacted_read"
   | "unknown"
 
 type ToolResultProjectionStatus =
@@ -962,6 +1005,17 @@ export class CursorGrpcService {
     "mcp",
     "shell",
     "execute_hook",
+    // 新增 proto 更新后的 Exec 工具
+    "force_background_shell",
+    "force_background_subagent",
+    "canvas_get_url",
+    "canvas_destroy",
+    "canvas_register",
+    "mcp_state_exec",
+    "subagent_await",
+    // ExecServerMessage 补齐
+    "request_context",
+    "redacted_read",
   ])
   private readonly protocolInlineOnlyFamilies: ReadonlySet<ToolFamily> =
     new Set([
@@ -988,6 +1042,9 @@ export class CursorGrpcService {
       "ai_attribution",
       "mcp_auth",
       "pr_management",
+      // 新增 ToolCall 级工具
+      "communicate_update",
+      "send_final_summary",
     ])
 
   // Active blob ID list (for KV storage)
@@ -1332,6 +1389,51 @@ export class CursorGrpcService {
         stepId: BigInt(stepId),
         stepDurationMs: BigInt(durationMs),
       })
+    )
+  }
+
+  // ─── Prompt Suggestion / PostRequestPrompt / ActiveBranchChange ──
+
+  /**
+   * Create PromptSuggestion response
+   * Cursor IDE 用于在会话结束后显示建议的后续 prompt
+   */
+  createPromptSuggestionResponse(suggestion: string): Buffer {
+    return this.wrapInteractionUpdate(
+      "promptSuggestion",
+      create(PromptSuggestionUpdateSchema, { suggestion })
+    )
+  }
+
+  /**
+   * Create PostRequestPrompt response
+   * Cursor IDE 用于在回复之后显示带按钮的提示卡片
+   */
+  createPostRequestPromptResponse(
+    title: string,
+    message: string,
+    buttonLabel: string,
+    buttonUrl: string
+  ): Buffer {
+    return this.wrapInteractionUpdate(
+      "postRequestPrompt",
+      create(PostRequestPromptUpdateSchema, {
+        title,
+        message,
+        buttonLabel,
+        buttonUrl,
+      })
+    )
+  }
+
+  /**
+   * Create ActiveBranchChange response
+   * 通知 Cursor IDE 当前活跃分支已切换
+   */
+  createActiveBranchChangeResponse(path: string, branchName: string): Buffer {
+    return this.wrapInteractionUpdate(
+      "activeBranchChange",
+      create(ActiveBranchChangeSchema, { path, branchName })
     )
   }
 
@@ -1861,6 +1963,11 @@ export class CursorGrpcService {
         case "CLIENT_SIDE_TOOL_V2_REFLECT":
           return "reflect"
       }
+      // 注意：force_background_shell/subagent、canvas_*、mcp_state_exec、subagent_await
+      // 没有对应的 ClientSideToolV2 枚举——它们是纯 ExecServerMessage 工具，
+      // 由 Cursor IDE 端内部触发而非通过 ClientSideToolV2 映射。
+      // communicate_update 和 send_final_summary 也没有 ClientSideToolV2 枚举，
+      // 但有专用 ToolCall oneof case（48/49），需通过模糊匹配识别。
     }
 
     const normalized = this.normalizeToolName(toolName)
@@ -1869,6 +1976,7 @@ export class CursorGrpcService {
     if (normalized.includes("reapply")) return "apply_agent_diff"
     if (normalized.includes("fetchrules")) return "read"
     if (normalized.includes("searchsymbols")) return "sem_search"
+    if (normalized.includes("execcommand")) return "shell"
     if (normalized.includes("backgroundcomposerfollowup")) return "truncated"
     if (normalized.includes("knowledgebase")) return "web_search"
     if (normalized.includes("fetchpullrequest")) return "web_fetch"
@@ -1877,6 +1985,24 @@ export class CursorGrpcService {
     if (normalized.includes("awaittask")) return "await"
     if (normalized.includes("readproject")) return "ls"
     if (normalized.includes("updateproject")) return "truncated"
+    if (normalized.includes("requestuserinput")) return "ask_question"
+    // Codex's native update_plan tool mutates the shared todo/plan state, so
+    // project it onto Cursor's updateTodos UI instead of the generic
+    // truncatedToolCall placeholder.
+    if (normalized.includes("updateplan")) return "update_todos"
+    if (normalized.includes("listmcpresourcetemplates"))
+      return "list_mcp_resources"
+    if (normalized.includes("viewimage")) return "read"
+    // Cursor's current protobuf does not expose exact Codex-native oneofs for
+    // sub-agent lifecycle or apply_patch. Project them onto the closest native
+    // Cursor families so the UI/tool stream stays structured instead of
+    // collapsing into truncatedToolCall placeholders.
+    if (normalized.includes("spawnagent")) return "task"
+    if (normalized.includes("sendinput")) return "task"
+    if (normalized.includes("resumeagent")) return "task"
+    if (normalized.includes("waitagent")) return "await"
+    if (normalized.includes("closeagent")) return "task"
+    if (normalized.includes("applypatch")) return "apply_agent_diff"
 
     if (
       normalized.includes("readmcpresource") ||
@@ -1969,6 +2095,64 @@ export class CursorGrpcService {
       normalized.includes("set_active_branch")
     )
       return "set_active_branch"
+    // 新增 proto 更新后的 Exec 工具模糊匹配
+    if (
+      normalized.includes("forcebackgroundshell") ||
+      normalized.includes("force_background_shell")
+    )
+      return "force_background_shell"
+    if (
+      normalized.includes("forcebackgroundsubagent") ||
+      normalized.includes("force_background_subagent")
+    )
+      return "force_background_subagent"
+    if (
+      normalized.includes("canvasgeturl") ||
+      normalized.includes("canvas_get_url")
+    )
+      return "canvas_get_url"
+    if (
+      normalized.includes("canvasdestroy") ||
+      normalized.includes("canvas_destroy")
+    )
+      return "canvas_destroy"
+    if (
+      normalized.includes("canvasregister") ||
+      normalized.includes("canvas_register")
+    )
+      return "canvas_register"
+    if (
+      normalized.includes("mcpstateexec") ||
+      normalized.includes("mcp_state_exec") ||
+      normalized.includes("mcpstate")
+    )
+      return "mcp_state_exec"
+    if (
+      normalized.includes("subagentawait") ||
+      normalized.includes("subagent_await")
+    )
+      return "subagent_await"
+    if (
+      normalized.includes("communicateupdate") ||
+      normalized.includes("communicate_update")
+    )
+      return "communicate_update"
+    if (
+      normalized.includes("sendfinalsummary") ||
+      normalized.includes("send_final_summary")
+    )
+      return "send_final_summary"
+    // ExecServerMessage 补齐模糊匹配
+    if (
+      normalized.includes("requestcontext") ||
+      normalized.includes("request_context")
+    )
+      return "request_context"
+    if (
+      normalized.includes("redactedread") ||
+      normalized.includes("redacted_read")
+    )
+      return "redacted_read"
     if (normalized.includes("askquestion")) return "ask_question"
     if (normalized.includes("switchmode")) return "switch_mode"
     if (normalized.includes("createplan")) return "create_plan"
@@ -3016,7 +3200,7 @@ export class CursorGrpcService {
                 : [],
             }
           })
-          .filter((entry) => !!entry)
+          .filter((entry): entry is Exclude<typeof entry, undefined> => !!entry)
       : []
     const suggestedSandboxMode = this.parseOptionalNonNegativeInt(
       record.suggestedSandboxMode ?? record.suggested_sandbox_mode
@@ -3043,10 +3227,8 @@ export class CursorGrpcService {
     args: Record<string, unknown>,
     shellResult?: ToolCompletionExtraData["shellResult"]
   ) {
-    const command = safeString(args.command)
-    const workingDirectory = safeString(
-      args.cwd || args.working_directory || args.workingDirectory
-    )
+    const command = this.resolveShellCommand(args)
+    const workingDirectory = this.resolveShellWorkingDirectory(args)
     const parsed = buildShellParsingMetadata(command)
     const requestedSandboxPolicyArg =
       args.requestedSandboxPolicy &&
@@ -3095,9 +3277,6 @@ export class CursorGrpcService {
       skipApproval: true,
       timeoutBehavior: timeoutBehavior ?? TimeoutBehavior.UNSPECIFIED,
       hardTimeout,
-      description:
-        safeString(shellResult?.description || args.description).trim() ||
-        undefined,
       classifierResult: this.normalizeShellClassifierResult(
         shellResult?.classifierResult ??
           args.classifierResult ??
@@ -3107,6 +3286,51 @@ export class CursorGrpcService {
         shellResult?.closeStdin ?? args.closeStdin ?? args.close_stdin
       ),
     })
+  }
+
+  private resolveShellToolDescription(
+    args: Record<string, unknown>,
+    shellResult?: ToolCompletionExtraData["shellResult"]
+  ): string | undefined {
+    const description = safeString(
+      shellResult?.description ||
+        args.description ||
+        args.justification ||
+        args.reason
+    ).trim()
+    return description || undefined
+  }
+
+  private resolveShellCommand(args: Record<string, unknown>): string {
+    return safeString(args.command || args.cmd)
+  }
+
+  private resolveShellWorkingDirectory(args: Record<string, unknown>): string {
+    return safeString(
+      args.cwd ||
+        args.workdir ||
+        args.working_directory ||
+        args.workingDirectory
+    )
+  }
+
+  private extractTaskAttachments(args: Record<string, unknown>): string[] {
+    const explicitAttachments = this.toStringArray(args.attachments)
+    if (explicitAttachments.length > 0) {
+      return explicitAttachments
+    }
+
+    const items = Array.isArray(args.items) ? args.items : []
+    const attachments: string[] = []
+    for (const rawItem of items) {
+      if (!rawItem || typeof rawItem !== "object") continue
+      const item = rawItem as Record<string, unknown>
+      const candidate = safeString(item.path || item.image_url).trim()
+      if (candidate) {
+        attachments.push(candidate)
+      }
+    }
+    return attachments
   }
 
   private normalizeReadLintsDiagnosticPosition(
@@ -3384,11 +3608,29 @@ export class CursorGrpcService {
   }
 
   private buildTaskArgs(args: Record<string, unknown>) {
+    const items = Array.isArray(args.items) ? args.items : []
+    const itemPrompt = items
+      .map((rawItem) => {
+        if (!rawItem || typeof rawItem !== "object") return ""
+        const item = rawItem as Record<string, unknown>
+        return safeString(item.text || item.path || item.image_url).trim()
+      })
+      .filter((value) => value.length > 0)
+      .join("\n")
+      .trim()
+    const resume = safeString(args.resume || args.id).trim()
+    const agentId = safeString(
+      args.agentId || args.agent_id || args.target || args.id
+    ).trim()
+    const fallbackAgentTaskLabel =
+      agentId || resume ? `Agent task ${agentId || resume}` : ""
     const prompt = safeString(
       args.prompt ||
         args.description ||
         args.task ||
         args.message ||
+        itemPrompt ||
+        fallbackAgentTaskLabel ||
         args.key ||
         args.value
     )
@@ -3397,13 +3639,13 @@ export class CursorGrpcService {
         args.prompt ||
         args.task ||
         args.message ||
+        itemPrompt ||
+        fallbackAgentTaskLabel ||
         args.value ||
         args.key
     )
     const model = safeString(args.model).trim()
-    const resume = safeString(args.resume).trim()
-    const agentId = safeString(args.agentId || args.agent_id).trim()
-    const attachments = this.toStringArray(args.attachments)
+    const attachments = this.extractTaskAttachments(args)
     return create(TaskArgsSchema, {
       description,
       prompt,
@@ -3411,6 +3653,7 @@ export class CursorGrpcService {
       resume: resume || undefined,
       agentId: agentId || undefined,
       attachments,
+      mode: TaskMode.AGENT,
     })
   }
 
@@ -3727,6 +3970,99 @@ export class CursorGrpcService {
           case: "executeHookArgs" as const,
           value: create(ExecuteHookArgsSchema, {}),
         }
+      // 新增 proto 更新后的 Exec 工具 args 构建
+      case "force_background_shell": {
+        const a = args as Record<string, unknown>
+        return {
+          case: "forceBackgroundShellArgs" as const,
+          value: create(ForceBackgroundShellArgsSchema, {
+            toolCallId: safeString(
+              a.toolCallId ?? a.tool_call_id ?? toolCallId
+            ),
+          }),
+        }
+      }
+      case "force_background_subagent": {
+        const a = args as Record<string, unknown>
+        return {
+          case: "forceBackgroundSubagentArgs" as const,
+          value: create(ForceBackgroundSubagentArgsSchema, {
+            toolCallId: safeString(
+              a.toolCallId ?? a.tool_call_id ?? toolCallId
+            ),
+          }),
+        }
+      }
+      case "canvas_get_url": {
+        const a = args as Record<string, unknown>
+        return {
+          case: "canvasGetUrlArgs" as const,
+          value: create(CanvasGetUrlArgsSchema, {
+            canvasId: safeString(a.canvasId ?? a.canvas_id),
+            preview: Boolean(a.preview),
+          }),
+        }
+      }
+      case "canvas_destroy": {
+        const a = args as Record<string, unknown>
+        return {
+          case: "canvasDestroyArgs" as const,
+          value: create(CanvasDestroyArgsSchema, {
+            canvasId: safeString(a.canvasId ?? a.canvas_id),
+          }),
+        }
+      }
+      case "canvas_register": {
+        const a = args as Record<string, unknown>
+        return {
+          case: "canvasRegisterArgs" as const,
+          value: create(CanvasRegisterArgsSchema, {
+            path: safeString(a.path),
+          }),
+        }
+      }
+      case "mcp_state_exec":
+        return {
+          case: "mcpStateExecArgs" as const,
+          value: create(McpStateExecArgsSchema, {}),
+        }
+      case "subagent_await": {
+        const a = args as Record<string, unknown>
+        return {
+          case: "subagentAwaitArgs" as const,
+          value: create(SubagentAwaitArgsSchema, {
+            agentId: safeString(a.agentId ?? a.agent_id),
+            timeoutMs: safeUint32(a.timeoutMs ?? a.timeout_ms, 30000),
+          }),
+        }
+      }
+      // ExecServerMessage 补齐
+      case "request_context": {
+        const a = args as Record<string, unknown>
+        return {
+          case: "requestContextArgs" as const,
+          value: create(RequestContextArgsSchema, {
+            notesSessionId:
+              safeString(a.notesSessionId ?? a.notes_session_id) || undefined,
+            workspaceId:
+              safeString(a.workspaceId ?? a.workspace_id) || undefined,
+          }),
+        }
+      }
+      case "redacted_read": {
+        const normalizedReadArgs = this.normalizeReadToolArgs(
+          args as Record<string, unknown>
+        )
+        return {
+          case: "redactedReadArgs" as const,
+          value: create(ReadArgsSchema, {
+            path: normalizedReadArgs.path,
+            toolCallId,
+            offset: normalizedReadArgs.offset,
+            limit: normalizedReadArgs.limit,
+          }),
+        }
+      }
       default: {
         const message = `Unknown tool "${toolName}" has no ExecServerMessage mapping`
         this.logger.error(message)
@@ -3816,6 +4152,20 @@ export class CursorGrpcService {
       blame_by_file_path: "blameByFilePathToolCall",
       report_bug: "reportBugToolCall",
       set_active_branch: "setActiveBranchToolCall",
+      // 纯 ExecServerMessage 工具（proto 中没有专用 ToolCall oneof case）
+      force_background_shell: "truncatedToolCall",
+      force_background_subagent: "truncatedToolCall",
+      canvas_get_url: "truncatedToolCall",
+      canvas_destroy: "truncatedToolCall",
+      canvas_register: "truncatedToolCall",
+      mcp_state_exec: "truncatedToolCall",
+      subagent_await: "truncatedToolCall",
+      // ExecServerMessage 补齐（proto 没有专用 ToolCall case）
+      request_context: "truncatedToolCall",
+      redacted_read: "readToolCall",
+      // 有专用 ToolCall oneof case 的新工具
+      communicate_update: "communicateUpdateToolCall",
+      send_final_summary: "sendFinalSummaryToolCall",
       unknown: "truncatedToolCall",
     }
     const matchedCase = familyToCase[family] || "truncatedToolCall"
@@ -3864,6 +4214,7 @@ export class CursorGrpcService {
           case: "shellToolCall" as const,
           value: create(ShellToolCallSchema, {
             args: this.buildShellArgsMessage(callId, args),
+            description: this.resolveShellToolDescription(args),
           }),
         }
       case "delete":
@@ -3946,7 +4297,7 @@ export class CursorGrpcService {
                     : [],
                 }
               })
-              .filter((item) => !!item)
+              .filter((item): item is Exclude<typeof item, undefined> => !!item)
           : []
         return {
           case: "updateTodosToolCall" as const,
@@ -4211,20 +4562,30 @@ export class CursorGrpcService {
           }),
         }
       // ─── New v2.6.13 Tool Call Builders ────────────────────────────
-      case "await":
+      case "await": {
+        const targetTaskId = safeString(
+          args.taskId ||
+            args.task_id ||
+            (Array.isArray(args.targets) ? args.targets[0] : "")
+        )
+        const blockUntilMs = safeUint32(
+          args.timeoutMs ??
+            args.timeout_ms ??
+            args.blockUntilMs ??
+            args.block_until_ms,
+          30000
+        )
         return {
           case: "awaitToolCall" as const,
           value: create(AwaitToolCallSchema, {
             args: create(AwaitArgsSchema, {
-              taskId: safeString(args.taskId || args.task_id),
-              blockUntilMs: safeUint32(
-                args.blockUntilMs ?? args.block_until_ms,
-                30000
-              ),
+              taskId: targetTaskId,
+              blockUntilMs,
               regex: safeString(args.regex) || undefined,
             }),
           }),
         }
+      }
       case "ai_attribution":
         return {
           case: "aiAttributionToolCall" as const,
@@ -4471,6 +4832,57 @@ export class CursorGrpcService {
           }),
         }
       }
+      case "communicate_update":
+        return {
+          case: "communicateUpdateToolCall" as const,
+          value: create(CommunicateUpdateToolCallSchema, {
+            args: create(CommunicateUpdateArgsSchema, {
+              currentStep: safeString(
+                args.currentStep || args.current_step || args.step
+              ),
+            }),
+          }),
+        }
+      case "send_final_summary":
+        return {
+          case: "sendFinalSummaryToolCall" as const,
+          value: create(SendFinalSummaryToolCallSchema, {
+            args: create(SendFinalSummaryArgsSchema, {
+              finalSummary: safeString(
+                args.finalSummary || args.final_summary || args.summary
+              ),
+            }),
+          }),
+        }
+      // 纯 ExecServerMessage 工具在 ToolCall 层用 truncated 表示（proto 没有专用 case）
+      case "force_background_shell":
+      case "force_background_subagent":
+      case "canvas_get_url":
+      case "canvas_destroy":
+      case "canvas_register":
+      case "mcp_state_exec":
+      case "request_context":
+        return {
+          case: "truncatedToolCall" as const,
+          value: create(TruncatedToolCallSchema, {
+            args: create(TruncatedToolCallArgsSchema, {}),
+          }),
+        }
+      case "redacted_read": {
+        // redacted_read 复用 ReadArgs，ToolCall 层映射到 readToolCall
+        const normalizedReadArgs = this.normalizeReadToolArgs(args)
+        return {
+          case: "readToolCall" as const,
+          value: create(ReadToolCallSchema, {
+            args: create(ReadToolArgsSchema, {
+              path: normalizedReadArgs.path,
+              offset: normalizedReadArgs.offset,
+              limit: normalizedReadArgs.limit,
+              includeLineNumbers: normalizedReadArgs.includeLineNumbers,
+            }),
+          }),
+        }
+      }
       default:
         this.logger.warn(
           `Unknown ToolCall type "${toolName}", defaulting to truncatedToolCall`
@@ -4623,8 +5035,8 @@ export class CursorGrpcService {
 
     if (family === "shell" || family === "background_shell_spawn") {
       const shellResult = extraData?.shellResult
-      const command = safeString(args.command)
-      const workingDirectory = safeString(args.cwd || args.working_directory)
+      const command = this.resolveShellCommand(args)
+      const workingDirectory = this.resolveShellWorkingDirectory(args)
 
       let resultOneOf: ShellResult["result"]
       if (status === "timeout") {
@@ -4723,6 +5135,7 @@ export class CursorGrpcService {
         case: "shellToolCall" as const,
         value: create(ShellToolCallSchema, {
           args: this.buildShellArgsMessage(callId, args, shellResult),
+          description: this.resolveShellToolDescription(args, shellResult),
           result: create(ShellResultSchema, {
             result: resultOneOf,
             sandboxPolicy:
@@ -4805,7 +5218,7 @@ export class CursorGrpcService {
       }
     }
 
-    if (family === "read") {
+    if (family === "read" || family === "redacted_read") {
       const normalizedReadArgs = this.normalizeReadToolArgs(args)
       const readSuccess = extraData?.readSuccess
       const hasBinaryOutput = readSuccess?.data instanceof Uint8Array
@@ -6066,7 +6479,11 @@ export class CursorGrpcService {
     // ─── New v2.6.13 Completion Handlers ─────────────────────────────
 
     if (family === "await") {
-      const taskIdVal = safeString(args.taskId || args.task_id)
+      const taskIdVal = safeString(
+        args.taskId ||
+          args.task_id ||
+          (Array.isArray(args.targets) ? args.targets[0] : "")
+      )
       let awaitResultOneOf: AwaitResult["result"]
       if (status === "success") {
         awaitResultOneOf = {
@@ -6724,6 +7141,115 @@ export class CursorGrpcService {
           }),
           result: create(ComputerUseResultSchema, {
             result: computerUseResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    if (family === "communicate_update") {
+      const currentStep = safeString(
+        args.currentStep || args.current_step || args.step
+      )
+      const messageIndex = safeUint32(
+        args.messageIndex ?? args.message_index,
+        0
+      )
+      let communicateResultOneOf: CommunicateUpdateResult["result"]
+      if (status === "success") {
+        communicateResultOneOf = {
+          case: "success" as const,
+          value: create(CommunicateUpdateSuccessSchema, {
+            currentStep,
+            messageIndex,
+          }),
+        }
+      } else {
+        communicateResultOneOf = {
+          case: "error" as const,
+          value: create(CommunicateUpdateErrorSchema, {
+            error: statusMessage || "communicate_update failed",
+          }),
+        }
+      }
+
+      return {
+        case: "communicateUpdateToolCall" as const,
+        value: create(CommunicateUpdateToolCallSchema, {
+          args: create(CommunicateUpdateArgsSchema, {
+            currentStep,
+          }),
+          result: create(CommunicateUpdateResultSchema, {
+            result: communicateResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    if (family === "send_final_summary") {
+      const finalSummary = safeString(
+        args.finalSummary || args.final_summary || args.summary
+      )
+      let sendFinalSummaryResultOneOf: SendFinalSummaryResult["result"]
+      if (status === "success") {
+        sendFinalSummaryResultOneOf = {
+          case: "success" as const,
+          value: create(SendFinalSummarySuccessSchema, {
+            finalSummary,
+          }),
+        }
+      } else {
+        sendFinalSummaryResultOneOf = {
+          case: "error" as const,
+          value: create(SendFinalSummaryErrorSchema, {
+            error: statusMessage || "send_final_summary failed",
+          }),
+        }
+      }
+
+      return {
+        case: "sendFinalSummaryToolCall" as const,
+        value: create(SendFinalSummaryToolCallSchema, {
+          args: create(SendFinalSummaryArgsSchema, {
+            finalSummary,
+          }),
+          result: create(SendFinalSummaryResultSchema, {
+            result: sendFinalSummaryResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    // 纯 ExecServerMessage 工具（proto 没有专用 ToolCall oneof case）
+    // 这些工具在 ToolCall 层正确映射到 truncatedToolCall
+    if (
+      family === "force_background_shell" ||
+      family === "force_background_subagent" ||
+      family === "canvas_get_url" ||
+      family === "canvas_destroy" ||
+      family === "canvas_register" ||
+      family === "mcp_state_exec" ||
+      family === "subagent_await" ||
+      family === "request_context"
+    ) {
+      const execOnlyResultOneOf =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(TruncatedToolCallSuccessSchema, {}),
+            }
+          : {
+              case: "error" as const,
+              value: create(TruncatedToolCallErrorSchema, {
+                error: statusMessage || `${family} failed`,
+              }),
+            }
+
+      return {
+        case: "truncatedToolCall" as const,
+        value: create(TruncatedToolCallSchema, {
+          args: create(TruncatedToolCallArgsSchema, {}),
+          result: create(TruncatedToolCallResultSchema, {
+            result: execOnlyResultOneOf,
           }),
         }),
       }

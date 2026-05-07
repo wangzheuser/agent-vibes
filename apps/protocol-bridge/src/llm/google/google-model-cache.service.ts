@@ -4,6 +4,10 @@ import {
   isSupportedModel as isRegistrySupported,
 } from "../shared/model-registry"
 import { ProcessPoolService } from "./process-pool.service"
+import {
+  GOOGLE_STARTUP_UPSTREAM_CHECK_ENV,
+  isGoogleStartupUpstreamCheckEnabled,
+} from "./startup-probe-policy"
 
 /**
  * Model info from Cloud Code API
@@ -42,8 +46,16 @@ export class GoogleModelCacheService implements OnModuleInit {
     this.addDefaultModels()
 
     if (this.processPool.isConfigured()) {
-      this.logger.log("Using default models, loading from API in background...")
-      this.loadModelsInBackground()
+      if (isGoogleStartupUpstreamCheckEnabled()) {
+        this.logger.log(
+          "Using default models, loading from Google API in background..."
+        )
+        this.loadModelsInBackground()
+      } else {
+        this.logger.log(
+          `Startup Google model fetch disabled (${GOOGLE_STARTUP_UPSTREAM_CHECK_ENV}=false); keeping default Gemini models until an explicit refresh or request.`
+        )
+      }
     } else {
       this.logger.warn(
         "Antigravity not configured, using default Gemini models"

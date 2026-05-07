@@ -371,6 +371,15 @@
     .toggle.on .toggle-track::after { transform: translateX(14px); background: #fff; }
     .toggle-label { font-size: var(--text-sm); color: var(--fg-2); user-select: none; }
     .toggle:hover .toggle-track { border-color: color-mix(in srgb, var(--focus) 60%, transparent); }
+    .toggle.disabled { opacity: 0.45; cursor: default; }
+    .toggle.disabled .toggle-label { cursor: default; }
+    .toggle.disabled:hover .toggle-track { border-color: var(--input-border); }
+    .toggle.pending { opacity: 0.72; cursor: progress; }
+    .toggle.pending .toggle-label { cursor: progress; }
+    .toggle.pending:hover .toggle-track { border-color: inherit; }
+    .toggle.readonly { cursor: default; }
+    .toggle.readonly .toggle-label { cursor: default; }
+    .toggle.readonly:hover .toggle-track { border-color: var(--input-border); }
 
     /* ── Log viewer (borderless terminal style) ── */
     .log-box {
@@ -476,6 +485,51 @@
       border-radius: var(--radius); color: var(--input-fg); font-size: var(--text-sm);
     }
     .setting-input:focus { outline: none; border-color: var(--focus); }
+    .setting-control-cluster {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--sp-2);
+      flex-wrap: wrap;
+    }
+    .setting-select-wrap {
+      position: relative;
+      min-width: 180px;
+    }
+    .setting-select-wrap::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      right: 12px;
+      width: 7px;
+      height: 7px;
+      border-right: 1.5px solid var(--fg-2);
+      border-bottom: 1.5px solid var(--fg-2);
+      transform: translateY(-65%) rotate(45deg);
+      pointer-events: none;
+      opacity: 0.9;
+    }
+    .setting-input-select {
+      width: 100%;
+      min-width: 180px;
+      height: 34px;
+      padding: 0 34px 0 12px;
+      text-align: left;
+      appearance: none;
+      -webkit-appearance: none;
+      background: color-mix(in srgb, var(--input-bg) 92%, var(--bg));
+      border-color: color-mix(in srgb, var(--input-border) 88%, transparent);
+      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 4%, transparent);
+      transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+    }
+    .setting-input-select:hover {
+      border-color: color-mix(in srgb, var(--focus) 36%, var(--input-border));
+      background: color-mix(in srgb, var(--input-bg) 84%, var(--bg));
+    }
+    .setting-input-select:focus {
+      border-color: var(--focus);
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--focus) 24%, transparent);
+    }
     .setting-input-wide {
       width: 100%; margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3); text-align: left;
       background: var(--input-bg); border: 1px solid var(--input-border);
@@ -490,6 +544,14 @@
     .setting-badge-ok { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
     .setting-badge-warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
     .setting-badge-info { background: color-mix(in srgb, #60a5fa 16%, transparent); color: #60a5fa; }
+    .setting-actions {
+      display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--sp-2);
+    }
+    .setting-hint {
+      margin-top: var(--sp-2);
+      font-size: var(--text-xs);
+      color: var(--fg-3);
+    }
     @media (max-width: 640px) {
       .settings-layout { flex-direction: column; }
       .settings-nav { width: 100%; border-right: none; border-bottom: 1px solid var(--line); padding: 0 0 var(--sp-2) 0; display: flex; gap: var(--sp-1); overflow-x: auto; }
@@ -839,6 +901,7 @@
           codexQuotaStatus.hasData = true;
           codexQuotaStatus.lastUpdatedAt = state.codexQuotaUpdatedAt || getCodexQuotaTimestamp(state.codexQuotaData) || null;
         }
+        if (typeof state.codexQuotaFetchedAt === 'number') codexQuotaFetchedAt = state.codexQuotaFetchedAt;
       } catch (err) {
         codexQuotaData = null;
       }
@@ -850,6 +913,8 @@
         if (state.googleQuotaData && state.googleQuotaData.accounts) {
           googleQuotaData = state.googleQuotaData;
         }
+        if (typeof state.googleQuotaFetchedAt === 'number') googleQuotaFetchedAt = state.googleQuotaFetchedAt;
+        if (typeof state.poolStatusFetchedAt === 'number') poolStatusFetchedAt = state.poolStatusFetchedAt;
       } catch (err) {
         googleQuotaData = null;
       }
@@ -873,6 +938,7 @@
         vscode.setState(Object.assign({}, prev, {
           codexQuotaData: codexQuotaData,
           codexQuotaUpdatedAt: codexQuotaStatus.lastUpdatedAt,
+          codexQuotaFetchedAt: codexQuotaFetchedAt,
         }));
       } catch (err) {
         // ignore cache persistence failures
@@ -884,10 +950,25 @@
         var prev = vscode.getState() || {};
         vscode.setState(Object.assign({}, prev, {
           googleQuotaData: googleQuotaData,
+          googleQuotaFetchedAt: googleQuotaFetchedAt,
+          poolStatusFetchedAt: poolStatusFetchedAt,
         }));
       } catch (err) {
         // ignore cache persistence failures
       }
+    }
+
+    // ── 数据新鲜度检查常量和状态 ──
+    var POOL_STALE_MS = 30000;        // Pool Status: 30 秒
+    var CODEX_QUOTA_STALE_MS = 60000; // Codex Quota: 60 秒
+    var GOOGLE_QUOTA_STALE_MS = 60000; // Google Quota: 60 秒
+
+    var poolStatusFetchedAt = 0;
+    var codexQuotaFetchedAt = 0;
+    var googleQuotaFetchedAt = 0;
+
+    function isStale(fetchedAt, thresholdMs) {
+      return !fetchedAt || (Date.now() - fetchedAt) > thresholdMs;
     }
 
     restoreAnalyticsCache();
@@ -932,9 +1013,18 @@
         var dbgToggle = document.getElementById('log-debug-toggle');
         if (dbgToggle) dbgToggle.classList.toggle('on', !!m.debugMode);
       }
-      if (m.type === 'poolStatusUpdate') renderPoolStatus(m.data);
-      if (m.type === 'googleQuotaUpdate') renderGoogleQuota(m.data);
-      if (m.type === 'codexQuotaUpdate') renderCodexQuota(m.data);
+      if (m.type === 'poolStatusUpdate') {
+        if (m.data) poolStatusFetchedAt = Date.now();
+        renderPoolStatus(m.data);
+      }
+      if (m.type === 'googleQuotaUpdate') {
+        if (m.data && m.data.accounts) googleQuotaFetchedAt = Date.now();
+        renderGoogleQuota(m.data);
+      }
+      if (m.type === 'codexQuotaUpdate') {
+        if (m.data && m.data.accounts) codexQuotaFetchedAt = Date.now();
+        renderCodexQuota(m.data);
+      }
       if (m.type === 'usageSummaryUpdate') {
         usageSummaryData = m.data;
         analyticsHydrated = hasAnalyticsCache();
@@ -1178,6 +1268,7 @@
       const pendingDisplayCommand = getPendingDisplayCommand(s);
       const renderedCommands = new Set();
       const baseActions = [];
+      const routingActive = Boolean(s.routingActive);
 
       const isRunning = s.bridge === 'Running';
       if (isRunning) {
@@ -1187,7 +1278,7 @@
       }
       baseActions.push({ label: 'Restart', command: 'agentVibes.restartServer', tone: 'secondary', disabled: !isRunning });
 
-      if (s.forwarding) {
+      if (routingActive) {
         baseActions.push({ label: 'Disable forwarding', command: 'agentVibes.disableForwarding', tone: 'secondary' });
       } else {
         baseActions.push({ label: 'Enable forwarding', command: 'agentVibes.enableForwarding', tone: isRunning ? 'primary' : 'secondary' });
@@ -1266,10 +1357,13 @@
 
       // 5 status cards — user-facing info only
       const grid = document.getElementById('status-grid');
+      const trafficLabel = 'Forwarding';
+      const trafficValue = s.forwarding ? 'Active' : 'Idle';
+      const trafficTone = s.forwarding ? 'good' : 'muted';
       const cards = [
         { label: 'Health', value: isRunning ? 'Online' : 'Offline', tone: isRunning ? 'good' : 'warn' },
         { label: 'SSL', value: s.hasCertificates ? 'Valid' : 'Missing', tone: s.hasCertificates ? 'good' : 'warn' },
-        { label: 'Forwarding', value: s.forwarding ? 'Active' : 'Idle', tone: s.forwarding ? 'good' : 'muted' },
+        { label: trafficLabel, value: trafficValue, tone: trafficTone },
         { label: 'Port', value: String(s.port || '--'), tone: s.port ? 'good' : '' },
         { label: 'Accounts', value: String(s.totalAccounts || 0), tone: s.totalAccounts > 0 ? 'good' : 'warn' },
       ];
@@ -1302,7 +1396,7 @@
       // Model mapping per backend
       const BACKEND_MODELS = {
         antigravity: ['Gemini Pro 3.1 High', 'Claude Opus 4.6'],
-        codex: ['GPT-5.4', 'Codex'],
+        codex: ['GPT-5.5', 'Codex'],
         'openai-compat': ['Custom Models'],
         'claude-api': ['Claude Opus 4.6'],
       };
@@ -1421,9 +1515,11 @@
       acctPage = 0;
       renderAccounts(allData || {});
       if (selectedChannel === 'codex' && codexQuotaData && codexQuotaData.accounts && codexQuotaData.accounts.length) {
-        setTimeout(function() {
-          refreshCodexQuota(false);
-        }, 0);
+        if (isStale(codexQuotaFetchedAt, CODEX_QUOTA_STALE_MS)) {
+          setTimeout(function() {
+            refreshCodexQuota(false);
+          }, 0);
+        }
       }
     }
 
@@ -1649,7 +1745,7 @@
       var selected = null;
       for (var mi = 0; mi < models.length; mi++) {
         var candidate = models[mi];
-        if (candidate && candidate.model === 'gpt-5.4' && candidate.effective) {
+        if (candidate && candidate.model === 'gpt-5.5' && candidate.effective) {
           selected = candidate;
           break;
         }
@@ -1928,10 +2024,23 @@
           if (item.desc) ch += '<div class="setting-desc">' + esc(item.desc) + '</div>';
           ch += '</div>';
           // Right side: value or control
-          if (item.type === 'toggle') {
+          if (item.type === 'toggle' || item.type === 'enumToggle' || item.type === 'readonlyToggle') {
             var on = Boolean(item.value);
-            ch += '<div class="toggle ' + (on ? 'on' : '') + '" data-key="' + esc(item.key) + '" onclick="toggleSetting(this)">';
+            var toggleClasses = 'toggle ' + (on ? 'on' : '') + (item.type === 'readonlyToggle' ? ' readonly' : '');
+            ch += '<div class="' + toggleClasses + '" data-key="' + esc(item.key || '') + '"';
+            if (item.type === 'enumToggle') {
+              ch += ' data-on-value="' + esc(item.onValue || '') + '" data-off-value="' + esc(item.offValue || '') + '"';
+            }
+            if (item.type === 'readonlyToggle') {
+              ch += ' data-readonly="1"';
+            }
+            ch += ' onclick="toggleSetting(this)">';
             ch += '<span class="toggle-label">' + (on ? 'On' : 'Off') + '</span>';
+            ch += '<div class="toggle-track"></div></div>';
+          } else if (item.type === 'commandToggle') {
+            var commandOn = Boolean(item.value);
+            ch += '<div class="toggle ' + (commandOn ? 'on' : '') + (item.disabled ? ' disabled' : '') + '" data-on-command="' + esc(item.onCommand || '') + '" data-off-command="' + esc(item.offCommand || '') + '" data-disabled="' + (item.disabled ? '1' : '0') + '" data-pending="' + (item.pending ? '1' : '0') + '" onclick="toggleCommandSetting(this)">';
+            ch += '<span class="toggle-label">' + (commandOn ? 'On' : 'Off') + '</span>';
             ch += '<div class="toggle-track"></div></div>';
           } else if (item.type === 'number') {
             if (item.key === 'port') {
@@ -1940,7 +2049,13 @@
               ch += '<input class="setting-input" type="number" value="' + esc(item.value) + '" data-key="' + esc(item.key) + '" onchange="updateNumberSetting(this)" />';
             }
           } else if (item.type === 'select') {
-            ch += '<select class="setting-input" data-key="' + esc(item.key) + '" onchange="updateStringSetting(this)">';
+            ch += '<div class="setting-control-cluster">';
+            if (item.badgeValue) {
+              var selectBadgeCls = item.badgeTone === 'ok' ? 'setting-badge-ok' : item.badgeTone === 'warn' ? 'setting-badge-warn' : item.badgeTone === 'info' ? 'setting-badge-info' : '';
+              ch += '<span class="setting-badge ' + selectBadgeCls + '">' + esc(item.badgeValue) + '</span>';
+            }
+            ch += '<div class="setting-select-wrap">';
+            ch += '<select class="setting-input setting-input-select' + (item.compact ? ' setting-input-select-compact' : '') + '" data-key="' + esc(item.key) + '" onchange="updateStringSetting(this)">';
             if (item.options) {
               for (var oi = 0; oi < item.options.length; oi++) {
                 var opt = item.options[oi];
@@ -1948,9 +2063,20 @@
               }
             }
             ch += '</select>';
+            ch += '</div>';
+            ch += '</div>';
           } else if (item.type === 'badge') {
-            var badgeCls = item.tone === 'ok' ? 'setting-badge-ok' : item.tone === 'warn' ? 'setting-badge-warn' : '';
+            var badgeCls = item.tone === 'ok' ? 'setting-badge-ok' : item.tone === 'warn' ? 'setting-badge-warn' : item.tone === 'info' ? 'setting-badge-info' : '';
             ch += '<span class="setting-badge ' + badgeCls + '">' + esc(item.value) + '</span>';
+          } else if (item.type === 'actions') {
+            ch += '<div class="setting-actions">';
+            if (item.actions) {
+              for (var ai = 0; ai < item.actions.length; ai++) {
+                var action = item.actions[ai];
+                ch += '<button class="btn btn-' + esc(action.tone || 'secondary') + '" onclick="runCmd(\'' + esc(action.command) + '\')"' + (action.disabled ? ' disabled' : '') + '>' + esc(action.label) + '</button>';
+              }
+            }
+            ch += '</div>';
           } else {
             // readonly
             ch += '<span class="setting-val">' + esc(item.value) + '</span>';
@@ -1959,6 +2085,9 @@
           // Path input (full-width below label)
           if (item.type === 'path') {
             ch += '<input class="setting-input-wide" type="text" value="' + esc(item.value) + '" placeholder="' + esc(item.placeholder || '') + '" data-key="' + esc(item.key) + '" onchange="updateStringSetting(this)" />';
+          }
+          if (item.hint) {
+            ch += '<div class="setting-hint">' + esc(item.hint) + '</div>';
           }
           ch += '</div>'; // setting-item
         }
@@ -1978,12 +2107,33 @@
     }
 
     function toggleSetting(el) {
+      if (el.dataset.readonly === '1') return;
       const key = el.dataset.key;
       const isOn = el.classList.contains('on');
       const newVal = !isOn;
+      const mappedValue = newVal
+        ? (el.dataset.onValue || '')
+        : (el.dataset.offValue || '');
       el.classList.toggle('on');
       el.querySelector('.toggle-label').textContent = newVal ? 'On' : 'Off';
-      vscode.postMessage({ type: 'updateSetting', key: key, value: newVal });
+      vscode.postMessage({
+        type: 'updateSetting',
+        key: key,
+        value: el.dataset.onValue || el.dataset.offValue ? mappedValue : newVal
+      });
+    }
+
+    function toggleCommandSetting(el) {
+      if (el.dataset.disabled === '1' || el.dataset.pending === '1') return;
+      var isOn = el.classList.contains('on');
+      var nextOn = !isOn;
+      var cmd = isOn ? el.dataset.offCommand : el.dataset.onCommand;
+      if (!cmd) return;
+      el.dataset.pending = '1';
+      el.classList.add('pending');
+      el.classList.toggle('on', nextOn);
+      el.querySelector('.toggle-label').textContent = nextOn ? 'On' : 'Off';
+      runCmd(cmd);
     }
 
     function updateNumberSetting(el) {
@@ -2455,16 +2605,26 @@
     };
 
     function refreshCodexQuota(force) {
+      if (!force && !isStale(codexQuotaFetchedAt, CODEX_QUOTA_STALE_MS)) {
+        return;
+      }
       codexQuotaStatus.loading = true;
       updateCodexQuotaRefreshHint();
       vscode.postMessage({ type: 'getCodexQuota', data: { force: !!force } });
     }
 
     function refreshPoolStatus(forceCodexQuota, forceGoogleQuota) {
+      var isForce = forceCodexQuota || forceGoogleQuota;
+      // 非 force 模式下检查 Pool Status 的新鲜度
+      if (!isForce && !isStale(poolStatusFetchedAt, POOL_STALE_MS)) {
+        return;
+      }
       var btn = document.getElementById('accounts-refresh-btn');
       if (btn) { btn.disabled = true; btn.textContent = 'Refreshing...'; }
       vscode.postMessage({ type: 'getPoolStatus' });
-      vscode.postMessage({ type: 'getGoogleQuota', data: { force: forceGoogleQuota === true } });
+      if (forceGoogleQuota || isStale(googleQuotaFetchedAt, GOOGLE_QUOTA_STALE_MS)) {
+        vscode.postMessage({ type: 'getGoogleQuota', data: { force: forceGoogleQuota === true } });
+      }
       refreshCodexQuota(!!forceCodexQuota);
     }
 
@@ -3196,7 +3356,7 @@
       { id: 'bridge',     name: 'Bridge Health',       desc: 'HTTPS health check against the local bridge' },
       { id: 'h2',         name: 'End-to-End Cursor TLS', desc: 'Verify api2.cursor.sh resolves correctly and presents a valid certificate end-to-end' },
       { id: 'forwarding', name: 'Traffic Forwarding',  desc: 'Verify hosts mapping and the active platform forwarding backend' },
-      { id: 'dns',        name: 'DNS Resolution',      desc: 'Resolve Cursor domains via /etc/hosts to local IP' },
+      { id: 'dns',        name: 'DNS Resolution',      desc: 'Resolve Cursor domains via /etc/hosts to the managed local IP' },
       { id: 'accounts',   name: 'Backend Accounts',    desc: 'Check at least one account is configured' },
     ];
     const testState = {};

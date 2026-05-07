@@ -1,6 +1,5 @@
-import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import { resolveModelThinkingCapability } from "../shared/model-registry"
-import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
+import type { ThinkingIntent } from "../shared/thinking-types"
 
 const STANDARD_LEVEL_ORDER = [
   "none",
@@ -119,18 +118,10 @@ function convertBudgetToThinkingLevel(budgetTokens: number): string {
 }
 
 export function resolveCodexReasoningEffort(
-  dto: Pick<
-    CreateMessageDto,
-    | "model"
-    | "thinking"
-    | "output_config"
-    | "_thinkingIntent"
-    | "_requestedModel"
-  >,
+  intent: ThinkingIntent | null | undefined,
   modelName: string
 ): string {
   const { supported, defaultLevel } = normalizeSupportedLevels(modelName)
-  const intent = resolveThinkingIntentFromDto(dto)
   if (!intent) {
     return defaultLevel
   }

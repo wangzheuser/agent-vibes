@@ -228,7 +228,12 @@ export function translateCodexSseEvent(
     // ── Function call (tool_use) blocks ──────────────────────────
     case "response.output_item.added": {
       const item = event.item as Record<string, unknown>
-      if (!item || item.type !== "function_call") break
+      if (
+        !item ||
+        (item.type !== "function_call" && item.type !== "custom_tool_call")
+      ) {
+        break
+      }
 
       state.hasToolCall = true
       state.hasReceivedArgumentsDelta = false
@@ -296,9 +301,51 @@ export function translateCodexSseEvent(
       break
     }
 
+    // ── custom_tool_call 参数流式传输 — 对齐 Codex 官方 response.custom_tool_call_input.delta ──
+    case "response.custom_tool_call_input.delta": {
+      state.hasReceivedArgumentsDelta = true
+      const delta = event.delta as string
+      if (delta != null) {
+        results.push(
+          formatSseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "input_json_delta", partial_json: delta },
+          })
+        )
+      }
+      break
+    }
+
     case "response.output_item.done": {
       const item = event.item as Record<string, unknown>
-      if (!item || item.type !== "function_call") break
+      if (
+        !item ||
+        (item.type !== "function_call" && item.type !== "custom_tool_call")
+      ) {
+        break
+      }
+
+      // custom_tool_call：透传原始 input，不做 patch 包装。
+      // 如果上游需要特定包装（如 Cursor 的 apply_agent_diff），在消费侧处理。
+      if (item.type === "custom_tool_call") {
+        const rawInput =
+          typeof item.input === "string"
+            ? item.input
+            : JSON.stringify(item.input)
+        if (rawInput) {
+          results.push(
+            formatSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: state.blockIndex,
+              delta: {
+                type: "input_json_delta",
+                partial_json: rawInput,
+              },
+            })
+          )
+        }
+      }
 
       results.push(
         formatSseEvent("content_block_stop", {
@@ -346,6 +393,75 @@ export function translateCodexSseEvent(
 
       results.push(formatSseEvent("message_delta", messageDelta))
       results.push(formatSseEvent("message_stop", { type: "message_stop" }))
+      break
+    }
+
+    // ── response.failed → 错误终止 — 对齐 Codex 官方 response.failed 事件 ──
+    case "response.failed": {
+      const response = event.response as Record<string, unknown>
+      const errorObj = response?.error as Record<string, unknown>
+      const errorMessage = (errorObj?.message as string) || "Response failed"
+      const errorCode = (errorObj?.code as string) || "unknown_error"
+
+      // 映射已知错误码到标准 stop_reason
+      let stopReason = "error"
+      if (errorCode === "context_length_exceeded") {
+        stopReason = "max_tokens"
+      }
+
+      results.push(
+        formatSseEvent("message_delta", {
+          type: "message_delta",
+          delta: {
+            stop_reason: stopReason,
+            stop_sequence: null,
+            error: { type: errorCode, message: errorMessage },
+          },
+          usage: { input_tokens: 0, output_tokens: 0 },
+        })
+      )
+      results.push(formatSseEvent("message_stop", { type: "message_stop" }))
+      break
+    }
+
+    // ── response.incomplete → 不完整响应 — 对齐 Codex 官方 response.incomplete 事件 ──
+    case "response.incomplete": {
+      const response = event.response as Record<string, unknown>
+      const incompleteDetails = response?.incomplete_details as Record<
+        string,
+        unknown
+      >
+      const reason = (incompleteDetails?.reason as string) || "unknown"
+
+      let stopReason = "max_tokens"
+      if (reason === "max_output_tokens") {
+        stopReason = "max_tokens"
+      }
+
+      results.push(
+        formatSseEvent("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: { input_tokens: 0, output_tokens: 0 },
+        })
+      )
+      results.push(formatSseEvent("message_stop", { type: "message_stop" }))
+      break
+    }
+
+    // ── reasoning 原始内容 — 对齐 Codex 官方 response.reasoning_text.delta ──
+    // 当服务端不提供 summary 而是发送原始 reasoning content 时使用。
+    case "response.reasoning_text.delta": {
+      const delta = event.delta as string
+      if (delta != null) {
+        results.push(
+          formatSseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "thinking_delta", thinking: delta },
+          })
+        )
+      }
       break
     }
 
@@ -463,6 +579,36 @@ export function translateCodexToClaudeNonStream(
             id: sanitizeClaudeToolId((item.call_id as string) || ""),
             name,
             input,
+          })
+          break
+        }
+
+        case "custom_tool_call": {
+          hasToolCall = true
+          let name = (item.name as string) || ""
+          const original = reverseToolMap.get(name)
+          if (original) name = original
+
+          // 透传原始 input，不做 patch 包装。
+          let customInput: Record<string, unknown> = {}
+          if (typeof item.input === "string") {
+            try {
+              const parsed = JSON.parse(item.input) as Record<string, unknown>
+              if (typeof parsed === "object" && parsed !== null) {
+                customInput = parsed
+              }
+            } catch {
+              customInput = { input: item.input }
+            }
+          } else if (item.input && typeof item.input === "object") {
+            customInput = item.input as Record<string, unknown>
+          }
+
+          content.push({
+            type: "tool_use",
+            id: sanitizeClaudeToolId((item.call_id as string) || ""),
+            name,
+            input: customInput,
           })
           break
         }

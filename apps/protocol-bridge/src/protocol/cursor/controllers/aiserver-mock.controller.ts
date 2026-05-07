@@ -9,7 +9,9 @@ import { Controller, Get, Logger, Post, Req, Res } from "@nestjs/common"
 import { FastifyReply, FastifyRequest } from "fastify"
 import {
   GetDefaultModelForCliResponseSchema,
+  GetNewChatNudgeLegacyModelPickerRequestSchema,
   GetNewChatNudgeLegacyModelPickerResponseSchema,
+  GetNewChatNudgeParameterizedModelPickerRequestSchema,
   GetNewChatNudgeParameterizedModelPickerResponseSchema,
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
@@ -65,6 +67,7 @@ import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.
 import { GoogleService } from "../../../llm/google/google.service"
 import { CodexService } from "../../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
+import { parseModelRequest } from "../../../llm/shared/model-request"
 import {
   DEFAULT_GEMINI_MODEL,
   canPublicClaudeModelUseGoogle,
@@ -78,6 +81,7 @@ import {
   buildCursorModelLabel,
   buildCursorUsableModel,
   buildLegacyCursorAvailableModels,
+  parseCursorVariantString,
   resolveCursorDefaultSelection,
   selectPreferredCursorModelName,
 } from "../cursor-model-protocol"
@@ -96,7 +100,7 @@ const ENABLED_CURSOR_FEATURES = new Set<string>([
 
 /**
  * Models that are enabled by default in the model picker.
- * GPT-5.4 variants (High Fast, Extra high Fast, etc.) must be enabled
+ * GPT variants (High Fast, Extra high Fast, etc.) must be enabled
  * manually in Cursor UI because defaultOn only works at the model level.
  */
 const DEFAULT_ON_MODELS = new Set<string>(["gemini-3.1-pro-high"])
@@ -212,7 +216,7 @@ const MOCK_DEFAULTS = {
   /** Whether free trial usage is allowed */
   isAllowed: true,
   /** Preferred default model shown in pickers when available */
-  defaultModel: "gpt-5.4",
+  defaultModel: "gpt-5.5",
 } as const
 
 interface ParsedAvailableModelsRequest {
@@ -438,6 +442,105 @@ export class AiserverMockController {
     this.logger.debug(
       `${label}: ${modelNames.length} model(s) -> ${modelNames.join(", ")}`
     )
+  }
+
+  private scheduleCodexWarmupForCursorModel(
+    cursorModel: string | undefined,
+    reason: string
+  ): void {
+    const normalizedModel = cursorModel?.trim()
+    if (!normalizedModel) {
+      return
+    }
+    const variantSelection = parseCursorVariantString(normalizedModel)
+    const routableModel =
+      variantSelection?.baseModel ||
+      parseModelRequest(normalizedModel).baseModel ||
+      normalizedModel
+
+    let route:
+      | {
+          backend: string
+          model: string
+        }
+      | undefined
+    try {
+      route = this.modelRouter.resolveModel(routableModel)
+    } catch (error) {
+      this.logger.debug(
+        `Skipped Codex warmup for model=${normalizedModel}: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return
+    }
+
+    if (route.backend !== "codex") {
+      return
+    }
+
+    void this.codexService
+      .prewarmSessionConnection(
+        {
+          model: route.model,
+        },
+        { reason }
+      )
+      .catch((error) => {
+        this.logger.debug(
+          `Codex warmup failed for model=${normalizedModel}: ${error instanceof Error ? error.message : String(error)}`
+        )
+      })
+  }
+
+  private schedulePreferredCodexWarmup(
+    models: Array<{ name: string; family: string; isThinking: boolean }>,
+    reason: string
+  ): void {
+    const preferredModel = this.getPreferredDefaultModelName(models)
+    this.scheduleCodexWarmupForCursorModel(preferredModel, reason)
+  }
+
+  private parseLegacyNudgeCurrentModel(
+    req?: FastifyRequest
+  ): string | undefined {
+    const body = req?.body
+    if (!(body instanceof Uint8Array || Buffer.isBuffer(body))) {
+      return undefined
+    }
+
+    try {
+      const request = fromBinary(
+        GetNewChatNudgeLegacyModelPickerRequestSchema,
+        new Uint8Array(body)
+      )
+      return request.currentModel?.trim() || undefined
+    } catch (error) {
+      this.logger.debug(
+        `GetNewChatNudgeLegacyModelPicker request parse failed: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return undefined
+    }
+  }
+
+  private parseParameterizedNudgeCurrentModel(
+    req?: FastifyRequest
+  ): string | undefined {
+    const body = req?.body
+    if (!(body instanceof Uint8Array || Buffer.isBuffer(body))) {
+      return undefined
+    }
+
+    try {
+      const request = fromBinary(
+        GetNewChatNudgeParameterizedModelPickerRequestSchema,
+        new Uint8Array(body)
+      )
+      return request.currentModel?.modelId?.trim() || undefined
+    } catch (error) {
+      this.logger.debug(
+        `GetNewChatNudgeParameterizedModelPicker request parse failed: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return undefined
+    }
   }
 
   private getPreferredDefaultModelName(
@@ -691,7 +794,7 @@ export class AiserverMockController {
               defaultOn: false,
               preferredDefaultModelName: defaultSelection.model,
               defaultOnFastEfforts:
-                model.name === "gpt-5.4"
+                model.name === MOCK_DEFAULTS.defaultModel
                   ? new Set(["high", "xhigh"])
                   : undefined,
             }
@@ -883,6 +986,10 @@ export class AiserverMockController {
       maxMode: selection.maxMode,
       nextDefaultSetDate: "",
     })
+    this.scheduleCodexWarmupForCursorModel(
+      selection.model,
+      "aiserver-default-model"
+    )
     this.sendProto(res, GetDefaultModelResponseSchema, response)
   }
 
@@ -900,10 +1007,12 @@ export class AiserverMockController {
     @Res() res: FastifyReply
   ): void {
     const customModelIds = this.parseGetUsableModelsRequest(req)
-    const models = this.buildCursorModels({
+    const cursorModels = this.buildCursorModels({
       additionalModelNames: customModelIds,
-    }).map((model) => buildCursorUsableModel(model))
+    })
+    const models = cursorModels.map((model) => buildCursorUsableModel(model))
     const response = create(GetUsableModelsResponseSchema, { models })
+    this.schedulePreferredCodexWarmup(cursorModels, "aiserver-usable-models")
     this.sendProto(res, GetUsableModelsResponseSchema, response)
   }
 
@@ -922,6 +1031,10 @@ export class AiserverMockController {
     const response = create(GetDefaultModelForCliResponseSchema, {
       model: selectedModel ? buildCursorUsableModel(selectedModel) : undefined,
     })
+    this.scheduleCodexWarmupForCursorModel(
+      selectedModel?.name || selection.model,
+      "aiserver-default-model-cli"
+    )
     this.sendProto(res, GetDefaultModelForCliResponseSchema, response)
   }
 
@@ -1355,8 +1468,18 @@ export class AiserverMockController {
   // ── agent.v1 supplementary endpoints ──
 
   @Post("agent.v1.AgentService/GetNewChatNudgeLegacyModelPicker")
-  handleGetNewChatNudgeLegacyModelPicker(@Res() res: FastifyReply): void {
+  handleGetNewChatNudgeLegacyModelPicker(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
     const response = create(GetNewChatNudgeLegacyModelPickerResponseSchema, {})
+    const requestedModel =
+      this.parseLegacyNudgeCurrentModel(req) ||
+      this.getPreferredDefaultModelName(this.buildCursorModels())
+    this.scheduleCodexWarmupForCursorModel(
+      requestedModel,
+      "agent-new-chat-nudge-legacy"
+    )
     this.sendProto(
       res,
       GetNewChatNudgeLegacyModelPickerResponseSchema,
@@ -1366,11 +1489,19 @@ export class AiserverMockController {
 
   @Post("agent.v1.AgentService/GetNewChatNudgeParameterizedModelPicker")
   handleGetNewChatNudgeParameterizedModelPicker(
+    @Req() req: FastifyRequest,
     @Res() res: FastifyReply
   ): void {
     const response = create(
       GetNewChatNudgeParameterizedModelPickerResponseSchema,
       {}
+    )
+    const requestedModel =
+      this.parseParameterizedNudgeCurrentModel(req) ||
+      this.getPreferredDefaultModelName(this.buildCursorModels())
+    this.scheduleCodexWarmupForCursorModel(
+      requestedModel,
+      "agent-new-chat-nudge-parameterized"
     )
     this.sendProto(
       res,

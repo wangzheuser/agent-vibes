@@ -212,8 +212,13 @@ const MODEL_DISCOVERY_TIMEOUT_MS = 8_000
 const MODEL_DISCOVERY_MAX_PAGES = 5
 const MODEL_DISCOVERY_TTL_MS = 15 * 60_000
 
+import type {
+  ProviderAdapter,
+  ProviderWarmupHint,
+} from "../shared/provider-adapter.interface"
+
 @Injectable()
-export class AnthropicApiService implements OnModuleInit {
+export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   private readonly logger = new Logger(AnthropicApiService.name)
 
   private accounts: ClaudeApiAccount[] = []
@@ -2683,5 +2688,17 @@ export class AnthropicApiService implements OnModuleInit {
         clearTimeout(timer)
       }
     }
+  }
+
+  // ── ProviderAdapter Interface ────────────────────────────────────────
+
+  /** No-op — HTTP-based Claude API doesn't need connection prewarming. */
+  warmup(_hint: ProviderWarmupHint): void {
+    // Intentionally empty — HTTP connections are established per-request.
+  }
+
+  /** No-op — Claude API is stateless per-request, no session resources to release. */
+  dispose(_conversationId: string): void {
+    // Intentionally empty.
   }
 }
