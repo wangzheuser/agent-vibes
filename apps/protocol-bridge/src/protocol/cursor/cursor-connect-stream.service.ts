@@ -445,7 +445,7 @@ interface PreparedToolInvocation {
 
 interface TopLevelContinuationDecision {
   adviseSynthesis: boolean
-  forceCloudCodeSynthesis: boolean
+  forceSynthesis: boolean
   historyTokens: number
   promptTokens: number
   availableHistoryBudgetTokens: number
@@ -732,10 +732,30 @@ export class CursorConnectStreamService {
   private readonly TOP_LEVEL_AGENT_REPEAT_EDIT_FORCE_COUNT = 2
   private readonly TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT = 8
   private readonly TOOL_BATCH_SUMMARY_DETAILS_LIMIT = 6
-  private readonly CLOUD_CODE_FORCED_SYNTHESIS_BLOCKED_TOOL_NAMES = new Set([
+  private readonly TOP_LEVEL_FORCED_SYNTHESIS_BLOCKED_TOOL_NAMES = new Set([
+    "client_side_tool_v2_run_terminal_command_v2",
+    "client_side_tool_v2_background_composer_followup",
+    "client_side_tool_v2_create_diagram",
+    "client_side_tool_v2_fix_lints",
+    "client_side_tool_v2_generate_image",
+    "client_side_tool_v2_todo_read",
+    "client_side_tool_v2_todo_write",
+    "client_side_tool_v2_update_project",
+    "background_composer_followup",
+    "canvas_destroy",
+    "canvas_get_url",
+    "canvas_register",
+    "command_status",
+    "create_diagram",
     "deep_search",
+    "exec_command",
+    "execute_hook",
     "fetch_rules",
     "file_search",
+    "fix_lints",
+    "force_background_shell",
+    "force_background_subagent",
+    "generate_image",
     "get_mcp_tools",
     "glob_search",
     "go_to_definition",
@@ -749,11 +769,27 @@ export class CursorConnectStreamService {
     "read_mcp_resource",
     "read_project",
     "read_semsearch_files",
+    "read_todos",
+    "request_context",
+    "run_command",
+    "run_terminal_command",
+    "run_terminal_command_v2",
     "search_symbols",
     "semantic_search",
+    "shell",
+    "subagent_await",
+    "todo_read",
+    "todo_write",
+    "truncated",
+    "truncated_tool_call",
+    "update_todos",
+    "update_project",
     "web_fetch",
     "web_search",
+    "write_shell_stdin",
   ])
+  private readonly TOP_LEVEL_FORCED_SYNTHESIS_ALLOWED_DEFERRED_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
+    new Set<DeferredToolFamily>(["apply_agent_diff", "apply_patch", "reapply"])
   private readonly LEGACY_WEB_DOCUMENT_CHUNK_SIZE = 4_000
   private readonly MAX_LEGACY_WEB_DOCUMENTS_PER_CONVERSATION = 12
   private readonly EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT: ContextAttachmentSnapshot =
@@ -913,6 +949,55 @@ export class CursorConnectStreamService {
         },
       ],
     }
+  }
+
+  private buildClientToolErrorResultRequest(
+    session: ChatSession,
+    toolCallId: string,
+    toolType: number,
+    content: string,
+    message: string
+  ): ParsedCursorRequest {
+    return {
+      conversation: [],
+      newMessage: "",
+      model: session.model,
+      thinkingLevel: session.thinkingLevel,
+      unifiedMode: "AGENT",
+      isAgentic: true,
+      supportedTools: session.supportedTools,
+      useWeb: session.useWeb,
+      toolResults: [
+        {
+          toolCallId,
+          toolType,
+          resultCase: "mcp_result",
+          resultData: Buffer.alloc(0),
+          inlineContent: content,
+          inlineState: {
+            status: "error",
+            message,
+          },
+        },
+      ],
+    }
+  }
+
+  private shouldReturnExecThrowToModel(
+    pendingToolCall: PendingToolCall
+  ): boolean {
+    const normalizedToolName = pendingToolCall.toolName.trim().toLowerCase()
+    const normalizedHistoryToolName = (pendingToolCall.historyToolName || "")
+      .trim()
+      .toLowerCase()
+
+    return (
+      pendingToolCall.toolFamilyHint === "mcp" ||
+      normalizedToolName === "client_side_tool_v2_mcp" ||
+      normalizedToolName === "client_side_tool_v2_call_mcp_tool" ||
+      normalizedHistoryToolName.startsWith("cursor-ide-") ||
+      normalizedHistoryToolName.startsWith("user-")
+    )
   }
 
   private isTaskLikePendingToolCall(
@@ -1208,6 +1293,40 @@ export class CursorConnectStreamService {
     const toolResultContent = stack
       ? `Tool execution aborted by client.\nreason: ${safeReason}\nstack: ${stack.slice(0, 2000)}`
       : `Tool execution aborted by client.\nreason: ${safeReason}`
+
+    if (this.shouldReturnExecThrowToModel(pendingToolCall)) {
+      const toolLabel =
+        pendingToolCall.historyToolName || pendingToolCall.toolName
+      const recoverableContent = stack
+        ? `[client_tool error] ${toolLabel} failed in Cursor client.\nreason: ${safeReason}\nstack: ${stack.slice(0, 2000)}\nDo not retry this exact client tool unless the required Cursor-side capability is available.`
+        : `[client_tool error] ${toolLabel} failed in Cursor client.\nreason: ${safeReason}\nDo not retry this exact client tool unless the required Cursor-side capability is available.`
+      this.logger.warn(
+        `Exec throw from recoverable client tool ${toolLabel}; returning error to model instead of aborting turn`
+      )
+      yield* this.handleToolResult(
+        conversationId,
+        this.buildClientToolErrorResultRequest(
+          session,
+          pendingToolCall.toolCallId,
+          execNumericId,
+          recoverableContent,
+          safeReason
+        ),
+        {
+          continueGeneration: true,
+        }
+      )
+
+      const sessionAfterRecoverableError =
+        this.sessionManager.getSession(conversationId)
+      if (!this.hasPendingStreamWork(sessionAfterRecoverableError)) {
+        this.logger.log(
+          `Recoverable client tool error handled for conversation ${conversationId}; ending stream after model continuation`
+        )
+        return true
+      }
+      return false
+    }
 
     yield* this.handleToolResult(
       conversationId,
@@ -3274,6 +3393,90 @@ ${raw}
       `Optimized implicit Codex tool profile: ${toolNames.length} -> ${optimized.length}`
     )
     return optimized
+  }
+
+  private filterImageGenerationToolsForTurn(
+    backend: BackendType,
+    toolNames: string[],
+    session: ChatSession,
+    contextLabel: string
+  ): string[] {
+    if (toolNames.length === 0) {
+      return toolNames
+    }
+    if (this.latestUserExplicitlyRequestsImageGeneration(session)) {
+      return toolNames
+    }
+
+    const filtered = toolNames.filter(
+      (toolName) => !this.isImageGenerationToolName(toolName)
+    )
+    if (filtered.length !== toolNames.length) {
+      this.logger.warn(
+        `Removed ${toolNames.length - filtered.length} image generation tool(s) ` +
+          `for ${contextLabel} (backend=${backend}); latest user message did not explicitly request image creation`
+      )
+    }
+    return filtered
+  }
+
+  private latestUserExplicitlyRequestsImageGeneration(
+    session: ChatSession | undefined
+  ): boolean {
+    if (!session) return false
+    const latestUserText = this.extractLatestUserPlainText(
+      session.messages as Array<{
+        role: "user" | "assistant"
+        content: MessageContent
+      }>
+    )
+    return this.textExplicitlyRequestsImageGeneration(latestUserText || "")
+  }
+
+  private textExplicitlyRequestsImageGeneration(text: string): boolean {
+    const normalized = text.trim().toLowerCase()
+    if (!normalized) return false
+
+    const asksAboutFailure =
+      /(why|failed|failure|error|unexpected|accidental|accidentally|triggered|为何|为什么|怎么回事|意外|触发|失败|报错|错误|故障|问题)/i.test(
+        normalized
+      )
+    const hasImageNoun =
+      /(image|picture|photo|illustration|diagram|logo|icon|poster|mockup|visual|图片|图像|图标|示意图|插图|海报|头像|视觉|logo)/i.test(
+        normalized
+      )
+    const hasCreateVerb =
+      /(generate|create|draw|make|render|design|生成|创建|绘制|画|制作|做|设计)/i.test(
+        normalized
+      )
+    const explicitRequestPrefix =
+      /(please|can you|help me|帮我|请|直接|给我|为我).{0,24}(generate|create|draw|make|render|design|生成|创建|绘制|画|制作|做|设计)/i.test(
+        normalized
+      )
+
+    if (!hasImageNoun || !hasCreateVerb) {
+      return false
+    }
+    if (asksAboutFailure && !explicitRequestPrefix) {
+      return false
+    }
+    return true
+  }
+
+  private isImageGenerationToolName(toolName: string): boolean {
+    const normalized = toolName.trim().toLowerCase()
+    if (!normalized) return false
+    const compact = normalized.replace(/[^a-z0-9]/g, "")
+    return (
+      normalized === "generate_image" ||
+      normalized === "create_diagram" ||
+      normalized === "client_side_tool_v2_generate_image" ||
+      normalized === "client_side_tool_v2_create_diagram" ||
+      compact === "generateimage" ||
+      compact === "creatediagram" ||
+      compact === "clientsidetoolv2generateimage" ||
+      compact === "clientsidetoolv2creatediagram"
+    )
   }
 
   private tryParseJsonRecord(value: string): Record<string, unknown> | null {
@@ -9910,6 +10113,15 @@ ${raw}
 
     try {
       const session = this.sessionManager.getSession(conversationId)
+      if (!this.latestUserExplicitlyRequestsImageGeneration(session)) {
+        const message =
+          "generate_image blocked: latest user message did not explicitly request image creation"
+        this.logger.warn(`${message}; prompt_preview=${prompt.slice(0, 160)}`)
+        return {
+          content: `[generate_image error] ${message}`,
+          state: { status: "error", message },
+        }
+      }
       const filePath =
         this.pickFirstString(input, ["filePath", "file_path", "path"]) || ""
       const outputFormat =
@@ -12839,11 +13051,129 @@ ${raw}
     }
   }
 
-  private shouldSuppressTodoLifecycleStarted(
-    _toolName: string,
-    _deferredToolFamily?: DeferredToolFamily
+  private shouldSuppressInternalToolLifecycleStarted(
+    toolName: string,
+    deferredToolFamily?: DeferredToolFamily
   ): boolean {
-    return false
+    return this.shouldSuppressInternalToolLifecycle(
+      toolName,
+      deferredToolFamily
+    )
+  }
+
+  private shouldSuppressInternalToolLifecycleCompleted(
+    toolName: string,
+    deferredToolFamily?: DeferredToolFamily
+  ): boolean {
+    return this.shouldSuppressInternalToolLifecycle(
+      toolName,
+      deferredToolFamily
+    )
+  }
+
+  private shouldSuppressInternalToolLifecycle(
+    toolName: string,
+    deferredToolFamily?: DeferredToolFamily
+  ): boolean {
+    return (
+      this.describeInternalToolLifecycleSuppression(
+        toolName,
+        deferredToolFamily
+      ) !== undefined
+    )
+  }
+
+  private describeInternalToolLifecycleSuppression(
+    toolName: string,
+    deferredToolFamily?: DeferredToolFamily
+  ):
+    | {
+        family?: DeferredToolFamily
+        reason: string
+      }
+    | undefined {
+    const family =
+      deferredToolFamily || this.normalizeDeferredToolFamily(toolName)
+
+    if (family) {
+      return {
+        family,
+        reason: "bridge_inline_or_interaction_query_tool",
+      }
+    }
+
+    if (this.isReadTodosToolName(toolName)) {
+      return {
+        family: "read_todos",
+        reason: "bridge_inline_todo_tool",
+      }
+    }
+
+    if (this.isUiOnlyTruncatedToolName(toolName)) {
+      return {
+        reason: "unsupported_cursor_toolcall_ui_projection",
+      }
+    }
+
+    return undefined
+  }
+
+  private isReadTodosToolName(toolName: string): boolean {
+    const normalized = toolName.trim().toLowerCase()
+    if (!normalized) return false
+    const compact = normalized.replace(/[^a-z0-9]/g, "")
+    return (
+      normalized === "read_todos" ||
+      normalized === "todo_read" ||
+      normalized === "client_side_tool_v2_todo_read" ||
+      compact === "readtodos" ||
+      compact === "todoread" ||
+      compact === "clientsidetoolv2todoread"
+    )
+  }
+
+  private isUiOnlyTruncatedToolName(toolName: string): boolean {
+    const normalized = toolName.trim().toLowerCase()
+    if (!normalized) return false
+    const compact = normalized.replace(/[^a-z0-9]/g, "")
+    return (
+      normalized === "background_composer_followup" ||
+      normalized === "canvas_destroy" ||
+      normalized === "canvas_get_url" ||
+      normalized === "canvas_register" ||
+      normalized === "client_side_tool_v2_background_composer_followup" ||
+      normalized === "fix_lints" ||
+      normalized === "client_side_tool_v2_fix_lints" ||
+      normalized === "client_side_tool_v2_update_project" ||
+      normalized === "execute_hook" ||
+      normalized === "force_background_shell" ||
+      normalized === "force_background_subagent" ||
+      normalized === "mcp_state_exec" ||
+      normalized === "request_context" ||
+      normalized === "subagent_await" ||
+      normalized === "truncated" ||
+      normalized === "truncated_tool_call" ||
+      normalized === "update_project" ||
+      normalized === "unknown" ||
+      compact === "backgroundcomposerfollowup" ||
+      compact === "canvasdestroy" ||
+      compact === "canvasgeturl" ||
+      compact === "canvasregister" ||
+      compact === "clientsidetoolv2backgroundcomposerfollowup" ||
+      compact === "fixlints" ||
+      compact === "clientsidetoolv2fixlints" ||
+      compact === "clientsidetoolv2updateproject" ||
+      compact === "executehook" ||
+      compact === "forcebackgroundshell" ||
+      compact === "forcebackgroundsubagent" ||
+      compact === "mcpstateexec" ||
+      compact === "requestcontext" ||
+      compact === "subagentawait" ||
+      compact === "truncated" ||
+      compact === "truncatedtoolcall" ||
+      compact === "updateproject" ||
+      compact === "unknown"
+    )
   }
 
   private shouldEmitToolCallStarted(
@@ -12851,7 +13181,7 @@ ${raw}
     deferredToolFamily: DeferredToolFamily | undefined,
     _canDispatchExec: boolean
   ): boolean {
-    return !this.shouldSuppressTodoLifecycleStarted(
+    return !this.shouldSuppressInternalToolLifecycleStarted(
       toolName,
       deferredToolFamily
     )
@@ -13550,24 +13880,21 @@ ${raw}
       diminishingReturns ||
       state.mutationBarrier.verificationReadOnlyBatchCount > 0 ||
       repeatedEditPaths.length > 0
-    const forceCloudCodeSynthesis =
-      this.isCloudCodeBackend(route.backend) &&
-      ((state.mutationBarrier.mutatingBatchCount === 0 &&
+    const forceSynthesis =
+      (state.mutationBarrier.mutatingBatchCount === 0 &&
         (state.readOnlyBatchCount >=
           this.TOP_LEVEL_AGENT_READONLY_FORCE_TURNS ||
-          promptUtilization >=
-            this.TOP_LEVEL_AGENT_CONTINUATION_COMPLETION_THRESHOLD ||
+          promptUtilization >= this.TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK ||
           diminishingReturns)) ||
-        (repeatedEditPaths.length > 0 &&
-          (state.mutationBarrier.verificationReadOnlyBatchCount > 0 ||
-            promptUtilization >=
-              this.TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK ||
-            diminishingReturns)))
+      (repeatedEditPaths.length > 0 &&
+        (state.mutationBarrier.verificationReadOnlyBatchCount > 0 ||
+          promptUtilization >= this.TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK ||
+          diminishingReturns))
     this.sessionManager.markSessionDirty(conversationId)
 
     return {
-      adviseSynthesis: adviseSynthesis || forceCloudCodeSynthesis,
-      forceCloudCodeSynthesis,
+      adviseSynthesis: adviseSynthesis || forceSynthesis,
+      forceSynthesis,
       historyTokens,
       promptTokens,
       availableHistoryBudgetTokens,
@@ -13622,18 +13949,28 @@ ${raw}
     return lines.join("\n\n")
   }
 
-  private filterCloudCodeToolsForForcedSynthesis(
+  private filterToolsForForcedSynthesis(
     toolDefinitions: ToolDefinition[]
   ): ToolDefinition[] {
     return toolDefinitions.filter((tool) => {
       const normalizedName = tool.name.trim().toLowerCase()
-      return !this.CLOUD_CODE_FORCED_SYNTHESIS_BLOCKED_TOOL_NAMES.has(
+      const deferredFamily = this.normalizeDeferredToolFamily(normalizedName)
+      if (
+        deferredFamily &&
+        !this.TOP_LEVEL_FORCED_SYNTHESIS_ALLOWED_DEFERRED_TOOL_FAMILIES.has(
+          deferredFamily
+        )
+      ) {
+        return false
+      }
+
+      return !this.TOP_LEVEL_FORCED_SYNTHESIS_BLOCKED_TOOL_NAMES.has(
         normalizedName
       )
     })
   }
 
-  private buildForcedCloudCodeSynthesisPrompt(
+  private buildForcedSynthesisPrompt(
     toolDefinitions: ToolDefinition[]
   ): string {
     const visibleToolNames = Array.from(
@@ -13645,8 +13982,8 @@ ${raw}
         : ""
 
     return [
-      "Cloud Code synthesis mode is now active because the read-only investigation budget is exhausted.",
-      "Read-only investigative tools have been removed for this continuation. Do not continue browsing, grepping, listing directories, or reading files.",
+      "Synthesis mode is now active because the top-level turn has exhausted its investigation budget.",
+      "Investigative and shell tools have been removed for this continuation. Do not continue browsing, grepping, listing directories, reading files, or running terminal commands.",
       "Synthesize from the evidence already gathered. If the task requires creating a report or artifact, create it now with an available write/edit tool instead of describing what you will do next.",
       toolPreview ? `Remaining non-read-only tools: ${toolPreview}.` : "",
     ]
@@ -13741,9 +14078,27 @@ ${raw}
     }
 
     const stepId = this.sessionManager.incrementStepId(conversationId)
-    yield this.grpcService.createStepStartedResponse(stepId)
+    const lifecycleSuppression = this.describeInternalToolLifecycleSuppression(
+      preparedTool.protocolToolName,
+      preparedTool.deferredToolFamily
+    )
+    const suppressLifecycle = Boolean(lifecycleSuppression)
+
+    if (!suppressLifecycle) {
+      yield this.grpcService.createStepStartedResponse(stepId)
+    } else {
+      this.logger.warn(
+        `Suppressed Cursor ToolCall UI lifecycle for ${preparedTool.protocolToolName}` +
+          (lifecycleSuppression?.family
+            ? ` (family=${lifecycleSuppression.family})`
+            : "") +
+          `; reason=${lifecycleSuppression?.reason || "internal_tool"}; ` +
+          "result remains in model history or a dedicated interaction query."
+      )
+    }
 
     if (
+      !suppressLifecycle &&
       this.shouldEmitToolCallStarted(
         preparedTool.protocolToolName,
         preparedTool.deferredToolFamily,
@@ -13951,7 +14306,7 @@ ${raw}
     toolInputOverride?: Record<string, unknown>
   ): Generator<Buffer> {
     const shouldSuppressStartedFallback =
-      this.shouldSuppressTodoLifecycleStarted(pendingToolCall.toolName)
+      this.shouldSuppressInternalToolLifecycleStarted(pendingToolCall.toolName)
 
     if (!pendingToolCall.startedEmitted && !shouldSuppressStartedFallback) {
       this.logger.warn(
@@ -14003,7 +14358,7 @@ ${raw}
     extraData?: ToolCompletedExtraData
   ): Generator<Buffer> {
     const shouldSuppressStartedFallback =
-      this.shouldSuppressTodoLifecycleStarted(projectedToolName)
+      this.shouldSuppressInternalToolLifecycleStarted(projectedToolName)
 
     if (!pendingToolCall.startedEmitted && !shouldSuppressStartedFallback) {
       const startedFallback = this.grpcService.createToolCallStartedResponse(
@@ -14721,6 +15076,26 @@ ${raw}
         }
       }
 
+      if (conversationId) {
+        const sessionAtStreamEnd =
+          this.sessionManager.getSession(conversationId)
+        const pendingIdsAtStreamEnd = sessionAtStreamEnd
+          ? Array.from(sessionAtStreamEnd.pendingToolCalls.keys())
+          : []
+        if (pendingIdsAtStreamEnd.length > 0) {
+          const interruptedCount = this.interruptPendingToolCallsForRecovery(
+            conversationId,
+            pendingIdsAtStreamEnd,
+            "bidi stream closed before tool results arrived"
+          )
+          if (interruptedCount > 0) {
+            this.logger.warn(
+              `BiDi stream ended with ${interruptedCount} pending tool call(s); marked previous turn interrupted for recovery`
+            )
+          }
+        }
+      }
+
       this.logger.log(`Stream ended for conversation: ${conversationId}`)
     } catch (error) {
       this.logger.error("Error in bidi stream", error)
@@ -14888,6 +15263,12 @@ ${raw}
       webSearchEnabled: parsed.useWeb,
       webFetchEnabled: parsed.useWeb,
     })
+    toolsToUse = this.filterImageGenerationToolsForTurn(
+      route.backend,
+      toolsToUse,
+      session,
+      `initial chat ${conversationId}`
+    )
 
     const mcpToolDefs =
       parsed.mcpToolDefs && parsed.mcpToolDefs.length > 0
@@ -15689,13 +16070,19 @@ ${raw}
           webFetchEnabled: activeSession.useWeb,
         }
       )
-      if (toolsToUse.length === 0) {
+      const filteredToolsToUse = this.filterImageGenerationToolsForTurn(
+        route.backend,
+        toolsToUse,
+        activeSession,
+        `shell continuation ${conversationId}`
+      )
+      if (filteredToolsToUse.length === 0) {
         this.logger.warn(
           "Tool-result continuation running with empty supportedTools (strict mode)"
         )
       }
 
-      const apiTools = buildToolsForApi(toolsToUse, {
+      const apiTools = buildToolsForApi(filteredToolsToUse, {
         mcpToolDefs: activeSession.mcpToolDefs,
         backend: route.backend,
       })
@@ -16723,6 +17110,30 @@ ${raw}
       toolResultContent = artifactUiProjection.content
       toolResultState = artifactUiProjection.toolResultState
       toolInputForProjection = artifactUiProjection.toolInput
+    } else if (
+      this.shouldSuppressInternalToolLifecycleCompleted(
+        pendingToolCall.toolName,
+        this.normalizeDeferredToolFamily(pendingToolCall.toolName)
+      )
+    ) {
+      const lifecycleSuppression =
+        this.describeInternalToolLifecycleSuppression(
+          pendingToolCall.toolName,
+          this.normalizeDeferredToolFamily(pendingToolCall.toolName)
+        )
+      this.sessionManager.recordCompletedToolCall(
+        conversationId,
+        pendingToolCall
+      )
+      this.logger.warn(
+        `Suppressed Cursor ToolCall completion for ${pendingToolCall.toolName}` +
+          (lifecycleSuppression?.family
+            ? ` (family=${lifecycleSuppression.family})`
+            : "") +
+          `; reason=${lifecycleSuppression?.reason || "internal_tool"}; ` +
+          `result_status=${toolResultState?.status || "unknown"}; ` +
+          "result content remains in model history."
+      )
     } else {
       yield* this.emitToolCompletedAndStep(
         conversationId,
@@ -16855,16 +17266,26 @@ ${raw}
           webFetchEnabled: activeSession.useWeb,
         }
       )
-      if (toolsForContinuation.length === 0) {
+      const filteredToolsForContinuation =
+        this.filterImageGenerationToolsForTurn(
+          route.backend,
+          toolsForContinuation,
+          activeSession,
+          `tool continuation ${conversationId}`
+        )
+      if (filteredToolsForContinuation.length === 0) {
         this.logger.warn(
           "Continuation generation running with empty supportedTools (strict mode)"
         )
       }
 
-      const allContinuationTools = buildToolsForApi(toolsForContinuation, {
-        mcpToolDefs: activeSession.mcpToolDefs,
-        backend: route.backend,
-      })
+      const allContinuationTools = buildToolsForApi(
+        filteredToolsForContinuation,
+        {
+          mcpToolDefs: activeSession.mcpToolDefs,
+          backend: route.backend,
+        }
+      )
       const normalizedContinuationHistory = this.normalizeHistoryForBackend(
         activeSession.messages as Array<{
           role: "user" | "assistant"
@@ -16891,26 +17312,25 @@ ${raw}
         normalizedContinuationHistory
       )
       const adviseSynthesis = continuationDecision.adviseSynthesis
-      const forceCloudCodeSynthesis =
-        continuationDecision.forceCloudCodeSynthesis
+      const forceSynthesis = continuationDecision.forceSynthesis
       let continuationTools = allContinuationTools
       let forcedSynthesisPrompt: string | undefined
-      if (forceCloudCodeSynthesis) {
+      if (forceSynthesis) {
         topLevelTurnState.forcedSynthesisAttempted = true
         const filteredContinuationTools =
-          this.filterCloudCodeToolsForForcedSynthesis(allContinuationTools)
+          this.filterToolsForForcedSynthesis(allContinuationTools)
         if (filteredContinuationTools.length > 0) {
           continuationTools = filteredContinuationTools
         }
         forcedSynthesisPrompt =
-          this.buildForcedCloudCodeSynthesisPrompt(continuationTools)
+          this.buildForcedSynthesisPrompt(continuationTools)
         const removedToolCount =
           allContinuationTools.length - continuationTools.length
         this.logger.warn(
           `Top-level agent turn forcing synthesis after ${continuationDecision.consecutiveReadOnlyBatches} consecutive read-only batches; ` +
             `history=${continuationDecision.historyTokens}, prompt=${continuationDecision.promptTokens}/${continuationDecision.availableHistoryBudgetTokens} tokens, ` +
             `continuations=${continuationDecision.continuationCount}, reasons=${continuationDecision.reasons.join(", ") || "budget_exhausted"}; ` +
-            `active tools=${continuationTools.length}/${allContinuationTools.length} (${removedToolCount} investigative tools removed)`
+            `active tools=${continuationTools.length}/${allContinuationTools.length} (${removedToolCount} restricted tools removed)`
         )
       } else if (adviseSynthesis) {
         this.logger.warn(

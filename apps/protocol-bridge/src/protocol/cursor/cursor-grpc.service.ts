@@ -4127,6 +4127,18 @@ export class CursorGrpcService {
     return toolFamilyHint || this.detectToolFamily(toolName)
   }
 
+  private warnTruncatedToolProjection(
+    context: string,
+    toolName: string,
+    family: ToolFamily,
+    reason: string
+  ): void {
+    this.logger.warn(
+      `[ToolProjection] ${context}: toolName="${toolName}", family="${family}" ` +
+        `projected to truncatedToolCall. reason=${reason}`
+    )
+  }
+
   /**
    * 构建空的 ToolCall V2（用于初始 partialToolCall 通知）
    */
@@ -4196,6 +4208,14 @@ export class CursorGrpcService {
       unknown: "truncatedToolCall",
     }
     const matchedCase = familyToCase[family] || "truncatedToolCall"
+    if (matchedCase === "truncatedToolCall") {
+      this.warnTruncatedToolProjection(
+        "empty_tool_call",
+        toolName,
+        family,
+        "Cursor protobuf has no dedicated empty ToolCall oneof for this family"
+      )
+    }
 
     return create(ToolCallSchema, {
       tool: { case: matchedCase, value: {} } as ToolCallOneOf,
@@ -4394,6 +4414,12 @@ export class CursorGrpcService {
         }
       }
       case "fix_lints":
+        this.warnTruncatedToolProjection(
+          "tool_call_started",
+          toolName,
+          family,
+          "fix_lints has no dedicated Cursor ToolCall oneof"
+        )
         return {
           case: "truncatedToolCall" as const,
           value: create(TruncatedToolCallSchema, {
@@ -4417,6 +4443,12 @@ export class CursorGrpcService {
         }
       }
       case "execute_hook":
+        this.warnTruncatedToolProjection(
+          "tool_call_started",
+          toolName,
+          family,
+          "execute_hook has no dedicated Cursor ToolCall oneof"
+        )
         return {
           case: "truncatedToolCall" as const,
           value: create(TruncatedToolCallSchema, {
@@ -4811,6 +4843,12 @@ export class CursorGrpcService {
           }),
         }
       case "truncated":
+        this.warnTruncatedToolProjection(
+          "tool_call_started",
+          toolName,
+          family,
+          "tool family was explicitly classified as truncated"
+        )
         return {
           case: "truncatedToolCall" as const,
           value: create(TruncatedToolCallSchema, {
@@ -4889,6 +4927,12 @@ export class CursorGrpcService {
       case "canvas_register":
       case "mcp_state_exec":
       case "request_context":
+        this.warnTruncatedToolProjection(
+          "tool_call_started",
+          toolName,
+          family,
+          "exec-only protocol tool has no dedicated Cursor ToolCall oneof"
+        )
         return {
           case: "truncatedToolCall" as const,
           value: create(TruncatedToolCallSchema, {
@@ -4911,8 +4955,11 @@ export class CursorGrpcService {
         }
       }
       default:
-        this.logger.warn(
-          `Unknown ToolCall type "${toolName}", defaulting to truncatedToolCall`
+        this.warnTruncatedToolProjection(
+          "tool_call_started",
+          toolName,
+          family,
+          "unknown ToolCall type"
         )
         return {
           case: "truncatedToolCall" as const,
@@ -5718,6 +5765,12 @@ export class CursorGrpcService {
     }
 
     if (family === "fix_lints") {
+      this.warnTruncatedToolProjection(
+        "tool_call_completed",
+        toolName,
+        family,
+        "fix_lints has no dedicated Cursor ToolCall result oneof"
+      )
       const fixLintsResultOneOf =
         status === "success"
           ? {
@@ -6009,6 +6062,12 @@ export class CursorGrpcService {
     }
 
     if (family === "truncated") {
+      this.warnTruncatedToolProjection(
+        "tool_call_completed",
+        toolName,
+        family,
+        "tool family was explicitly classified as truncated"
+      )
       const truncatedResultOneOf =
         status === "success"
           ? {
@@ -6034,6 +6093,12 @@ export class CursorGrpcService {
     }
 
     if (family === "execute_hook") {
+      this.warnTruncatedToolProjection(
+        "tool_call_completed",
+        toolName,
+        family,
+        "execute_hook has no dedicated Cursor ToolCall result oneof"
+      )
       const truncatedResultOneOf =
         status === "success"
           ? {
@@ -7264,6 +7329,12 @@ export class CursorGrpcService {
       family === "subagent_await" ||
       family === "request_context"
     ) {
+      this.warnTruncatedToolProjection(
+        "tool_call_completed",
+        toolName,
+        family,
+        "exec-only protocol tool has no dedicated Cursor ToolCall result oneof"
+      )
       const execOnlyResultOneOf =
         status === "success"
           ? {
@@ -7289,6 +7360,12 @@ export class CursorGrpcService {
     }
 
     if (family === "unknown") {
+      this.warnTruncatedToolProjection(
+        "tool_call_completed",
+        toolName,
+        family,
+        "unknown ToolCall result type"
+      )
       const fallbackResultOneOf =
         status === "success"
           ? {
@@ -7317,6 +7394,12 @@ export class CursorGrpcService {
 
     // Last-resort safety net: always emit protocol-valid result oneof.
     const unhandledFamily = String(family || "unknown")
+    this.warnTruncatedToolProjection(
+      "tool_call_completed",
+      toolName,
+      family,
+      `unhandled tool family "${unhandledFamily}"`
+    )
     const safetyResultOneOf =
       status === "success"
         ? {
