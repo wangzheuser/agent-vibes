@@ -15,9 +15,6 @@ export const CTX_SERVER_RUNNING = "agentVibes.serverRunning"
 // Persisted extension state keys
 export const STATE = {
   FORWARDING_RELOAD_PROMPTED: "agentVibes.forwardingReloadPrompted",
-  CURSOR_SHELL_AUTORUN_PATCH_PREFERRED:
-    "agentVibes.cursorShellAutoRunPatchPreferred",
-  CURSOR_SHELL_AUTORUN_PATCH_BUILD: "agentVibes.cursorShellAutoRunPatchBuild",
 } as const
 
 // Command identifiers
@@ -39,9 +36,6 @@ export const CMD = {
   CHECK_UPDATES: "agentVibes.checkExtensionUpdates",
   OPEN_CONFIG: "agentVibes.openConfig",
   OPEN_DASHBOARD: "agentVibes.openDashboard",
-  APPLY_CURSOR_SHELL_AUTORUN_PATCH: "agentVibes.applyCursorShellAutoRunPatch",
-  RESTORE_CURSOR_SHELL_AUTORUN_PATCH:
-    "agentVibes.restoreCursorShellAutoRunPatch",
   APPLY_CURSOR_CHECKSUMS: "agentVibes.applyCursorChecksums",
   RESET_CURSOR_PATCHES: "agentVibes.resetCursorPatches",
 } as const

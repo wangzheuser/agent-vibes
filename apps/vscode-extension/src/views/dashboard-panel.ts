@@ -10,7 +10,6 @@ import { startCodexOAuthFlow } from "../services/codex-oauth-service"
 import { ConfigManager } from "../services/config-manager"
 import { CursorChecksumsService } from "../services/cursor-checksums"
 import { CursorPatchManagerService } from "../services/cursor-patch-manager"
-import { CursorShellAutoRunPatchService } from "../services/cursor-shell-autorun-patch"
 import { NetworkManager } from "../services/network-manager"
 import { startOAuthFlow } from "../services/oauth-service"
 import { detectCurrentAntigravityVersion } from "../utils/antigravity-version"
@@ -77,8 +76,6 @@ export class DashboardPanel {
   private accountFileDebounceTimer: ReturnType<typeof setTimeout> | null = null
   private readonly cursorPatchManager = new CursorPatchManagerService()
   private readonly cursorChecksums = new CursorChecksumsService()
-  private readonly cursorShellAutoRunPatch =
-    new CursorShellAutoRunPatchService()
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -817,32 +814,16 @@ export class DashboardPanel {
           .filter((part): part is string => Boolean(part))
           .join(" • ")
       : "Unknown"
-    const shellAutoRunPatchStatus = this.cursorShellAutoRunPatch.getStatus()
-    const shellPatchStatusDesc = !shellAutoRunPatchStatus.fileExists
-      ? "Cursor workbench file was not found in a supported install location."
-      : shellAutoRunPatchStatus.isPatched
-        ? shellAutoRunPatchStatus.hasBaseline
-          ? "Shell auto-run command cards default to expanded mode."
-          : "Shell auto-run command cards are already patched, but Agent Vibes has no captured original baseline for this file."
-        : shellAutoRunPatchStatus.canPatch
-          ? "Forces shell auto-run command cards to default to expanded mode until Cursor fixes the regression upstream."
-          : "This Cursor build does not match the known shell auto-run patch target."
-
     const cursorChecksumsStatus = this.cursorChecksums.getStatus()
     const checksumToggleValue =
-      cursorChecksumsStatus.differsFromBaseline === true ||
-      (shellAutoRunPatchStatus.isPatched && cursorChecksumsStatus.allMatched)
+      cursorChecksumsStatus.differsFromBaseline === true
     const checksumStatusDesc = !cursorChecksumsStatus.productExists
       ? "Cursor product.json was not found in a supported install location."
       : cursorChecksumsStatus.differsFromBaseline === true
-        ? "Core file checksums were updated from the original product.json backup. Agent Vibes does this automatically whenever it applies a core patch."
-        : shellAutoRunPatchStatus.isPatched && cursorChecksumsStatus.allMatched
-          ? cursorChecksumsStatus.hasBaseline
-            ? "Core file checksums already match the patched shell workbench file. Agent Vibes keeps this aligned automatically when it applies a core patch."
-            : "Core file checksums already match the patched shell workbench file, but Agent Vibes has no captured original baseline for product.json."
-          : cursorChecksumsStatus.allMatched
-            ? "Core file checksums already match product.json."
-            : `${cursorChecksumsStatus.mismatchCount} core file checksum(s) differ from product.json. This usually only needs manual repair after out-of-band core file changes.`
+        ? "Core file checksums were updated from the original product.json backup."
+        : cursorChecksumsStatus.allMatched
+          ? "Core file checksums already match product.json."
+          : `${cursorChecksumsStatus.mismatchCount} core file checksum(s) differ from product.json. This usually only needs manual repair after out-of-band core file changes.`
     const channelAccountsData = {
       codex: this.getChannelData("codex"),
       "openai-compat": this.getChannelData("openai-compat"),
@@ -1042,24 +1023,9 @@ export class DashboardPanel {
               },
               {
                 label: "Fix Checksums Next",
-                desc: "Ported from the Fix VSCode Checksums Next extension. Agent Vibes keeps this aligned automatically whenever it applies a core patch.",
+                desc: "Ported from the Fix VSCode Checksums Next extension for manual Cursor checksum repair.",
                 value: checksumToggleValue ? "On" : "Off",
                 hint: checksumStatusDesc,
-              },
-              {
-                label: "Shell Auto-Run Expanded",
-                desc: "Fixes the Cursor regression where shell command preview cards still default to collapsed even when collapse is disabled.",
-                type: "commandToggle",
-                value: shellAutoRunPatchStatus.isPatched,
-                onCommand: CMD.APPLY_CURSOR_SHELL_AUTORUN_PATCH,
-                offCommand: CMD.RESTORE_CURSOR_SHELL_AUTORUN_PATCH,
-                disabled:
-                  !shellAutoRunPatchStatus.fileExists ||
-                  (!shellAutoRunPatchStatus.isPatched &&
-                    !shellAutoRunPatchStatus.canPatch) ||
-                  (shellAutoRunPatchStatus.isPatched &&
-                    !shellAutoRunPatchStatus.hasBaseline),
-                hint: shellPatchStatusDesc,
               },
             ],
           },

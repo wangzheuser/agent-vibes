@@ -17,7 +17,6 @@ import { ExtensionUpdateService } from "../services/extension-update"
 import { NetworkManager } from "../services/network-manager"
 import { logger } from "../utils/logger"
 import { executePrivileged } from "../utils/terminal"
-import { getCursorInstallFingerprint } from "../utils/platform"
 import { DashboardPanel } from "../views/dashboard-panel"
 
 function pickFirstNonEmptyString(...values: unknown[]): string | undefined {
@@ -119,17 +118,6 @@ export function registerCommands(
   const cursorChecksums = new CursorChecksumsService()
   const cursorPatchManager = new CursorPatchManagerService()
 
-  const setShellAutoRunPatchPreference = async (enabled: boolean) => {
-    await context.globalState.update(
-      STATE.CURSOR_SHELL_AUTORUN_PATCH_PREFERRED,
-      enabled
-    )
-    await context.globalState.update(
-      STATE.CURSOR_SHELL_AUTORUN_PATCH_BUILD,
-      enabled ? (getCursorInstallFingerprint() ?? undefined) : undefined
-    )
-  }
-
   const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
     if (context.globalState.get<boolean>(STATE.FORWARDING_RELOAD_PROMPTED)) {
       return
@@ -198,76 +186,6 @@ export function registerCommands(
   // ── Cursor patch helpers ─────────────────────────────────────────
 
   context.subscriptions.push(
-    vscode.commands.registerCommand(
-      CMD.APPLY_CURSOR_SHELL_AUTORUN_PATCH,
-      async () => {
-        const result = cursorPatchManager.applyShellAutoRunPatch()
-        if (!result.success) {
-          const detail = result.errors.join("; ") || "Unknown error"
-          void vscode.window.showErrorMessage(
-            result.rolledBack
-              ? `Failed to apply shell auto-run patch, but the partial change was rolled back: ${detail}`
-              : `Failed to apply shell auto-run patch: ${detail}`
-          )
-          return
-        }
-
-        await setShellAutoRunPatchPreference(true)
-
-        const patchMessage = result.updated
-          ? "Applied shell auto-run expanded patch"
-          : "Shell auto-run expanded patch is already applied"
-        const checksumMessage =
-          result.checksumUpdated > 0
-            ? `updated ${result.checksumUpdated} Cursor checksum(s) automatically`
-            : "Cursor checksums already matched the current core files"
-        const action = await vscode.window.showInformationMessage(
-          `${patchMessage}; ${checksumMessage}. Fully restart Cursor to apply.`,
-          "Quit Cursor Now",
-          "Later"
-        )
-        if (action === "Quit Cursor Now") {
-          await vscode.commands.executeCommand("workbench.action.quit")
-        }
-      }
-    )
-  )
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand(
-      CMD.RESTORE_CURSOR_SHELL_AUTORUN_PATCH,
-      async () => {
-        const result = cursorPatchManager.restoreShellAutoRunPatch()
-        if (!result.success) {
-          const detail = result.errors.join("; ") || "Unknown error"
-          void vscode.window.showErrorMessage(
-            `Failed to restore shell auto-run patch: ${detail}`
-          )
-          return
-        }
-
-        await setShellAutoRunPatchPreference(false)
-
-        const patchMessage = result.updated
-          ? "Restored the original shell auto-run behavior"
-          : "Shell auto-run patch was already off"
-        const checksumMessage =
-          result.checksumUpdated > 0
-            ? "restored the original Cursor checksum baseline automatically"
-            : "Cursor checksums were already at the original baseline"
-        const action = await vscode.window.showInformationMessage(
-          `${patchMessage}; ${checksumMessage}. Fully restart Cursor to apply.`,
-          "Quit Cursor Now",
-          "Later"
-        )
-        if (action === "Quit Cursor Now") {
-          await vscode.commands.executeCommand("workbench.action.quit")
-        }
-      }
-    )
-  )
-
-  context.subscriptions.push(
     vscode.commands.registerCommand(CMD.APPLY_CURSOR_CHECKSUMS, async () => {
       const result = cursorChecksums.apply()
       if (!result.success) {
@@ -303,8 +221,6 @@ export function registerCommands(
         )
         return
       }
-
-      await setShellAutoRunPatchPreference(false)
 
       const parts: string[] = []
       parts.push(`Reset ${result.restored} Cursor file(s)`)
