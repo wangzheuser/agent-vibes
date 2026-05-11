@@ -358,9 +358,9 @@ function stripMatchingQuotes(value: string): string {
 function extractSkillNameFromPath(rawPath: string): string | null {
   const normalizedPath = normalizePathForMatch(rawPath)
   const segments = normalizedPath.split("/").filter(Boolean)
-  const fileName = segments.at(-1) || ""
+  const fileName = segments[segments.length - 1] || ""
   if (fileName.toLowerCase() !== "skill.md") return null
-  return segments.at(-2) || null
+  return segments[segments.length - 2] || null
 }
 
 function isSkillFilePath(rawPath: string): boolean {
@@ -441,7 +441,9 @@ function isCursorCanvasProjectPath(normalizedLowerPath: string): boolean {
     const projectSegments = segments.slice(index + 2)
     return (
       projectSegments.includes("canvases") ||
-      (projectSegments.at(-1) || "").endsWith(".canvas.tsx")
+      (projectSegments[projectSegments.length - 1] || "").endsWith(
+        ".canvas.tsx"
+      )
     )
   }
   return false
