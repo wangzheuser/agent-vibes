@@ -310,6 +310,13 @@ export interface ChatSession {
   isAgentic: boolean
   supportedTools: string[]
   mcpToolDefs?: ParsedCursorRequest["mcpToolDefs"]
+  /** Browser MCP 页面状态，用于在没有页面上下文时拦截依赖页面的工具调用 */
+  browserContext?: {
+    hasPage: boolean
+    lastToolName?: string
+    lastUrl?: string
+    updatedAt: number
+  }
   useWeb: boolean
   requestContextEnv?: ParsedCursorRequest["requestContextEnv"]
   createdAt: Date
@@ -406,6 +413,7 @@ export interface PendingToolCall {
   editApplyWarning?: string
   editFailureContext?: EditFailureContext
   beforeContent?: string // File content before edit (for edit tools)
+  afterContent?: string // File content after edit (computed from applyEditInputToFileText)
   // Which BiDi stream this tool call was dispatched on
   streamId: string
   // Shell stream accumulation (for streaming shell output)
@@ -3086,7 +3094,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       : path.resolve(normalizedRoot, filePath)
   }
 
-  async addPendingToolCall(
+  addPendingToolCall(
     conversationId: string,
     toolCallId: string,
     toolName: string,
@@ -3096,32 +3104,19 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     historyToolName?: string,
     historyToolInput?: Record<string, unknown>,
     codexToolCallType?: "function" | "custom"
-  ): Promise<void> {
+  ): void {
     const session = this.getSession(conversationId)
     if (session) {
-      // For edit tools, capture file content BEFORE the edit
-      let beforeContent: string | undefined
-      if (toolName === "edit_file_v2" || toolName === "edit") {
-        const filePath = (toolInput as { path?: string })?.path
-        if (filePath) {
-          try {
-            const fs = await import("fs/promises")
-            const resolvedFilePath = this.resolveWorkspaceFilePath(
-              session,
-              filePath
-            )
-            beforeContent = await fs.readFile(resolvedFilePath, "utf-8")
-            this.logger.debug(
-              `Captured before content for ${resolvedFilePath}: ${beforeContent.length} bytes`
-            )
-          } catch (e) {
-            const errorMessage = e instanceof Error ? e.message : String(e)
-            this.logger.warn(
-              `Failed to read file before edit: ${filePath} - ${errorMessage}`
-            )
-          }
-        }
-      }
+      // For edit tools, beforeContent is captured later in the
+      // read_result → writeArgs handshake (see CursorConnectStreamService
+      // handleToolResult). The read_result payload carries the
+      // client-reported pre-edit content of the file, which is the only
+      // value that is consistent with the post-edit content emitted in the
+      // subsequent write_result. Reading the bridge host's local fs here
+      // would produce stale or wrong content in SSH remote-development
+      // workflows (issue #5), so we leave beforeContent unset until the
+      // protocol-supplied truth arrives.
+      const beforeContent: string | undefined = undefined
 
       session.pendingToolCalls.set(toolCallId, {
         toolCallId,

@@ -95,6 +95,13 @@ import {
   ParsedToolResult,
 } from "./tools/cursor-request-parser"
 import {
+  type CursorSkillMetadata,
+  findCursorSkillByName,
+  findCursorSkillForInternalPath,
+  normalizeSkillName,
+  resolveCursorSkillPolicy,
+} from "./tools/cursor-skill-policy"
+import {
   buildToolsForApi,
   getDefaultCodexImplicitAgentToolNames,
   matchesImplicitDefaultAgentToolNames,
@@ -107,13 +114,6 @@ import {
   resolveMcpCallFields as resolveMcpCallFieldsFromContract,
   resolveMcpToolDefinition,
 } from "./tools/mcp-call-contract"
-import {
-  findCursorSkillByName,
-  findCursorSkillForInternalPath,
-  normalizeSkillName,
-  resolveCursorSkillPolicy,
-  type CursorSkillMetadata,
-} from "./tools/cursor-skill-policy"
 import {
   buildNumberedLineEntries,
   extractEditFailureSelection,
@@ -539,6 +539,15 @@ interface ExecDispatchResolution {
   target?: ExecDispatchTarget
   errorMessage?: string
 }
+
+const BROWSER_MCP_TOOL_PREFIX = "cursor-ide-browser-browser_"
+const BROWSER_CONTEXT_INITIALIZER_TOOL_NAMES = new Set(["navigate", "tabs"])
+const BROWSER_CONTEXT_FREE_TOOL_NAMES = new Set([
+  "tabs",
+  "lock",
+  "profile_start",
+  "profile_stop",
+])
 
 interface SyntheticCodexAgentState {
   agentId: string
@@ -6377,10 +6386,11 @@ ${raw}
     }
 
     const searchText =
-      this.pickFirstRawString(toolInput as Record<string, unknown>, [
-        "search",
-        "old_text",
-      ]) ?? undefined
+      this.pickFirstRawString(
+        toolInput as Record<string, unknown>,
+        ["search", "old_text"],
+        { allowEmpty: true }
+      ) ?? undefined
     const replaceText =
       this.pickFirstRawString(
         toolInput as Record<string, unknown>,
@@ -7844,6 +7854,141 @@ ${raw}
     return undefined
   }
 
+  private normalizeBrowserMcpActionName(value: string): string {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+  }
+
+  private resolveBrowserMcpToolAction(
+    declaredToolName: string,
+    rawToolName?: string,
+    input?: Record<string, unknown>
+  ): string | undefined {
+    const candidates = [
+      declaredToolName,
+      rawToolName || "",
+      typeof input?.name === "string" ? input.name : "",
+      typeof input?.toolName === "string" ? input.toolName : "",
+      typeof input?.tool_name === "string" ? input.tool_name : "",
+    ]
+
+    for (const candidate of candidates) {
+      const normalized = candidate.trim().toLowerCase()
+      if (!normalized) continue
+
+      const compact = normalized.replace(/[^a-z0-9]+/g, "_")
+      const browserPrefix = this.normalizeBrowserMcpActionName(
+        BROWSER_MCP_TOOL_PREFIX
+      )
+      if (compact.startsWith(`${browserPrefix}_`)) {
+        return this.normalizeBrowserMcpActionName(
+          compact.slice(browserPrefix.length + 1)
+        )
+      }
+
+      if (normalized.startsWith("browser_")) {
+        return this.normalizeBrowserMcpActionName(
+          normalized.slice("browser_".length)
+        )
+      }
+
+      if (normalized.startsWith("browser-")) {
+        return this.normalizeBrowserMcpActionName(
+          normalized.slice("browser-".length)
+        )
+      }
+    }
+
+    return undefined
+  }
+
+  private getBrowserMcpArguments(
+    input: Record<string, unknown>
+  ): Record<string, unknown> {
+    const args = input.arguments
+    if (args && typeof args === "object" && !Array.isArray(args)) {
+      return args as Record<string, unknown>
+    }
+    return input
+  }
+
+  private validateBrowserMcpDispatch(
+    session: ChatSession,
+    declaredToolName: string,
+    input: Record<string, unknown>,
+    rawToolName?: string
+  ): string | undefined {
+    const action = this.resolveBrowserMcpToolAction(
+      declaredToolName,
+      rawToolName,
+      input
+    )
+    if (!action) return undefined
+
+    if (
+      BROWSER_CONTEXT_INITIALIZER_TOOL_NAMES.has(action) ||
+      BROWSER_CONTEXT_FREE_TOOL_NAMES.has(action)
+    ) {
+      return undefined
+    }
+
+    const args = this.getBrowserMcpArguments(input)
+    const explicitViewId =
+      typeof args.viewId === "string" ? args.viewId.trim() : ""
+    if (session.browserContext?.hasPage || explicitViewId) {
+      return undefined
+    }
+
+    return (
+      `Browser MCP 工具 "${declaredToolName}" 需要先存在 active browser page；` +
+      `当前 session 还没有通过 cursor-ide-browser-browser_navigate 打开页面，` +
+      `也没有通过 cursor-ide-browser-browser_tabs 创建/选择 tab。` +
+      `请先调用 cursor-ide-browser-browser_navigate({ "url": "..." })，` +
+      `再重试 "${declaredToolName}"。`
+    )
+  }
+
+  private recordBrowserMcpDispatch(
+    session: ChatSession,
+    declaredToolName: string,
+    input: Record<string, unknown>,
+    rawToolName?: string
+  ): void {
+    const action = this.resolveBrowserMcpToolAction(
+      declaredToolName,
+      rawToolName,
+      input
+    )
+    if (!action) return
+
+    const args = this.getBrowserMcpArguments(input)
+    const tabAction =
+      typeof args.action === "string" ? args.action.trim().toLowerCase() : ""
+    const explicitViewId =
+      typeof args.viewId === "string" ? args.viewId.trim() : ""
+    const opensPage =
+      action === "navigate" ||
+      explicitViewId.length > 0 ||
+      (action === "tabs" && ["new", "select"].includes(tabAction))
+    const hasPage = Boolean(session.browserContext?.hasPage || opensPage)
+
+    if (!hasPage) return
+
+    const nextUrl =
+      typeof args.url === "string" && args.url.trim()
+        ? args.url.trim()
+        : session.browserContext?.lastUrl
+    session.browserContext = {
+      hasPage,
+      lastToolName: declaredToolName,
+      lastUrl: nextUrl,
+      updatedAt: Date.now(),
+    }
+  }
+
   private resolveExecDispatchTarget(
     session: ChatSession,
     toolName: string,
@@ -7852,10 +7997,26 @@ ${raw}
     const mcpToolDef = resolveMcpToolDefinition(session.mcpToolDefs, toolName)
     if (mcpToolDef) {
       try {
+        const dispatchInput = buildMcpDispatchInput(input, mcpToolDef)
+        const browserDispatchError = this.validateBrowserMcpDispatch(
+          session,
+          mcpToolDef.name,
+          dispatchInput,
+          mcpToolDef.toolName
+        )
+        if (browserDispatchError) {
+          return { errorMessage: browserDispatchError }
+        }
+        this.recordBrowserMcpDispatch(
+          session,
+          mcpToolDef.name,
+          dispatchInput,
+          mcpToolDef.toolName
+        )
         return {
           target: {
             toolName: "CLIENT_SIDE_TOOL_V2_MCP",
-            input: buildMcpDispatchInput(input, mcpToolDef),
+            input: dispatchInput,
             toolFamilyHint: "mcp",
           },
         }
@@ -7897,16 +8058,32 @@ ${raw}
     ) {
       try {
         const resolved = resolveMcpCallFieldsFromContract(input)
+        const dispatchInput: Record<string, unknown> = {
+          ...input,
+          name: resolved.name,
+          toolName: resolved.toolName,
+          providerIdentifier: resolved.providerIdentifier,
+          arguments: resolved.rawArgs,
+        }
+        const browserDispatchError = this.validateBrowserMcpDispatch(
+          session,
+          resolved.name,
+          dispatchInput,
+          resolved.toolName
+        )
+        if (browserDispatchError) {
+          return { errorMessage: browserDispatchError }
+        }
+        this.recordBrowserMcpDispatch(
+          session,
+          resolved.name,
+          dispatchInput,
+          resolved.toolName
+        )
         return {
           target: {
             toolName: "CLIENT_SIDE_TOOL_V2_MCP",
-            input: {
-              ...input,
-              name: resolved.name,
-              toolName: resolved.toolName,
-              providerIdentifier: resolved.providerIdentifier,
-              arguments: resolved.rawArgs,
-            },
+            input: dispatchInput,
             toolFamilyHint: "mcp",
           },
         }
@@ -7918,10 +8095,29 @@ ${raw}
         )
         if (fallbackMcpDef) {
           try {
+            const fallbackDispatchInput = buildMcpDispatchInput(
+              input,
+              fallbackMcpDef
+            )
+            const browserDispatchError = this.validateBrowserMcpDispatch(
+              session,
+              fallbackMcpDef.name,
+              fallbackDispatchInput,
+              fallbackMcpDef.toolName
+            )
+            if (browserDispatchError) {
+              return { errorMessage: browserDispatchError }
+            }
+            this.recordBrowserMcpDispatch(
+              session,
+              fallbackMcpDef.name,
+              fallbackDispatchInput,
+              fallbackMcpDef.toolName
+            )
             return {
               target: {
                 toolName: "CLIENT_SIDE_TOOL_V2_MCP",
-                input: buildMcpDispatchInput(input, fallbackMcpDef),
+                input: fallbackDispatchInput,
                 toolFamilyHint: "mcp",
               },
             }
@@ -14419,12 +14615,12 @@ ${raw}
     )
   }
 
-  private async *registerPreparedToolInvocation(
+  private *registerPreparedToolInvocation(
     conversationId: string,
     session: ChatSession,
     streamId: string | undefined,
     preparedTool: PreparedToolInvocation
-  ): AsyncGenerator<Buffer> {
+  ): Generator<Buffer> {
     const { activeToolCall } = preparedTool
 
     if (
@@ -14444,7 +14640,7 @@ ${raw}
       )
     }
 
-    await this.sessionManager.addPendingToolCall(
+    this.sessionManager.addPendingToolCall(
       conversationId,
       activeToolCall.id,
       preparedTool.protocolToolName,
@@ -16807,6 +17003,7 @@ ${raw}
           )
           editPending.editApplyWarning = computedEdit.warning
           editPending.editFailureContext = computedEdit.failureContext
+          editPending.afterContent = computedEdit.fileText
           if ((computedEdit.resolvedMatches?.length || 0) > 0) {
             const reconciled = computedEdit.resolvedMatches
               ?.map((match) => {
@@ -17090,56 +17287,119 @@ ${raw}
       !pendingToolCall.editApplyWarning
 
     if (shouldBuildEditPreview) {
-      try {
-        const fs = await import("fs/promises")
-        const toolInput = pendingToolCall.toolInput as ToolInputWithPath
-        const filePath = toolInput.path
-        if (filePath && typeof filePath === "string") {
-          const resolvedFilePath = this.resolveWorkspaceFilePath(
-            conversationId,
-            filePath
-          )
-          // Read the file content after edit
-          const afterContent = await fs.readFile(resolvedFilePath, "utf-8")
+      const toolInput = pendingToolCall.toolInput as ToolInputWithPath
+      const filePath = toolInput.path
+      if (filePath && typeof filePath === "string") {
+        const resolvedFilePath = this.resolveWorkspaceFilePath(
+          conversationId,
+          filePath
+        )
 
-          // Use beforeContent captured when tool call was registered
-          const beforeContent = pendingToolCall.beforeContent || ""
+        // Resolve afterContent from the client-supplied write_result.
+        //
+        // Cursor's edit_file tool runs through a two-step protocol on the
+        // client (read_result → writeArgs → write_result). The write_result
+        // payload's `WriteSuccess.fileContentAfterWrite` field carries the
+        // exact bytes the client wrote to disk. That is the only value that
+        // is guaranteed to match what the user actually sees in the editor —
+        // independently of where the bridge is running. Reading the bridge
+        // host's local fs only happens to work in legacy single-host setups
+        // and produces nonsensical diffs in SSH remote-development workflows
+        // because the file does not exist on the bridge host (see issue #5).
+        let afterContent: string | undefined = pendingToolCall.afterContent
+        let afterSource =
+          pendingToolCall.afterContent !== undefined
+            ? "computed_edit"
+            : "missing"
+        if (
+          toolResult.resultCase === "write_result" &&
+          toolResult.resultData &&
+          toolResult.resultData.length > 0
+        ) {
+          try {
+            const execMsg = fromBinary(
+              ExecClientMessageSchema,
+              toolResult.resultData
+            )
+            if (
+              execMsg.message.case === "writeResult" &&
+              execMsg.message.value.result.case === "success"
+            ) {
+              const writeSuccess = execMsg.message.value.result.value
+              if (typeof writeSuccess.fileContentAfterWrite === "string") {
+                afterContent = writeSuccess.fileContentAfterWrite
+                afterSource = "write_result"
+              }
+            }
+          } catch (err) {
+            this.logger.debug(
+              `Failed to extract write_result.fileContentAfterWrite: ${err instanceof Error ? err.message : String(err)}`
+            )
+          }
+        }
 
+        // Fallback: legacy single-host mode where the bridge can read the
+        // workspace file directly. Skipped in SSH remote-development because
+        // the file lives on the remote host.
+        if (afterContent === undefined) {
+          try {
+            const fs = await import("fs/promises")
+            afterContent = await fs.readFile(resolvedFilePath, "utf-8")
+            afterSource = "host_fs"
+          } catch (readError) {
+            const errMessage =
+              readError instanceof Error ? readError.message : String(readError)
+            this.logger.debug(
+              `Local fs unavailable for edit result (${resolvedFilePath}): ${errMessage}`
+            )
+          }
+        }
+
+        // beforeContent is captured during the read_result phase (see the
+        // `editPending.beforeContent = readSuccessContent` branch in
+        // handleToolResult). That value is the client-reported pre-edit
+        // content, so it always matches afterContent's scope (whole file).
+        // No fs / read-snapshot fallbacks here — both are inferior to the
+        // protocol-supplied truth and would re-introduce the inconsistent
+        // before/after pairs that produced "-507 / +1" hallucinations.
+        const beforeContent = pendingToolCall.beforeContent
+        const beforeSource =
+          typeof beforeContent === "string" ? "captured_pre_edit" : "missing"
+
+        const haveBefore = typeof beforeContent === "string"
+        const haveAfter = typeof afterContent === "string"
+
+        if (haveBefore && haveAfter) {
+          const resolvedBefore = beforeContent
+          const resolvedAfter = afterContent as string
           extraData = {
             ...(extraData || {}),
-            beforeContent,
-            afterContent,
+            beforeContent: resolvedBefore,
+            afterContent: resolvedAfter,
             editSuccess: this.buildEditSuccessExtraData(
               filePath,
-              beforeContent,
-              afterContent
+              resolvedBefore,
+              resolvedAfter
             ),
           }
           this.logger.debug(
-            `Prepared edit diff data: ${resolvedFilePath} (before=${beforeContent.length}, after=${afterContent.length} bytes)`
+            `Prepared edit diff data: ${resolvedFilePath} ` +
+              `(before=${resolvedBefore.length} bytes via ${beforeSource}, ` +
+              `after=${resolvedAfter.length} bytes via ${afterSource})`
           )
-          this.logger.debug(
-            `Edit preview payload ready: tool=${pendingToolCall.toolName}, path=${resolvedFilePath}, ` +
-              `before=${beforeContent.length}, after=${afterContent.length}, ` +
-              `modelCallId=${pendingToolCall.modelCallId || "(none)"}`
-          )
-
-          // Track file state in session
           this.sessionManager.addFileState(
             conversationId,
             resolvedFilePath,
-            beforeContent,
-            afterContent
+            resolvedBefore,
+            resolvedAfter
           )
-        }
-      } catch (e) {
-        this.logger.warn(
-          `Failed to read file for edit result: ${String(e)}; using empty afterContent`
-        )
-        extraData = {
-          ...(extraData || {}),
-          beforeContent: pendingToolCall.beforeContent || "",
-          afterContent: "",
+        } else {
+          // Skip the synthetic diff payload so history does not display a
+          // bogus "-N/+M" line delta. The textual tool result is preserved.
+          this.logger.debug(
+            `Skipping edit diff payload for ${pendingToolCall.toolCallId}: ` +
+              `before=${beforeSource}, after=${afterSource}`
+          )
         }
       }
     } else if (this.isEditToolInvocation(pendingToolCall.toolName)) {

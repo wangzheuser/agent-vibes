@@ -3,8 +3,8 @@ import {
   Controller,
   Get,
   Headers,
-  HttpException,
   HttpCode,
+  HttpException,
   Post,
   Res,
   UseGuards,
@@ -153,7 +153,14 @@ export class MessagesController {
   })
   @ApiBody({ type: CreateMessageDto })
   async createMessage(
-    @Body() createMessageDto: CreateMessageDto,
+    // NOTE: receive the raw plain body instead of letting Nest run
+    // class-transformer/class-validator on it. The SEA esbuild bundle does
+    // not preserve the reflect-metadata that ValidationPipe needs for DTO
+    // transforms, which would otherwise strip every property and leave the
+    // service with `model: undefined` (see #5 follow-up). The DTO is still
+    // declared for OpenAPI / typing, but at the wire level we accept any
+    // plain object and validate the required fields downstream.
+    @Body() body: Record<string, unknown>,
     @Headers("x-api-key") apiKey?: string,
     @Headers("anthropic-version") version?: string,
     @Headers()
@@ -162,6 +169,19 @@ export class MessagesController {
   ) {
     void apiKey
     void version
+    const createMessageDto = body as unknown as CreateMessageDto
+    if (
+      typeof createMessageDto?.model !== "string" ||
+      createMessageDto.model.trim() === ""
+    ) {
+      throw new HttpException(
+        {
+          type: "error",
+          error: { type: "invalid_request_error", message: "missing model" },
+        },
+        400
+      )
+    }
     const forwardHeaders = this.pickAnthropicForwardHeaders(headers)
     const codexForwardHeaders = this.pickCodexForwardHeaders(headers)
 
@@ -229,8 +249,8 @@ export class MessagesController {
     required: false,
   })
   @ApiBody({ type: CountTokensDto })
-  countTokens(@Body() countTokensDto: CountTokensDto) {
-    return this.messagesService.countTokens(countTokensDto)
+  countTokens(@Body() body: Record<string, unknown>) {
+    return this.messagesService.countTokens(body as unknown as CountTokensDto)
   }
 
   @Get("anthropic/models")
