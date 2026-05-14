@@ -5307,6 +5307,326 @@ ${raw}
     }
   }
 
+  /**
+   * Fallback: CRLF normalization matching.
+   * Models typically emit LF-only text even when the file uses CRLF (Windows).
+   * Normalize both sides to LF for matching, then locate the corresponding
+   * region in the original content and apply the replacement there.
+   */
+  private attemptCrlfNormalizedMatch(
+    content: string,
+    range: { startOffset: number; endOffset: number; lineStarts: number[] },
+    options: {
+      searchText: string
+      replaceText: string
+      allowMultiple?: boolean
+      startLine?: number
+      endLine?: number
+      warningPrefix: string
+    }
+  ): {
+    fileText: string
+    resolvedMatch?: EditResolvedMatch
+  } | null {
+    const { searchText, replaceText } = options
+    const allowMultiple = options.allowMultiple || false
+
+    // Only attempt if there is a CRLF mismatch scenario
+    const contentHasCrlf = content.includes("\r\n")
+    const searchHasCrlf = searchText.includes("\r\n")
+    if (!contentHasCrlf && !searchHasCrlf) return null
+    // If both already use the same line endings, this fallback won't help
+    if (contentHasCrlf === searchHasCrlf) return null
+
+    const normalizedContent = content.replace(/\r\n/g, "\n")
+    const normalizedSearch = searchText.replace(/\r\n/g, "\n")
+    const normalizedReplace = replaceText.replace(/\r\n/g, "\n")
+
+    const normalizedRange = {
+      startOffset: content.slice(0, range.startOffset).replace(/\r\n/g, "\n")
+        .length,
+      endOffset: content.slice(0, range.endOffset).replace(/\r\n/g, "\n")
+        .length,
+    }
+
+    const allNormalizedOffsets = this.findSubstringOffsets(
+      normalizedContent,
+      normalizedSearch
+    )
+    const matchesInRange = allNormalizedOffsets.filter((offset) => {
+      const matchEnd = offset + normalizedSearch.length
+      return (
+        offset >= normalizedRange.startOffset &&
+        matchEnd <= normalizedRange.endOffset
+      )
+    })
+
+    const effectiveMatches =
+      allNormalizedOffsets.length === 1 ? allNormalizedOffsets : matchesInRange
+
+    if (effectiveMatches.length === 0) return null
+    if (!allowMultiple && effectiveMatches.length > 1) return null
+
+    // Map the normalized offset back to the original content offset.
+    // Build a mapping: for each position in normalizedContent, track the
+    // corresponding position in the original content.
+    const firstMatch = effectiveMatches[0] as number
+    const originalOffset = this.mapNormalizedOffsetToOriginal(
+      content,
+      firstMatch
+    )
+    const originalMatchEnd = this.mapNormalizedOffsetToOriginal(
+      content,
+      firstMatch + normalizedSearch.length
+    )
+
+    // Determine the correct replacement text: if the file uses CRLF, the
+    // replacement should also use CRLF to maintain consistency.
+    const finalReplace = contentHasCrlf
+      ? normalizedReplace.replace(/\n/g, "\r\n")
+      : normalizedReplace
+
+    if (allowMultiple && effectiveMatches.length > 1) {
+      // Apply all matches in reverse order to preserve offsets
+      let result = content
+      const sortedMatches = [...effectiveMatches].sort((a, b) => b - a)
+      for (const normalizedMatchOffset of sortedMatches) {
+        const origStart = this.mapNormalizedOffsetToOriginal(
+          content,
+          normalizedMatchOffset
+        )
+        const origEnd = this.mapNormalizedOffsetToOriginal(
+          content,
+          normalizedMatchOffset + normalizedSearch.length
+        )
+        result =
+          result.slice(0, origStart) + finalReplace + result.slice(origEnd)
+      }
+      this.logger.debug(
+        `${options.warningPrefix}: CRLF normalization retry succeeded ` +
+          `(${effectiveMatches.length} matches, content=${contentHasCrlf ? "CRLF" : "LF"}, search=${searchHasCrlf ? "CRLF" : "LF"})`
+      )
+      return { fileText: result }
+    }
+
+    const matchedStartLine = this.resolveLineNumberFromOffset(
+      range.lineStarts,
+      originalOffset
+    )
+    const matchedEndLine = this.resolveLineNumberFromOffset(
+      range.lineStarts,
+      Math.max(originalOffset, originalMatchEnd - 1)
+    )
+
+    this.logger.debug(
+      `${options.warningPrefix}: CRLF normalization retry succeeded ` +
+        `(content=${contentHasCrlf ? "CRLF" : "LF"}, search=${searchHasCrlf ? "CRLF" : "LF"})`
+    )
+
+    return {
+      fileText:
+        content.slice(0, originalOffset) +
+        finalReplace +
+        content.slice(originalMatchEnd),
+      resolvedMatch: {
+        requestedStartLine: options.startLine,
+        requestedEndLine: options.endLine,
+        matchedStartLine,
+        matchedEndLine,
+      },
+    }
+  }
+
+  /**
+   * Map an offset in CRLF-normalized (LF-only) content back to the
+   * corresponding offset in the original content.
+   */
+  private mapNormalizedOffsetToOriginal(
+    originalContent: string,
+    normalizedOffset: number
+  ): number {
+    let origPos = 0
+    let normPos = 0
+    while (normPos < normalizedOffset && origPos < originalContent.length) {
+      if (
+        originalContent[origPos] === "\r" &&
+        origPos + 1 < originalContent.length &&
+        originalContent[origPos + 1] === "\n"
+      ) {
+        // CRLF pair in original maps to single LF in normalized
+        origPos += 2
+        normPos += 1
+      } else {
+        origPos += 1
+        normPos += 1
+      }
+    }
+    return origPos
+  }
+
+  /**
+   * Fallback: trailing whitespace tolerance matching.
+   * Models sometimes omit or add trailing spaces/tabs that differ from the
+   * actual file content.  Normalize trailing whitespace per line for matching,
+   * then locate the corresponding region in the original content.
+   */
+  private attemptTrailingWhitespaceNormalizedMatch(
+    content: string,
+    range: { startOffset: number; endOffset: number; lineStarts: number[] },
+    options: {
+      searchText: string
+      replaceText: string
+      allowMultiple?: boolean
+      startLine?: number
+      endLine?: number
+      warningPrefix: string
+    }
+  ): {
+    fileText: string
+    resolvedMatch?: EditResolvedMatch
+  } | null {
+    const { searchText, replaceText } = options
+    const allowMultiple = options.allowMultiple || false
+
+    // Only attempt if the search text contains newlines (multi-line edit)
+    // and there's a plausible trailing whitespace difference
+    if (!searchText.includes("\n")) return null
+
+    const stripTrailing = (text: string): string =>
+      text
+        .split("\n")
+        .map((line) => line.replace(/[ \t]+$/, ""))
+        .join("\n")
+
+    const strippedSearch = stripTrailing(searchText)
+    // If stripping didn't change anything, this fallback won't help
+    if (strippedSearch === searchText) {
+      // Also check if the content has trailing whitespace that the search lacks
+      const targetSlice = content.slice(range.startOffset, range.endOffset)
+      const strippedTarget = stripTrailing(targetSlice)
+      if (strippedTarget === targetSlice) return null
+    }
+
+    // Try matching the stripped search against the stripped content
+    const strippedContent = stripTrailing(content)
+    const strippedAllOffsets = this.findSubstringOffsets(
+      strippedContent,
+      strippedSearch
+    )
+    if (strippedAllOffsets.length === 0) return null
+    if (!allowMultiple && strippedAllOffsets.length > 1) return null
+
+    // Map the stripped offset back to the original content.
+    // Since we only strip trailing whitespace (not add chars), each line in
+    // stripped content is <= the original line.  We map by line number.
+    const strippedLines = strippedContent.split("\n")
+    const originalLines = content.split("\n")
+
+    // Find which line the match starts on in stripped content
+    const matchOffset = strippedAllOffsets[0] as number
+    let charCount = 0
+    let matchStartLine = 0
+    for (let i = 0; i < strippedLines.length; i++) {
+      const lineLen = strippedLines[i]?.length ?? 0
+      if (charCount + lineLen >= matchOffset) {
+        matchStartLine = i
+        break
+      }
+      charCount += lineLen + 1 // +1 for \n
+    }
+
+    // Find the match end line
+    const matchEndInStripped = matchOffset + strippedSearch.length
+    charCount = 0
+    let matchEndLine = 0
+    for (let i = 0; i < strippedLines.length; i++) {
+      const lineLen = strippedLines[i]?.length ?? 0
+      const lineEnd = charCount + lineLen
+      if (lineEnd >= matchEndInStripped) {
+        matchEndLine = i
+        break
+      }
+      charCount += lineLen + 1
+    }
+
+    // Reconstruct the original offset range from line numbers
+    const origStartOffset = this.computeOriginalOffsetFromLine(
+      originalLines,
+      matchStartLine,
+      matchOffset - this.computeLineStartOffset(strippedLines, matchStartLine)
+    )
+    const origEndOffset = this.computeOriginalOffsetFromLine(
+      originalLines,
+      matchEndLine,
+      matchEndInStripped -
+        this.computeLineStartOffset(strippedLines, matchEndLine)
+    )
+
+    // Verify the replacement makes sense: the original slice should have
+    // the same content as searchText when both are trailing-ws-stripped
+    const originalSlice = content.slice(origStartOffset, origEndOffset)
+    if (stripTrailing(originalSlice) !== strippedSearch) return null
+
+    // Apply the replacement.  Preserve the file's trailing whitespace style
+    // by using the replaceText as-is (the model's intended output).
+    const matchedStart = this.resolveLineNumberFromOffset(
+      range.lineStarts,
+      origStartOffset
+    )
+    const matchedEnd = this.resolveLineNumberFromOffset(
+      range.lineStarts,
+      Math.max(origStartOffset, origEndOffset - 1)
+    )
+
+    this.logger.debug(
+      `${options.warningPrefix}: trailing whitespace normalization retry succeeded ` +
+        `(lines ${matchedStart}-${matchedEnd})`
+    )
+
+    return {
+      fileText:
+        content.slice(0, origStartOffset) +
+        replaceText +
+        content.slice(origEndOffset),
+      resolvedMatch: {
+        requestedStartLine: options.startLine,
+        requestedEndLine: options.endLine,
+        matchedStartLine: matchedStart,
+        matchedEndLine: matchedEnd,
+      },
+    }
+  }
+
+  /**
+   * Compute the character offset of the start of a given line index
+   * within a lines array (joined by \n).
+   */
+  private computeLineStartOffset(lines: string[], lineIndex: number): number {
+    let offset = 0
+    for (let i = 0; i < lineIndex && i < lines.length; i++) {
+      offset += (lines[i]?.length ?? 0) + 1 // +1 for \n
+    }
+    return offset
+  }
+
+  /**
+   * Compute the original content offset given a line index and a column
+   * offset within that line.
+   */
+  private computeOriginalOffsetFromLine(
+    originalLines: string[],
+    lineIndex: number,
+    columnOffset: number
+  ): number {
+    let offset = 0
+    for (let i = 0; i < lineIndex && i < originalLines.length; i++) {
+      offset += (originalLines[i]?.length ?? 0) + 1 // +1 for \n
+    }
+    return (
+      offset + Math.min(columnOffset, originalLines[lineIndex]?.length ?? 0)
+    )
+  }
+
   private pickFirstRawString(
     source: Record<string, unknown>,
     keys: string[],
@@ -5546,6 +5866,30 @@ ${raw}
           return retryResult
         }
       }
+
+      // Fallback: CRLF normalization — models typically emit LF-only search
+      // text even when the file uses CRLF (common on Windows).  Normalize
+      // both sides to LF for matching, then apply the edit on the original
+      // content using the mapped offset.
+      const crlfFallbackResult = this.attemptCrlfNormalizedMatch(
+        content,
+        range,
+        options
+      )
+      if (crlfFallbackResult) {
+        return crlfFallbackResult
+      }
+
+      // Fallback: trailing whitespace tolerance — models sometimes omit or
+      // add trailing spaces/tabs that differ from the actual file content.
+      // Normalize trailing whitespace per line for matching, then apply the
+      // edit on the original content.
+      const trailingWsFallbackResult =
+        this.attemptTrailingWhitespaceNormalizedMatch(content, range, options)
+      if (trailingWsFallbackResult) {
+        return trailingWsFallbackResult
+      }
+
       // Following claude-code's design: searchText not found is always a
       // failure — never silently assume the edit was "already applied".
       // If replaceText happens to exist in the range, add a diagnostic
