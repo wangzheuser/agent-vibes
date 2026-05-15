@@ -1097,47 +1097,94 @@ export function appendRequestedCursorModels(
   }
 
   const merged = [...models]
-  const seen = new Set(
-    merged.map((model) => parseModelRequest(model.name).normalizedBaseModel)
-  )
+  // Dedup on the full raw id (including any "(suffix)" qualifier) so that a
+  // user-added "gpt-5.5 (xhigh)" does not collide with the predefined
+  // "gpt-5.5" entry. Using normalizedBaseModel here would silently swallow
+  // the suffix variant.
+  const seen = new Set(merged.map((model) => model.name.trim().toLowerCase()))
 
   for (const requestedModelId of requestedModelIds) {
-    const trimmed = parseModelRequest(requestedModelId || "").baseModel.trim()
-    if (!trimmed) {
+    const parsed = parseModelRequest(requestedModelId || "")
+    const rawId = parsed.rawModel.trim()
+    if (!rawId) {
       continue
     }
 
-    const normalized = parseModelRequest(trimmed).normalizedBaseModel
-    if (!normalized || seen.has(normalized)) {
+    const dedupKey = rawId.toLowerCase()
+    if (seen.has(dedupKey)) {
       continue
     }
 
-    const predefinedModel = getCursorDisplayModel(trimmed)
-    if (predefinedModel) {
-      seen.add(normalized)
-      merged.push({ ...predefinedModel, isUserAdded: true })
+    // 1. Exact predefined hit (e.g. "claude-sonnet-4-5-thinking" → predefined entry).
+    const exactPredefined = getCursorDisplayModel(rawId)
+    if (
+      exactPredefined &&
+      exactPredefined.name.trim().toLowerCase() === dedupKey
+    ) {
+      seen.add(dedupKey)
+      merged.push({ ...exactPredefined, isUserAdded: true })
       continue
     }
 
-    const resolved = resolveCloudCodeModel(trimmed)
+    // 2. Predefined base hit when no suffix is present (e.g. "claude-sonnet-4-5"
+    //    → predefined "claude-sonnet-4-5"). We do not collapse a suffixed input
+    //    onto a non-suffixed predefined entry, because the suffix changes
+    //    thinking semantics and needs its own row.
+    if (!parsed.hasSuffix) {
+      const baseHit = getCursorDisplayModel(parsed.baseModel)
+      if (baseHit && baseHit.name.trim().toLowerCase() === dedupKey) {
+        seen.add(dedupKey)
+        merged.push({ ...baseHit, isUserAdded: true })
+        continue
+      }
+    }
+
+    const resolved = resolveCloudCodeModel(parsed.baseModel)
     if (!resolved) {
       continue
     }
 
-    const fallbackDisplayName =
+    // Suffix-derived thinking semantics. Levels / budgets / "auto" all imply
+    // a thinking-capable variant. "none" forces a non-thinking variant.
+    // "unknown" suffix (e.g. "(thinking)" written with parens) keeps the
+    // resolved default — users who want the thinking variant should use the
+    // canonical "*-thinking" id instead, which is matched in step 1.
+    const suffixForcesThinking =
+      parsed.suffix?.kind === "level" ||
+      parsed.suffix?.kind === "budget" ||
+      parsed.suffix?.kind === "auto"
+    const suffixForcesNonThinking = parsed.suffix?.kind === "none"
+    const isThinking = suffixForcesThinking
+      ? true
+      : suffixForcesNonThinking
+        ? false
+        : resolved.isThinking || !!resolved.thinking
+
+    const normalizedBase = parsed.normalizedBaseModel
+    const baseDisplayName =
       !resolved.displayName ||
-      resolved.displayName === normalized ||
-      resolved.displayName === trimmed
-        ? formatFallbackModelName(trimmed)
+      resolved.displayName.toLowerCase() === normalizedBase ||
+      resolved.displayName === parsed.baseModel
+        ? formatFallbackModelName(parsed.baseModel)
         : resolved.displayName
 
-    seen.add(normalized)
+    const suffixLabel = parsed.suffix?.raw?.trim()
+    const displayName =
+      parsed.hasSuffix && suffixLabel
+        ? `${baseDisplayName} (${suffixLabel})`
+        : baseDisplayName
+    const shortName =
+      parsed.hasSuffix && suffixLabel
+        ? `${baseDisplayName} ${suffixLabel}`
+        : baseDisplayName
+
+    seen.add(dedupKey)
     merged.push({
-      name: trimmed,
-      displayName: fallbackDisplayName,
-      shortName: fallbackDisplayName,
+      name: rawId,
+      displayName,
+      shortName,
       family: resolved.family,
-      isThinking: resolved.isThinking || !!resolved.thinking,
+      isThinking,
       isUserAdded: true,
     })
   }

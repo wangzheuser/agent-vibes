@@ -119,6 +119,16 @@
         "category": "Agent Vibes"
       },
       {
+        "command": "agentVibes.openKiroAccounts",
+        "title": "Open Kiro Accounts JSON",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.syncKiroIDE",
+        "title": "Sync Kiro IDE Credentials",
+        "category": "Agent Vibes"
+      },
+      {
         "command": "agentVibes.startServer",
         "title": "Start Server",
         "category": "Agent Vibes",
@@ -260,6 +270,11 @@
           "type": "string",
           "default": "",
           "description": "Optional absolute path for claude-api-accounts.json. If empty, uses <dataDir>/data/claude-api-accounts.json"
+        },
+        "agentVibes.kiroAccountsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path for kiro-accounts.json. If empty, uses <dataDir>/data/kiro-accounts.json"
         }
       }
     }

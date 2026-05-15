@@ -1,10 +1,11 @@
 import { Module } from "@nestjs/common"
-import { AnthropicApiModule } from "../../llm/anthropic/anthropic-api.module"
 import { ContextModule } from "../../context/context.module"
-import { CodexModule } from "../../llm/openai/codex.module"
+import { AnthropicApiModule } from "../../llm/anthropic/anthropic-api.module"
 import { GoogleModule } from "../../llm/google/google.module"
-import { ModelModule } from "../../llm/shared/model.module"
+import { KiroModule } from "../../llm/aws/kiro.module"
+import { CodexModule } from "../../llm/openai/codex.module"
 import { OpenaiCompatModule } from "../../llm/openai/openai-compat.module"
+import { ModelModule } from "../../llm/shared/model.module"
 import { MessagesController } from "./messages.controller"
 import { MessagesService } from "./messages.service"
 import { TokenizerService } from "./tokenizer.service"
@@ -14,6 +15,7 @@ import { TokenizerService } from "./tokenizer.service"
     AnthropicApiModule,
     CodexModule,
     GoogleModule,
+    KiroModule,
     ContextModule,
     ModelModule,
     OpenaiCompatModule,
@@ -24,6 +26,7 @@ import { TokenizerService } from "./tokenizer.service"
     AnthropicApiModule,
     CodexModule,
     GoogleModule,
+    KiroModule,
     MessagesService,
     OpenaiCompatModule,
   ],

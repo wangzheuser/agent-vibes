@@ -1257,7 +1257,10 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
   "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
   "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
-  "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT",
+  // CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT intentionally omitted from the
+  // default agent builtin tool surface — the proxy runtime does not implement
+  // a VM environment broker, so we do not advertise it on the user-facing
+  // surface to avoid wasting model tokens on a tool that always fails.
   "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
   "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
   "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
@@ -2106,7 +2109,6 @@ function buildCodexToolsForApi(
     "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
     "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
     "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-    "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT",
     "CLIENT_SIDE_TOOL_V2_TASK",
     "CLIENT_SIDE_TOOL_V2_TASK_V2",
     "CLIENT_SIDE_TOOL_V2_TODO_READ",
@@ -2341,7 +2343,10 @@ export function buildToolsForApi(
     "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
     "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
     "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-    "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT",
+    // CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT intentionally omitted —
+    // the proxy runtime does not implement a VM environment broker, so we
+    // do not advertise it on the user-facing surface to avoid wasting model
+    // tokens on a tool that always fails with "backend not configured".
     "CLIENT_SIDE_TOOL_V2_TASK",
     "CLIENT_SIDE_TOOL_V2_TASK_V2",
     "CLIENT_SIDE_TOOL_V2_TODO_READ",

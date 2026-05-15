@@ -6,15 +6,12 @@ export interface ToolContinuationMessage {
 }
 
 export function backendRequiresCompleteToolBatchBeforeContinuation(
-  backend: BackendType
+  _backend: BackendType
 ): boolean {
-  return (
-    backend === "google" ||
-    backend === "google-claude" ||
-    backend === "claude-api" ||
-    backend === "codex" ||
-    backend === "openai-compat"
-  )
+  // All known LLM backends require that every tool_use in an assistant message
+  // has a corresponding tool_result before the next request is sent.
+  // Sending partial tool results causes "Improperly formed request" errors.
+  return true
 }
 
 export function findPendingToolUseIdsInMessages(

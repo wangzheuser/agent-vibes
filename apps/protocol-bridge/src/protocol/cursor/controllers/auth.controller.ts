@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Logger, Post } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import { createHash, randomUUID } from "crypto"
+import { KiroService } from "../../../llm/aws/kiro.service"
 import { AntigravityIdeSyncService } from "../antigravity-ide-sync.service"
 import { CursorAuthService } from "../cursor-auth.service"
 
@@ -24,7 +25,8 @@ export class AuthController {
   constructor(
     private readonly configService: ConfigService,
     private readonly cursorAuthService: CursorAuthService,
-    private readonly antigravityIdeSyncService: AntigravityIdeSyncService
+    private readonly antigravityIdeSyncService: AntigravityIdeSyncService,
+    private readonly kiroService: KiroService
   ) {}
 
   private getCursorIdentity(): CursorIdentity {
@@ -119,6 +121,97 @@ export class AuthController {
     return {
       synced: true,
       ...this.antigravityIdeSyncService.syncCredentialsFromIde(),
+    }
+  }
+
+  // ── Kiro: one-click sync from local AWS SSO / Kiro IDE caches ──────────
+
+  @Post("kiro/sync-local")
+  async syncKiroFromLocalCaches() {
+    try {
+      const result = await this.kiroService.syncFromLocalCaches()
+      this.logger.log(
+        `Kiro local sync: imported=${result.imported}, skipped=${result.skipped}, total=${result.accountCount}`
+      )
+      return result
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Kiro local sync failed"
+      this.logger.error(`Kiro local sync error: ${message}`)
+      return {
+        synced: false,
+        imported: 0,
+        skipped: 0,
+        accountCount: 0,
+        path: "",
+        sources: [],
+        error: message,
+      }
+    }
+  }
+
+  // ── Kiro: AWS Builder ID OAuth device flow ─────────────────────────────
+
+  @Post("kiro/login/start")
+  async startKiroBuilderIdLogin(
+    @Body() body: { region?: string; proxyUrl?: string } = {}
+  ) {
+    const session = await this.kiroService.startBuilderIdLogin({
+      region: body.region,
+      proxyUrl: body.proxyUrl,
+    })
+    return session
+  }
+
+  @Post("kiro/login/poll")
+  async pollKiroBuilderIdLogin(
+    @Body() body: { sessionId?: string; proxyUrl?: string } = {}
+  ) {
+    const sessionId = (body.sessionId || "").trim()
+    if (!sessionId) {
+      return { status: "expired" as const, message: "missing sessionId" }
+    }
+    return this.kiroService.pollBuilderIdLogin(sessionId, {
+      proxyUrl: body.proxyUrl,
+    })
+  }
+
+  @Post("kiro/login/cancel")
+  cancelKiroBuilderIdLogin(@Body() body: { sessionId?: string } = {}) {
+    const sessionId = (body.sessionId || "").trim()
+    return {
+      cancelled: sessionId
+        ? this.kiroService.cancelBuilderIdLogin(sessionId)
+        : false,
+    }
+  }
+
+  // ── Kiro: manual JSON paste fallback ───────────────────────────────────
+
+  @Post("kiro/import")
+  importKiroFromJson(@Body() body: { raw?: string } = {}) {
+    const raw = (body.raw || "").trim()
+    if (!raw) {
+      return {
+        imported: 0,
+        skipped: 0,
+        accountCount: 0,
+        path: "",
+        error: "empty payload",
+      }
+    }
+    try {
+      return this.kiroService.importFromRawJson(raw)
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Kiro import failed"
+      return {
+        imported: 0,
+        skipped: 0,
+        accountCount: 0,
+        path: "",
+        error: message,
+      }
     }
   }
 }

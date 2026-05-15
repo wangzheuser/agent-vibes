@@ -1,18 +1,17 @@
 #!/usr/bin/env node
 /**
- * Antigravity Traffic Capture
+ * Kiro Traffic Capture
  *
- * Captures official Antigravity IDE -> Cloud Code API traffic by inserting
+ * Captures agent-vibes -> Kiro/AWS CodeWhisperer API traffic by inserting
  * mitmdump into Clash Verge's runtime config and reloading mihomo via API.
  *
- * Flow: Antigravity IDE -> TUN -> Clash -> capture-mitm(:10444) -> Clash(VMess) -> Cloud Code
+ * Flow: agent-vibes -> TUN -> Clash -> capture-mitm(:10445) -> Clash(VMess) -> Kiro API
  *
  * How it works:
- *   capture:start  - Patches clash-verge.yaml to add capture-mitm proxy and
- *                     routing rules, reloads mihomo via API, then starts mitmdump.
- *   capture:stop   - Removes the runtime patch, kills mitmdump, reloads mihomo.
- *   capture:repair - Restores the runtime config if capture rules were left behind after an
- *                     unexpected exit or Clash restart.
+ *   capture:kiro:start  - Patches clash-verge.yaml to add capture-mitm proxy and
+ *                          routing rules, reloads mihomo via API, then starts mitmdump.
+ *   capture:kiro:stop   - Removes the runtime patch, kills mitmdump, reloads mihomo.
+ *   capture:kiro:repair - Restores the runtime config if capture rules were left behind.
  */
 const fs = require("node:fs")
 const path = require("node:path")
@@ -20,26 +19,29 @@ const http = require("node:http")
 const { spawn, spawnSync } = require("node:child_process")
 
 const SCRIPT_DIR = __dirname
-const MITM_PORT = 10444
-const LOG_DIR = path.join(SCRIPT_DIR, "traffic_dumps")
-const CAPTURE_SCRIPT = path.join(SCRIPT_DIR, "capture-traffic.py")
+const MITM_PORT = 10445
+const LOG_DIR = path.join(SCRIPT_DIR, "kiro_traffic_dumps")
+const CAPTURE_SCRIPT = path.join(SCRIPT_DIR, "capture-kiro-traffic.py")
 const platform = require("../lib/platform")
 
 // Clash Verge runtime config paths
 const CLASH_DIR = platform.clashConfigDir()
 const CLASH_RUNTIME_CONFIG = path.join(CLASH_DIR, "clash-verge.yaml")
 const CLASH_SOCKET_DEFAULT = "/tmp/verge/verge-mihomo.sock"
-const CAPTURE_PROXY_BLOCK_BEGIN = "# >>> agent-vibes capture proxy"
-const CAPTURE_PROXY_BLOCK_END = "# <<< agent-vibes capture proxy"
-const CAPTURE_RULE_BLOCK_BEGIN = "# >>> agent-vibes capture rules"
-const CAPTURE_RULE_BLOCK_END = "# <<< agent-vibes capture rules"
+const CAPTURE_PROXY_BLOCK_BEGIN = "# >>> agent-vibes kiro capture proxy"
+const CAPTURE_PROXY_BLOCK_END = "# <<< agent-vibes kiro capture proxy"
+const CAPTURE_RULE_BLOCK_BEGIN = "# >>> agent-vibes kiro capture rules"
+const CAPTURE_RULE_BLOCK_END = "# <<< agent-vibes kiro capture rules"
+
+// Kiro target domains
+const KIRO_DOMAINS = [
+  "q.us-east-1.amazonaws.com",
+  "codewhisperer.us-east-1.amazonaws.com",
+  "oidc.us-east-1.amazonaws.com",
+]
 
 let mitmdumpBin = null
 
-/**
- * Cross-platform shell command executor.
- * Uses bash on Unix, cmd on Windows.
- */
 function runShell(cmd, ok = false) {
   const isWin = platform.PLATFORM === "win32"
   const shell = isWin ? "cmd" : "bash"
@@ -47,18 +49,6 @@ function runShell(cmd, ok = false) {
   const r = spawnSync(shell, shellArgs, { stdio: "inherit" })
   if (r.status !== 0 && !ok) process.exit(r.status ?? 1)
   return r
-}
-
-/**
- * Cross-platform shell command executor that captures output.
- */
-function runShellCapture(cmd, ok = false) {
-  const isWin = platform.PLATFORM === "win32"
-  const shell = isWin ? "cmd" : "bash"
-  const shellArgs = isWin ? ["/c", cmd] : ["-lc", cmd]
-  const r = spawnSync(shell, shellArgs, { encoding: "utf-8", stdio: "pipe" })
-  if (r.status !== 0 && !ok) process.exit(r.status ?? 1)
-  return (r.stdout || "").trim()
 }
 
 function runCapture(command, args, ok = false) {
@@ -76,9 +66,6 @@ function runCapture(command, args, ok = false) {
   }
 }
 
-/**
- * Read the Clash external controller secret from config.yaml.
- */
 function readClashSecret() {
   try {
     const configPath = path.join(CLASH_DIR, "config.yaml")
@@ -87,16 +74,10 @@ function readClashSecret() {
       const m = line.match(/^secret:\s*(.+)/)
       if (m) return m[1].trim()
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return null
 }
 
-/**
- * Resolve the Clash external controller Unix socket path from config.yaml.
- * Used on macOS/Linux. Falls back to CLASH_SOCKET_DEFAULT.
- */
 function readClashSocket() {
   try {
     const configPath = path.join(CLASH_DIR, "config.yaml")
@@ -105,17 +86,10 @@ function readClashSocket() {
       const m = line.match(/^external-controller-unix:\s*(.+)/)
       if (m) return m[1].trim()
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return CLASH_SOCKET_DEFAULT
 }
 
-/**
- * Resolve the Clash external controller TCP address from config.yaml.
- * Used on Windows, or as fallback on other platforms.
- * Returns { host, port } or null.
- */
 function readClashTcpController() {
   try {
     const configPath = path.join(CLASH_DIR, "config.yaml")
@@ -125,7 +99,6 @@ function readClashTcpController() {
       if (m) {
         const addr = m[1].trim().replace(/^['"]|['"]$/g, "")
         if (!addr) continue
-        // Parse host:port (e.g., "127.0.0.1:9097" or ":9090")
         const colonIdx = addr.lastIndexOf(":")
         if (colonIdx === -1) continue
         const host = addr.slice(0, colonIdx) || "127.0.0.1"
@@ -133,17 +106,10 @@ function readClashTcpController() {
         if (!isNaN(port)) return { host, port }
       }
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return null
 }
 
-/**
- * Make an HTTP request to the Clash API.
- * On macOS/Linux: prefers Unix socket, falls back to TCP.
- * On Windows: uses TCP only.
- */
 function clashApiRequest(method, apiPath, body = null) {
   const secret = readClashSecret()
   const headers = { "Content-Type": "application/json" }
@@ -162,7 +128,6 @@ function clashApiRequest(method, apiPath, body = null) {
       req.end()
     }
 
-    // Windows: TCP only
     if (platform.PLATFORM === "win32") {
       const tcp = readClashTcpController()
       if (!tcp) {
@@ -182,7 +147,6 @@ function clashApiRequest(method, apiPath, body = null) {
       return
     }
 
-    // macOS/Linux: try Unix socket first, fall back to TCP
     const socketPath = readClashSocket()
     const socketReq = http.request(
       { socketPath, path: apiPath, method, headers },
@@ -193,13 +157,9 @@ function clashApiRequest(method, apiPath, body = null) {
       }
     )
     socketReq.on("error", () => {
-      // Socket failed, try TCP fallback
       const tcp = readClashTcpController()
       if (!tcp) {
-        resolve({
-          statusCode: 0,
-          error: "Cannot reach Clash API (no socket or TCP controller)",
-        })
+        resolve({ statusCode: 0, error: "Cannot reach Clash API" })
         return
       }
       doRequest({
@@ -216,21 +176,18 @@ function clashApiRequest(method, apiPath, body = null) {
   })
 }
 
-/**
- * Reload Clash config via external controller API.
- */
 function reloadClash() {
   return clashApiRequest("PUT", "/configs?force=true", {
     path: CLASH_RUNTIME_CONFIG,
   }).then((res) => {
     if (res.statusCode === 204 || res.statusCode === 200) {
-      console.log("✓ Clash runtime config reloaded via API")
+      console.log("  Clash runtime config reloaded via API")
     } else if (res.error) {
-      console.log(`⚠ Cannot reach Clash API: ${res.error}`)
+      console.log(`  Cannot reach Clash API: ${res.error}`)
       console.log("  Please restart Clash Verge manually.")
     } else {
       console.log(
-        `⚠ Clash API returned ${res.statusCode}: ${(res.data || "").trim() || "(empty)"}`
+        `  Clash API returned ${res.statusCode}: ${(res.data || "").trim() || "(empty)"}`
       )
       console.log("  Please restart Clash Verge manually.")
     }
@@ -238,34 +195,15 @@ function reloadClash() {
 }
 
 async function flushClashCaches() {
-  const requests = [
+  for (const req of [
     { method: "POST", path: "/cache/dns/flush", label: "DNS cache" },
     { method: "POST", path: "/cache/fakeip/flush", label: "fake-ip cache" },
-  ]
-
-  for (const req of requests) {
+  ]) {
     const res = await clashApiRequest(req.method, req.path)
     if (res.statusCode === 204 || res.statusCode === 200) {
-      console.log(`✓ ${req.label} flushed`)
-    } else if (res.error) {
-      console.log(`⚠ Cannot flush ${req.label}: ${res.error}`)
-    } else {
-      console.log(`⚠ Cannot flush ${req.label}: API returned ${res.statusCode}`)
+      console.log(`  ${req.label} flushed`)
     }
   }
-}
-
-/**
- * Fetch Clash runtime rules via API.
- */
-function fetchClashRules() {
-  return clashApiRequest("GET", "/rules").then((res) => {
-    try {
-      return JSON.parse(res.data || "null")
-    } catch {
-      return null
-    }
-  })
 }
 
 function resolveMitmdump() {
@@ -292,47 +230,10 @@ function resolveMitmdump() {
   process.exit(1)
 }
 
-function parseWindowsProcessList(raw) {
-  return raw
-    .split(/\r?\n\r?\n+/)
-    .map((block) => {
-      const fields = {}
-      for (const line of block.split(/\r?\n/)) {
-        const trimmed = line.trim()
-        if (!trimmed || !trimmed.includes("=")) continue
-        const idx = trimmed.indexOf("=")
-        fields[trimmed.slice(0, idx)] = trimmed.slice(idx + 1).trim()
-      }
-      const pid = parseInt(fields.ProcessId, 10)
-      if (isNaN(pid)) return null
-      return {
-        Name: fields.Name || "unknown",
-        ProcessId: pid,
-      }
-    })
-    .filter(Boolean)
-}
-
-function queryWindowsProcesses(whereClause) {
-  if (platform.PLATFORM !== "win32") return []
-  const result = runCapture(
-    "wmic",
-    ["process", "where", whereClause, "get", "ProcessId,Name", "/format:list"],
-    true
-  )
-  if (result.error || result.status !== 0) return []
-  return parseWindowsProcessList(result.stdout)
-}
-
-function getManagedWindowsMitmdumpProcesses() {
-  return queryWindowsProcesses("CommandLine like '%mitmdump%capture-traffic%'")
-}
-
-function getManagedUnixMitmdumpProcesses() {
+function getManagedMitmdumpProcesses() {
   if (platform.PLATFORM === "win32") return []
   const result = runCapture("ps", ["-axo", "pid=,command="], true)
   if (result.error || result.status !== 0 || !result.stdout) return []
-
   return result.stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -340,40 +241,15 @@ function getManagedUnixMitmdumpProcesses() {
     .filter(
       (line) =>
         line.includes("mitmdump") &&
-        line.includes("capture-traffic") &&
+        line.includes("capture-kiro-traffic") &&
         !line.includes("pgrep") &&
         !line.includes("rg ")
     )
     .map((line) => {
       const match = line.match(/^(\d+)\s+(.+)$/)
       if (!match) return { Name: line, ProcessId: null }
-      return {
-        Name: match[2],
-        ProcessId: parseInt(match[1], 10),
-      }
+      return { Name: match[2], ProcessId: parseInt(match[1], 10) }
     })
-}
-
-function getManagedMitmdumpProcesses() {
-  return platform.PLATFORM === "win32"
-    ? getManagedWindowsMitmdumpProcesses()
-    : getManagedUnixMitmdumpProcesses()
-}
-
-function printProcessStatus(label, processes) {
-  if (processes.length === 0) {
-    console.log(`  ${label}: not running`)
-    return
-  }
-
-  console.log(`  ${label}:`)
-  for (const proc of processes) {
-    const pidSuffix =
-      proc.ProcessId == null || Number.isNaN(proc.ProcessId)
-        ? ""
-        : ` (pid ${proc.ProcessId})`
-    console.log(`    ${proc.Name}${pidSuffix}`)
-  }
 }
 
 function readClashRuntimeConfig() {
@@ -417,7 +293,6 @@ function extractNamedEntries(content, sectionName) {
   const lines = content.split(/\r?\n/)
   const names = []
   let inSection = false
-
   for (const line of lines) {
     if (line === `${sectionName}:`) {
       inSection = true
@@ -431,11 +306,9 @@ function extractNamedEntries(content, sectionName) {
       break
     }
     if (!inSection) continue
-
     const match = line.match(/^- name:\s*(.+)$/)
     if (match) names.push(match[1].trim())
   }
-
   return names
 }
 
@@ -443,12 +316,10 @@ function resolveCaptureUpstream(content) {
   const groupNames = extractNamedEntries(content, "proxy-groups")
   if (groupNames.includes("PROXY")) return "PROXY"
   if (groupNames.length > 0) return groupNames[0]
-
   const proxyNames = extractNamedEntries(content, "proxies").filter(
-    (name) => name !== "capture-mitm"
+    (name) => name !== "kiro-capture-mitm"
   )
   if (proxyNames.length > 0) return proxyNames[0]
-
   throw new Error(
     "Cannot find a usable upstream proxy target in clash-verge.yaml"
   )
@@ -457,7 +328,7 @@ function resolveCaptureUpstream(content) {
 function buildCaptureProxyBlock() {
   return [
     CAPTURE_PROXY_BLOCK_BEGIN,
-    "- name: capture-mitm",
+    "- name: kiro-capture-mitm",
     "  type: http",
     "  server: 127.0.0.1",
     `  port: ${MITM_PORT}`,
@@ -466,25 +337,24 @@ function buildCaptureProxyBlock() {
 }
 
 function buildCaptureRuleBlock(upstreamTarget) {
-  return [
-    CAPTURE_RULE_BLOCK_BEGIN,
-    `- PROCESS-NAME,mitmdump,${upstreamTarget}`,
-    "- DOMAIN-SUFFIX,googleapis.com,capture-mitm",
-    CAPTURE_RULE_BLOCK_END,
-  ].join("\n")
+  const rules = [CAPTURE_RULE_BLOCK_BEGIN]
+  rules.push(`- PROCESS-NAME,mitmdump,${upstreamTarget}`)
+  for (const domain of KIRO_DOMAINS) {
+    rules.push(`- DOMAIN,${domain},kiro-capture-mitm`)
+  }
+  rules.push(CAPTURE_RULE_BLOCK_END)
+  return rules.join("\n")
 }
 
 function applyCaptureRuntimePatch() {
   const cleanContent = stripCaptureBlocks(readClashRuntimeConfig())
   const upstreamTarget = resolveCaptureUpstream(cleanContent)
-
   if (!/^proxies:\s*$/m.test(cleanContent)) {
     throw new Error("Cannot find proxies section in clash-verge.yaml")
   }
   if (!/^rules:\s*$/m.test(cleanContent)) {
     throw new Error("Cannot find rules section in clash-verge.yaml")
   }
-
   let patched = cleanContent.replace(
     /^proxies:\s*$/m,
     `proxies:\n${buildCaptureProxyBlock()}`
@@ -494,7 +364,6 @@ function applyCaptureRuntimePatch() {
     `rules:\n${buildCaptureRuleBlock(upstreamTarget)}`
   )
   writeClashRuntimeConfig(patched)
-
   return upstreamTarget
 }
 
@@ -511,14 +380,12 @@ function isLocalPortListening(port, timeoutMs = 500) {
   return new Promise((resolve) => {
     let settled = false
     const socket = net.createConnection({ host: "127.0.0.1", port })
-
     function finish(result) {
       if (settled) return
       settled = true
       socket.destroy()
       resolve(result)
     }
-
     socket.setTimeout(timeoutMs)
     socket.on("connect", () => finish(true))
     socket.on("timeout", () => finish(false))
@@ -532,7 +399,6 @@ async function inspectCaptureState() {
   const managedMitmdumpProcesses = getManagedMitmdumpProcesses()
   const managedMitmdumpRunning = managedMitmdumpProcesses.length > 0
   const mitmPortListening = await isLocalPortListening(MITM_PORT)
-
   return {
     runtimePatched,
     managedMitmdumpProcesses,
@@ -545,9 +411,6 @@ async function inspectCaptureState() {
   }
 }
 
-/**
- * Wait for a TCP port to accept connections.
- */
 function waitForPort(port, timeoutMs = 8000) {
   const net = require("node:net")
   const start = Date.now()
@@ -560,17 +423,12 @@ function waitForPort(port, timeoutMs = 8000) {
         sock.destroy()
         resolve()
       })
-      sock.on("error", () => {
-        setTimeout(attempt, 200)
-      })
+      sock.on("error", () => setTimeout(attempt, 200))
     }
     attempt()
   })
 }
 
-/**
- * Restore Clash runtime config (remove capture rules). Safe to call multiple times.
- */
 async function restoreClash() {
   let changed = false
   try {
@@ -579,9 +437,9 @@ async function restoreClash() {
     return
   }
   if (changed) {
-    console.log("\n✓ Removed capture injection from clash-verge.yaml.")
+    console.log("\n  Removed kiro capture injection from clash-verge.yaml.")
   } else {
-    console.log("\n✓ clash-verge.yaml already clean.")
+    console.log("\n  clash-verge.yaml already clean.")
   }
   console.log("Reloading Clash runtime config...")
   await reloadClash()
@@ -590,7 +448,7 @@ async function restoreClash() {
 
 async function cmdStart() {
   if (!fs.existsSync(CAPTURE_SCRIPT)) {
-    console.error("No capture-traffic.py found")
+    console.error("No capture-kiro-traffic.py found")
     process.exit(1)
   }
   const mitmdump = resolveMitmdump()
@@ -600,49 +458,27 @@ async function cmdStart() {
 
   let captureState = await inspectCaptureState()
   if (captureState.staleInjection) {
-    console.log("")
-    console.log(
-      "Detected stale runtime capture injection. Clash still points googleapis.com to capture-mitm," +
-        " but mitmdump is no longer running."
-    )
-    console.log("Repairing Clash before starting a new capture session...")
+    console.log("\nDetected stale kiro capture injection. Repairing...")
     await restoreClash()
     captureState = await inspectCaptureState()
   }
 
   if (captureState.managedMitmdumpRunning && captureState.runtimePatched) {
-    console.log("")
-    console.log("Capture is already running.")
+    console.log("\nKiro capture is already running.")
     console.log(
-      "Use `npm run antigravity:capture:stop` before starting a new session."
+      "Use `npm run capture:kiro:stop` before starting a new session."
     )
     return
   }
 
-  if (captureState.managedMitmdumpRunning && !captureState.runtimePatched) {
-    console.error(
-      "Managed mitmdump is already running, but clash-verge.yaml is not in capture mode."
-    )
-    console.error("Run `npm run antigravity:capture:repair` before retrying.")
-    process.exit(1)
-  }
-
   if (captureState.portOccupiedWithoutManagedMitmdump) {
     console.error(
-      "Port " +
-        MITM_PORT +
-        " is already occupied by another process. Refusing to start capture."
-    )
-    console.error(
-      "Run `npm run antigravity:capture:repair` and free the port before retrying."
+      "Port " + MITM_PORT + " is already occupied. Free it before retrying."
     )
     process.exit(1)
   }
 
-  // ── Step 1: Start mitmdump FIRST (before touching Clash) ──
-  console.log("")
-  console.log("Starting mitmdump on port " + MITM_PORT + "...")
-
+  console.log("\nStarting mitmdump on port " + MITM_PORT + "...")
   const mitmProc = spawn(
     mitmdump,
     [
@@ -657,19 +493,17 @@ async function cmdStart() {
     { stdio: "inherit" }
   )
 
-  // ── Step 2: Wait for mitmdump port to be ready ──
   try {
     await waitForPort(MITM_PORT)
-    console.log("✓ mitmdump listening on port " + MITM_PORT)
+    console.log("  mitmdump listening on port " + MITM_PORT)
   } catch (e) {
-    console.error("✗ mitmdump failed to start: " + e.message)
+    console.error("  mitmdump failed to start: " + e.message)
     mitmProc.kill()
     process.exit(1)
   }
 
-  // ── Step 3: NOW patch runtime config (mitmdump is confirmed ready) ──
   const upstreamTarget = applyCaptureRuntimePatch()
-  console.log("Injected capture patch into clash-verge.yaml.")
+  console.log("Injected kiro capture patch into clash-verge.yaml.")
   console.log("Mitmdump upstream target: " + upstreamTarget)
 
   console.log("Reloading Clash runtime config...")
@@ -679,21 +513,21 @@ async function cmdStart() {
 
   console.log("")
   console.log(
-    "  Flow: Antigravity IDE -> TUN -> Clash -> mitmdump(:" +
+    "  Flow: agent-vibes -> TUN -> Clash -> mitmdump(:" +
       MITM_PORT +
-      ") -> Clash(VMess) -> Cloud Code"
+      ") -> Clash(VMess) -> Kiro API"
   )
-  console.log("  Logs:  " + path.join(SCRIPT_DIR, "antigravity_traffic.log"))
+  console.log("  Domains: " + KIRO_DOMAINS.join(", "))
+  console.log("  Logs:  " + path.join(SCRIPT_DIR, "kiro_traffic.log"))
   console.log("  Dumps: " + LOG_DIR)
   console.log("  Press Ctrl+C to stop capture and restore Clash config.")
   console.log("")
 
-  // ── Step 4: Auto-restore on exit (Ctrl+C, crash, kill) ──
   let cleaned = false
   async function cleanup(code) {
     if (cleaned) return
     cleaned = true
-    console.log("\nStopping capture...")
+    console.log("\nStopping kiro capture...")
     try {
       mitmProc.kill()
     } catch {}
@@ -712,26 +546,17 @@ async function cmdStart() {
 }
 
 async function cmdStop() {
-  // Kill mitmdump (cross-platform)
   if (platform.PLATFORM === "win32") {
-    const processes = getManagedWindowsMitmdumpProcesses()
-    for (const proc of processes) {
-      runShell(`taskkill /F /PID ${proc.ProcessId} >nul 2>&1`, true)
-    }
+    // Windows: use taskkill
   } else {
-    runShell('pkill -f "mitmdump.*capture-traffic" 2>/dev/null', true)
+    runShell('pkill -f "mitmdump.*capture-kiro-traffic" 2>/dev/null', true)
   }
-
-  // Remove runtime patch
   if (removeCaptureRuntimePatch()) {
-    console.log("Removed capture injection from clash-verge.yaml.")
+    console.log("Removed kiro capture injection from clash-verge.yaml.")
   } else {
-    console.log("clash-verge.yaml already clean, nothing to restore.")
+    console.log("clash-verge.yaml already clean.")
   }
-
-  // Auto-reload Clash runtime config via API
-  console.log("")
-  console.log("Reloading Clash runtime config...")
+  console.log("\nReloading Clash runtime config...")
   await reloadClash()
   await flushClashCaches()
 }
@@ -743,105 +568,40 @@ async function cmdRepair() {
     !state.managedMitmdumpRunning &&
     !state.mitmPortListening
   ) {
-    console.log("Capture state already clean.")
+    console.log("Kiro capture state already clean.")
     return
   }
-
-  console.log("Repairing capture state...")
+  console.log("Repairing kiro capture state...")
   await cmdStop()
-
-  if (state.portOccupiedWithoutManagedMitmdump) {
-    console.log("")
-    console.log(
-      "Note: port " +
-        MITM_PORT +
-        " is still occupied by another local process. Clash has been restored,"
-    )
-    console.log(
-      "but you should free that port before the next capture session."
-    )
-  }
 }
 
 async function cmdStatus() {
   const state = await inspectCaptureState()
   const active = state.runtimePatched
-  console.log("Clash runtime config: " + (active ? "CAPTURE MODE" : "normal"))
+  console.log(
+    "Clash runtime config: " + (active ? "KIRO CAPTURE MODE" : "normal")
+  )
   console.log("  File: " + CLASH_RUNTIME_CONFIG)
-
-  // Check runtime rules via Clash API
-  const rulesData = await fetchClashRules()
-  if (rulesData && rulesData.rules) {
-    const captureRule = rulesData.rules.find(
-      (r) => r.payload && r.payload.includes("capture-mitm")
-    )
-    console.log(
-      "Clash runtime:    " +
-        (captureRule ? "CAPTURE MODE (live)" : "normal (live)")
-    )
-  } else {
-    console.log("Clash runtime:    (cannot reach API)")
-  }
-
   console.log("\nHealth:")
   if (state.staleInjection) {
     console.log("  stale injection detected")
-    console.log(
-      "  clash-verge.yaml still routes googleapis.com to capture-mitm, but mitmdump/10444 is gone."
-    )
-    console.log("  Fix: npm run antigravity:capture:repair")
+    console.log("  Fix: npm run capture:kiro:repair")
   } else if (state.runtimePatched && state.managedMitmdumpRunning) {
-    console.log("  capture session looks healthy")
+    console.log("  kiro capture session looks healthy")
   } else if (!state.runtimePatched && !state.managedMitmdumpRunning) {
-    console.log("  capture state is clean")
-  } else if (state.runtimePatched && state.portOccupiedWithoutManagedMitmdump) {
-    console.log(
-      "  capture rules are active, but port 10444 belongs to another process"
-    )
-    console.log("  Fix: npm run antigravity:capture:repair")
-  } else if (state.runtimePatched) {
-    console.log(
-      "  capture runtime patch is active, but managed mitmdump was not found"
-    )
-    console.log("  Fix: npm run antigravity:capture:repair")
+    console.log("  kiro capture state is clean")
   } else {
-    console.log(
-      "  managed mitmdump is running while clash-verge.yaml is normal"
-    )
-    console.log("  Fix: npm run antigravity:capture:repair")
+    console.log("  inconsistent state")
+    console.log("  Fix: npm run capture:kiro:repair")
   }
-
   console.log("\nProcesses:")
-  if (platform.PLATFORM === "win32") {
-    printProcessStatus("mitmdump", state.managedMitmdumpProcesses)
-    printProcessStatus("clash", queryWindowsProcesses("Name like '%mihomo%'"))
+  const procs = state.managedMitmdumpProcesses
+  if (procs.length === 0) {
+    console.log("  mitmdump (kiro): not running")
   } else {
-    printProcessStatus("mitmdump", state.managedMitmdumpProcesses)
-    runShell(
-      "echo -n '  clash:    '; pgrep -fl 'verge-mihomo|mihomo' | head -1 || echo 'not running'",
-      true
-    )
-  }
-
-  console.log("\nPorts:")
-  if (platform.PLATFORM === "win32") {
-    runShell(
-      "echo   " +
-        MITM_PORT +
-        ' (mitm):  & (netstat -an | findstr ":' +
-        MITM_PORT +
-        '.*LISTENING" || echo -)',
-      true
-    )
-  } else {
-    runShell(
-      "echo -n '  " +
-        MITM_PORT +
-        " (mitm):  '; lsof -nP -iTCP:" +
-        MITM_PORT +
-        " -sTCP:LISTEN 2>/dev/null | tail -1 || echo '-'",
-      true
-    )
+    for (const proc of procs) {
+      console.log(`  mitmdump (kiro): pid ${proc.ProcessId}`)
+    }
   }
 }
 
@@ -875,6 +635,6 @@ switch (process.argv[2]) {
     })
     break
   default:
-    console.log("Usage: sudo node capture.js [start|stop|status|repair]")
+    console.log("Usage: node capture-kiro.js [start|stop|status|repair]")
     process.exit(1)
 }

@@ -1,6 +1,6 @@
 import * as fs from "fs"
-import * as path from "path"
 import * as os from "os"
+import * as path from "path"
 
 const APP_ROOT_MARKER = "nest-cli.json"
 const ACCOUNT_CONFIG_ENV_VARS: Record<string, string> = {
@@ -8,6 +8,7 @@ const ACCOUNT_CONFIG_ENV_VARS: Record<string, string> = {
   "claude-api-accounts.json": "AGENT_VIBES_CLAUDE_API_ACCOUNTS_PATH",
   "codex-accounts.json": "AGENT_VIBES_CODEX_ACCOUNTS_PATH",
   "openai-compat-accounts.json": "AGENT_VIBES_OPENAI_COMPAT_ACCOUNTS_PATH",
+  "kiro-accounts.json": "AGENT_VIBES_KIRO_ACCOUNTS_PATH",
 }
 
 /**

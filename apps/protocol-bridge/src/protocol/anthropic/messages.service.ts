@@ -5,8 +5,6 @@ import {
   TokenCounterService,
   UnifiedMessage,
 } from "../../context"
-import { CodexService } from "../../llm/openai/codex.service"
-import type { CodexForwardHeaders } from "../../llm/openai/codex-header-utils"
 import {
   AnthropicApiService,
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
@@ -17,8 +15,14 @@ import {
   GOOGLE_STARTUP_UPSTREAM_CHECK_ENV,
   isGoogleStartupUpstreamCheckEnabled,
 } from "../../llm/google/startup-probe-policy"
+import { KiroService } from "../../llm/aws/kiro.service"
+import type { CodexForwardHeaders } from "../../llm/openai/codex-header-utils"
+import { CodexService } from "../../llm/openai/codex.service"
+import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
+import { BackendApiError } from "../../llm/shared/backend-errors"
 import {
   canPublicClaudeModelUseGoogle,
+  canPublicClaudeModelUseKiro,
   getCodexPublicModelIds,
   getPublicModelMetadata,
   resolveCloudCodeModel,
@@ -27,8 +31,6 @@ import {
   ModelRouteResult,
   ModelRouterService,
 } from "../../llm/shared/model-router.service"
-import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
-import { BackendApiError } from "../../llm/shared/backend-errors"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import { CountTokensDto } from "./dto/count-tokens.dto"
 import { CreateMessageDto } from "./dto/create-message.dto"
@@ -68,7 +70,8 @@ export class MessagesService implements OnModuleInit {
     private readonly contextManager: ContextManagerService,
     private readonly codexService: CodexService,
     private readonly openaiCompatService: OpenaiCompatService,
-    private readonly anthropicApiService: AnthropicApiService
+    private readonly anthropicApiService: AnthropicApiService,
+    private readonly kiroService: KiroService
   ) {}
 
   private isGptBackendAvailable(): boolean {
@@ -110,7 +113,8 @@ export class MessagesService implements OnModuleInit {
       () => this.resolveStartupGoogleAvailability(),
       () => this.codexService.checkAvailability(),
       () => this.openaiCompatService.checkAvailability(),
-      () => this.anthropicApiService.checkAvailability()
+      () => this.anthropicApiService.checkAvailability(),
+      () => this.kiroService.checkAvailability()
     )
     this.modelRouter.setGptAvailabilityProviders({
       codex: () => this.codexService.isAvailable(),
@@ -120,6 +124,9 @@ export class MessagesService implements OnModuleInit {
     })
     this.modelRouter.setClaudeAvailabilityProvider((model) =>
       this.anthropicApiService.supportsModel(model)
+    )
+    this.modelRouter.setKiroAvailabilityProvider((model) =>
+      this.kiroService.supportsModel(model)
     )
     this.logger.log("Backend availability tests completed")
   }
@@ -274,6 +281,13 @@ export class MessagesService implements OnModuleInit {
       return (
         this.anthropicApiService.getConfiguredMaxContextTokens(route.model) ??
         DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS
+      )
+    }
+    if (route.backend === "kiro") {
+      return (
+        this.kiroService.getConfiguredMaxContextTokens(route.model) ??
+        // Kiro defaults to a 1M window for Sonnet/Opus 4.6 family.
+        1_000_000
       )
     }
     if (route.backend === "openai-compat") {
@@ -458,6 +472,11 @@ export class MessagesService implements OnModuleInit {
         )
       }
 
+      if (route.backend === "kiro") {
+        this.logger.log(`[ROUTE] Kiro backend | model: ${route.model}`)
+        return await this.kiroService.sendClaudeMessage(routedDto)
+      }
+
       if (route.backend === "openai-compat") {
         this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
         return await this.openaiCompatService.sendClaudeMessage(routedDto)
@@ -561,6 +580,21 @@ export class MessagesService implements OnModuleInit {
         for await (const event of this.anthropicApiService.sendClaudeMessageStream(
           routedDto,
           forwardHeaders
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        return
+      }
+
+      if (route.backend === "kiro") {
+        this.logger.log(
+          `[ROUTE] Kiro backend | model: ${route.model} | stream: true`
+        )
+        for await (const event of this.kiroService.sendClaudeMessageStream(
+          routedDto
         )) {
           yield* handleEvent(event)
         }
@@ -829,6 +863,12 @@ export class MessagesService implements OnModuleInit {
         this.googleModelCache.isValidModel(resolved.cloudCodeId)
       )
     }
+    const canRouteViaKiro = (modelId: string): boolean => {
+      if (!this.modelRouter.isKiroAvailable) {
+        return false
+      }
+      return canPublicClaudeModelUseKiro(modelId)
+    }
     const isModelAdvertisable = (modelId: string): boolean => {
       const resolved = resolveCloudCodeModel(modelId)
       if (!resolved) {
@@ -849,7 +889,8 @@ export class MessagesService implements OnModuleInit {
 
       return (
         this.anthropicApiService.supportsModel(modelId) ||
-        canRouteViaGoogle(modelId)
+        canRouteViaGoogle(modelId) ||
+        canRouteViaKiro(modelId)
       )
     }
     const modelMap = new Map<
@@ -928,6 +969,15 @@ export class MessagesService implements OnModuleInit {
     for (const modelId of compatibilityModels) {
       if (isModelAdvertisable(modelId)) {
         addModel(modelId)
+      }
+    }
+
+    // Kiro-only Claude models (e.g. Haiku 4.5 / Opus 4.7) when Kiro is enabled.
+    if (this.modelRouter.isKiroAvailable) {
+      for (const modelId of this.kiroService.getPublicModelIds()) {
+        if (canPublicClaudeModelUseKiro(modelId)) {
+          addModel(modelId, "anthropic")
+        }
       }
     }
 

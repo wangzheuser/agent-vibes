@@ -154,9 +154,13 @@ if (command === "cert") {
     if (process.platform === "darwin") {
       console.error("  Install with: brew install mkcert")
     } else if (process.platform === "win32") {
-      console.error("  Install with: choco install mkcert  (or scoop install mkcert)")
+      console.error(
+        "  Install with: choco install mkcert  (or scoop install mkcert)"
+      )
     } else {
-      console.error("  Install with: sudo apt install mkcert  (or see https://github.com/FiloSottile/mkcert)")
+      console.error(
+        "  Install with: sudo apt install mkcert  (or see https://github.com/FiloSottile/mkcert)"
+      )
     }
     process.exit(1)
   }
@@ -173,14 +177,18 @@ if (command === "cert") {
   if (!caInstalled) {
     console.log(`\n${CYAN}▸ Installing mkcert local CA...${NC}`)
   } else {
-    console.log(`\n${CYAN}▸ Ensuring mkcert local CA is installed in trust store...${NC}`)
+    console.log(
+      `\n${CYAN}▸ Ensuring mkcert local CA is installed in trust store...${NC}`
+    )
   }
   const installResult = spawnSync("mkcert", ["-install"], {
     stdio: "inherit",
     encoding: "utf-8",
   })
   if (installResult.status !== 0) {
-    console.error(`${RED}✗ mkcert -install failed. You may need to run it manually.${NC}`)
+    console.error(
+      `${RED}✗ mkcert -install failed. You may need to run it manually.${NC}`
+    )
   }
 
   // ── Step 2: macOS — Verify & remediate CA trust in System Keychain ──
@@ -188,29 +196,50 @@ if (command === "cert") {
     console.log(`\n${CYAN}▸ Verifying CA trust in macOS Keychain...${NC}`)
 
     // Check if CA is trusted using security verify-cert
-    const verifyResult = spawnSync("security", ["verify-cert", "-c", caRootPem], {
-      encoding: "utf-8",
-      stdio: "pipe",
-    })
+    const verifyResult = spawnSync(
+      "security",
+      ["verify-cert", "-c", caRootPem],
+      {
+        encoding: "utf-8",
+        stdio: "pipe",
+      }
+    )
 
     if (verifyResult.status !== 0) {
-      console.log(`${YELLOW}⚠ CA not fully trusted by macOS. Attempting to fix...${NC}`)
+      console.log(
+        `${YELLOW}⚠ CA not fully trusted by macOS. Attempting to fix...${NC}`
+      )
 
       // Try to add to System keychain with explicit trust
-      const addResult = spawnSync("sudo", [
-        "security", "add-trusted-cert",
-        "-d",             // admin trust domain
-        "-r", "trustRoot",
-        "-k", "/Library/Keychains/System.keychain",
-        caRootPem,
-      ], { stdio: "inherit" })
+      const addResult = spawnSync(
+        "sudo",
+        [
+          "security",
+          "add-trusted-cert",
+          "-d", // admin trust domain
+          "-r",
+          "trustRoot",
+          "-k",
+          "/Library/Keychains/System.keychain",
+          caRootPem,
+        ],
+        { stdio: "inherit" }
+      )
 
       if (addResult.status === 0) {
-        console.log(`${GREEN}✓${NC} CA added to System Keychain as trusted root`)
+        console.log(
+          `${GREEN}✓${NC} CA added to System Keychain as trusted root`
+        )
       } else {
-        console.log(`${YELLOW}⚠ Automatic trust failed (macOS Sonoma+ may require manual approval).${NC}`)
-        console.log(`  Please open Keychain Access, find "mkcert" in System keychain,`)
-        console.log(`  double-click → Trust → set "When using this certificate" to "Always Trust"`)
+        console.log(
+          `${YELLOW}⚠ Automatic trust failed (macOS Sonoma+ may require manual approval).${NC}`
+        )
+        console.log(
+          `  Please open Keychain Access, find "mkcert" in System keychain,`
+        )
+        console.log(
+          `  double-click → Trust → set "When using this certificate" to "Always Trust"`
+        )
       }
     } else {
       console.log(`${GREEN}✓${NC} CA is trusted by macOS`)
@@ -278,27 +307,35 @@ if (command === "cert") {
   // Electron's Node.js layer (Extension Host, gRPC client) does NOT read
   // macOS System Keychain. It needs NODE_EXTRA_CA_CERTS to trust mkcert CA.
   if (fs.existsSync(caRootPem)) {
-    console.log(`\n${CYAN}▸ Configuring NODE_EXTRA_CA_CERTS for Cursor (Electron/Node.js)...${NC}`)
+    console.log(
+      `\n${CYAN}▸ Configuring NODE_EXTRA_CA_CERTS for Cursor (Electron/Node.js)...${NC}`
+    )
 
     const exportLine = `export NODE_EXTRA_CA_CERTS="${caRootPem}"`
     let configured = false
 
     // Detect shell profile
     const home = process.env.HOME || process.env.USERPROFILE || ""
-    const shellProfiles = process.platform === "win32"
-      ? [] // Windows: handled separately
-      : [
-          path.join(home, ".zshrc"),
-          path.join(home, ".bashrc"),
-          path.join(home, ".bash_profile"),
-        ]
+    const shellProfiles =
+      process.platform === "win32"
+        ? [] // Windows: handled separately
+        : [
+            path.join(home, ".zshrc"),
+            path.join(home, ".bashrc"),
+            path.join(home, ".bash_profile"),
+          ]
 
     for (const profile of shellProfiles) {
       if (!fs.existsSync(profile)) continue
 
       const content = fs.readFileSync(profile, "utf-8")
-      if (content.includes("NODE_EXTRA_CA_CERTS") && content.includes(caRootPem)) {
-        console.log(`${GREEN}✓${NC} NODE_EXTRA_CA_CERTS already configured in ${path.basename(profile)}`)
+      if (
+        content.includes("NODE_EXTRA_CA_CERTS") &&
+        content.includes(caRootPem)
+      ) {
+        console.log(
+          `${GREEN}✓${NC} NODE_EXTRA_CA_CERTS already configured in ${path.basename(profile)}`
+        )
         configured = true
         break
       }
@@ -317,22 +354,32 @@ if (command === "cert") {
         if (content.includes(marker)) {
           // Replace existing block
           const updated = content.replace(
-            new RegExp(`\n${marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[^\\n]*\\n`),
+            new RegExp(
+              `\n${marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[^\\n]*\\n`
+            ),
             block
           )
           fs.writeFileSync(targetProfile, updated)
         } else {
           fs.appendFileSync(targetProfile, block)
         }
-        console.log(`${GREEN}✓${NC} Added NODE_EXTRA_CA_CERTS to ${path.basename(targetProfile)}`)
-        console.log(`  ${DIM}Run: source ~/${path.basename(targetProfile)}${NC}`)
+        console.log(
+          `${GREEN}✓${NC} Added NODE_EXTRA_CA_CERTS to ${path.basename(targetProfile)}`
+        )
+        console.log(
+          `  ${DIM}Run: source ~/${path.basename(targetProfile)}${NC}`
+        )
       } else if (process.platform !== "win32") {
-        console.log(`${YELLOW}⚠${NC} Could not find shell profile. Please add manually:`)
+        console.log(
+          `${YELLOW}⚠${NC} Could not find shell profile. Please add manually:`
+        )
         console.log(`  ${exportLine}`)
       }
 
       if (process.platform === "win32") {
-        console.log(`${YELLOW}▸${NC} Windows: Set environment variable manually:`)
+        console.log(
+          `${YELLOW}▸${NC} Windows: Set environment variable manually:`
+        )
         console.log(`  setx NODE_EXTRA_CA_CERTS "${caRootPem}"`)
       }
     }
@@ -347,41 +394,71 @@ if (command === "cert") {
 
   console.log(`\n${CYAN}═══ Certificate Setup Summary ═══${NC}`)
   console.log(`  CA Root:     ${GREEN}${caRootPem}${NC}`)
-  console.log(`  Certificate: ${fs.existsSync(certFile) ? GREEN + "✓" : RED + "✗"} ${certFile}${NC}`)
-  console.log(`  Key:         ${fs.existsSync(keyFile) ? GREEN + "✓" : RED + "✗"} ${keyFile}${NC}`)
+  console.log(
+    `  Certificate: ${fs.existsSync(certFile) ? GREEN + "✓" : RED + "✗"} ${certFile}${NC}`
+  )
+  console.log(
+    `  Key:         ${fs.existsSync(keyFile) ? GREEN + "✓" : RED + "✗"} ${keyFile}${NC}`
+  )
 
   // Verify cert matches key
   if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
-    const certMod = spawnSync("openssl", ["x509", "-noout", "-modulus", "-in", certFile], {
-      encoding: "utf-8", stdio: "pipe",
-    })
-    const keyMod = spawnSync("openssl", ["rsa", "-noout", "-modulus", "-in", keyFile], {
-      encoding: "utf-8", stdio: "pipe",
-    })
-    if (certMod.stdout && keyMod.stdout && certMod.stdout.trim() === keyMod.stdout.trim()) {
+    const certMod = spawnSync(
+      "openssl",
+      ["x509", "-noout", "-modulus", "-in", certFile],
+      {
+        encoding: "utf-8",
+        stdio: "pipe",
+      }
+    )
+    const keyMod = spawnSync(
+      "openssl",
+      ["rsa", "-noout", "-modulus", "-in", keyFile],
+      {
+        encoding: "utf-8",
+        stdio: "pipe",
+      }
+    )
+    if (
+      certMod.stdout &&
+      keyMod.stdout &&
+      certMod.stdout.trim() === keyMod.stdout.trim()
+    ) {
       console.log(`  Key Match:   ${GREEN}✓${NC} certificate and key match`)
     } else {
-      console.log(`  Key Match:   ${RED}✗${NC} certificate and key DO NOT match!`)
+      console.log(
+        `  Key Match:   ${RED}✗${NC} certificate and key DO NOT match!`
+      )
     }
 
     // Verify cert chain against CA
-    const chainResult = spawnSync("openssl", [
-      "verify", "-CAfile", caRootPem, certFile,
-    ], { encoding: "utf-8", stdio: "pipe" })
+    const chainResult = spawnSync(
+      "openssl",
+      ["verify", "-CAfile", caRootPem, certFile],
+      { encoding: "utf-8", stdio: "pipe" }
+    )
     if (chainResult.status === 0) {
       console.log(`  Chain:       ${GREEN}✓${NC} certificate chain is valid`)
     } else {
-      console.log(`  Chain:       ${RED}✗${NC} certificate chain verification failed`)
+      console.log(
+        `  Chain:       ${RED}✗${NC} certificate chain verification failed`
+      )
       console.log(`  ${DIM}${(chainResult.stderr || "").trim()}${NC}`)
     }
   }
 
   console.log("")
   if (process.platform === "darwin") {
-    console.log(`${YELLOW}Important:${NC} After running this command, ${YELLOW}fully quit and restart Cursor${NC}`)
-    console.log(`(Cmd+Q, not just close window) for the certificate changes to take effect.`)
+    console.log(
+      `${YELLOW}Important:${NC} After running this command, ${YELLOW}fully quit and restart Cursor${NC}`
+    )
+    console.log(
+      `(Cmd+Q, not just close window) for the certificate changes to take effect.`
+    )
   } else {
-    console.log(`${YELLOW}Important:${NC} Restart Cursor for the certificate changes to take effect.`)
+    console.log(
+      `${YELLOW}Important:${NC} Restart Cursor for the certificate changes to take effect.`
+    )
   }
   console.log("")
 
@@ -404,22 +481,28 @@ if (command === "forward") {
       // Windows: node script checks for admin internally
       nodeScript("scripts/proxy/setup-forwarding.js", [subCmd])
     } else {
-      run("sudo", [process.execPath, path.join(ROOT, "scripts/proxy/setup-forwarding.js"), subCmd])
+      run("sudo", [
+        process.execPath,
+        path.join(ROOT, "scripts/proxy/setup-forwarding.js"),
+        subCmd,
+      ])
     }
   } else {
     nodeScript("scripts/proxy/setup-forwarding.js", [subCmd])
   }
 }
 
-
-
 if (command === "capture") {
   const subCmd = args[1] || "status"
   if (process.platform === "win32") {
     // Windows: no sudo, scripts check elevation internally
-    nodeScript("scripts/capture/capture.js", [subCmd])
+    nodeScript("scripts/capture/capture-google.js", [subCmd])
   } else {
-    run("sudo", [process.execPath, path.join(ROOT, "scripts/capture/capture.js"), subCmd])
+    run("sudo", [
+      process.execPath,
+      path.join(ROOT, "scripts/capture/capture-google.js"),
+      subCmd,
+    ])
   }
 }
 

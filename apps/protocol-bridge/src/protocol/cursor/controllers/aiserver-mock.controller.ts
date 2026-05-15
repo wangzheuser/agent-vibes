@@ -29,13 +29,13 @@ import {
   AvailableModelsScope,
   BootstrapStatsigRequestSchema,
   BootstrapStatsigResponseSchema,
-  CheckUsageBasedPriceResponseSchema,
   CheckFeatureStatusRequestSchema,
   CheckFeatureStatusResponseSchema,
   CheckFeaturesStatusRequestSchema,
   CheckFeaturesStatusResponseSchema,
   CheckFeaturesStatusResponse_FeatureStatusSchema,
   CheckQueuePositionResponseSchema,
+  CheckUsageBasedPriceResponseSchema,
   FindBugsResponseSchema,
   GetCloudSetupBlockersResponseSchema,
   GetCurrentPeriodUsageResponseSchema,
@@ -73,16 +73,18 @@ import {
 import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.service"
 import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../../llm/google/google.service"
+import { KiroService } from "../../../llm/aws/kiro.service"
 import { CodexService } from "../../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
-import { parseModelRequest } from "../../../llm/shared/model-request"
 import {
   DEFAULT_GEMINI_MODEL,
   canPublicClaudeModelUseGoogle,
   getCursorDisplayModels,
   resolveCloudCodeModel,
 } from "../../../llm/shared/model-registry"
+import { parseModelRequest } from "../../../llm/shared/model-request"
 import { ModelRouterService } from "../../../llm/shared/model-router.service"
+import { connectRPCHandler } from "../connect-rpc-handler"
 import {
   appendRequestedCursorModels,
   buildCursorAvailableModel,
@@ -94,7 +96,6 @@ import {
   selectPreferredCursorModelName,
 } from "../cursor-model-protocol"
 import { KnowledgeBaseService } from "../knowledge-base.service"
-import { connectRPCHandler } from "../connect-rpc-handler"
 
 const ENABLED_CURSOR_FEATURES = new Set<string>([
   "react_shell_tool",
@@ -258,6 +259,7 @@ export class AiserverMockController {
     private readonly googleModelCache: GoogleModelCacheService,
     private readonly codexService: CodexService,
     private readonly anthropicApiService: AnthropicApiService,
+    private readonly kiroService: KiroService,
     private readonly modelRouter: ModelRouterService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly knowledgeBaseService: KnowledgeBaseService
@@ -280,6 +282,11 @@ export class AiserverMockController {
   }
 
   private isCursorModelCurrentlyRoutable(modelId: string): boolean {
+    // Kiro dynamically discovered models are always routable when Kiro is available.
+    if (this.kiroService.supportsModel(modelId)) {
+      return true
+    }
+
     const resolved = resolveCloudCodeModel(modelId)
     if (!resolved) {
       return this.anthropicApiService.supportsModel(modelId)

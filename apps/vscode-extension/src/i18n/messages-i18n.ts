@@ -79,6 +79,7 @@ const EN: Record<string, string> = {
   "file.openOpenAICompatFailed":
     "Open OpenAI-compatible accounts file failed: {message}",
   "file.openClaudeApiFailed": "Open Claude API accounts file failed: {message}",
+  "file.openKiroFailed": "Open Kiro accounts file failed: {message}",
   "file.openAccountFailed": "Failed to open account file",
 
   // ── SSL certificates / CA trust ──
@@ -202,6 +203,7 @@ const ZH: Record<string, string> = {
   // ── File access ──
   "file.openOpenAICompatFailed": "打开 OpenAI 兼容账号文件失败：{message}",
   "file.openClaudeApiFailed": "打开 Claude API 账号文件失败：{message}",
+  "file.openKiroFailed": "打开 Kiro 账号文件失败：{message}",
   "file.openAccountFailed": "打开账号文件失败",
 
   // ── SSL certificates / CA trust ──

@@ -115,7 +115,8 @@ export async function activate(
     config.getAccountCount(config.antigravityAccountsPath) > 0 ||
     config.getAccountCount(config.claudeApiAccountsPath) > 0 ||
     config.getAccountCount(config.codexAccountsPath) > 0 ||
-    config.getAccountCount(config.openaiCompatAccountsPath) > 0
+    config.getAccountCount(config.openaiCompatAccountsPath) > 0 ||
+    config.getAccountCount(config.kiroAccountsPath) > 0
 
   if (needsCerts || !hasAnyAccounts) {
     const missing: string[] = []

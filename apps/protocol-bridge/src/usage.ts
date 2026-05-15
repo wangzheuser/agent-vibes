@@ -7,7 +7,12 @@ import {
 } from "@nestjs/common"
 import { PersistenceService } from "./persistence"
 
-export type UsageBackend = "codex" | "google" | "openai-compat" | "claude-api"
+export type UsageBackend =
+  | "codex"
+  | "google"
+  | "openai-compat"
+  | "claude-api"
+  | "kiro"
 
 export type UsageTransport = string
 
@@ -196,6 +201,7 @@ const BACKEND_LABELS: Record<UsageBackend, string> = {
   google: "Antigravity",
   "openai-compat": "OpenAI-Compatible",
   "claude-api": "Claude API",
+  kiro: "Kiro",
 }
 
 const TRACKED_BACKENDS = Object.keys(BACKEND_LABELS) as UsageBackend[]
@@ -271,6 +277,23 @@ export class UsageStatsService implements OnModuleInit {
   recordClaudeApiUsage(record: BackendUsageRecord): void {
     this.recordUsage({
       backend: "claude-api",
+      transport: record.transport,
+      modelName: record.modelName,
+      accountKey: record.accountKey,
+      accountLabel: record.accountLabel,
+      inputTokens: record.inputTokens,
+      cachedInputTokens: record.cachedInputTokens,
+      cacheCreationInputTokens: record.cacheCreationInputTokens,
+      outputTokens: record.outputTokens,
+      webSearchRequests: record.webSearchRequests,
+      durationMs: record.durationMs,
+      recordedAt: record.recordedAt,
+    })
+  }
+
+  recordKiroUsage(record: BackendUsageRecord): void {
+    this.recordUsage({
+      backend: "kiro",
       transport: record.transport,
       modelName: record.modelName,
       accountKey: record.accountKey,
@@ -653,6 +676,7 @@ export class UsageStatsService implements OnModuleInit {
       google: this.createBackendState(),
       "openai-compat": this.createBackendState(),
       "claude-api": this.createBackendState(),
+      kiro: this.createBackendState(),
     }
   }
 

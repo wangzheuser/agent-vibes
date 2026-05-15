@@ -3,6 +3,7 @@ import { ApiOperation, ApiTags } from "@nestjs/swagger"
 import { AnthropicApiService } from "./llm/anthropic/anthropic-api.service"
 import type { GoogleQuotaAccountSnapshot } from "./llm/google/process-pool.service"
 import { ProcessPoolService } from "./llm/google/process-pool.service"
+import { KiroService } from "./llm/aws/kiro.service"
 import { CodexService } from "./llm/openai/codex.service"
 import { OpenaiCompatService } from "./llm/openai/openai-compat.service"
 import type {
@@ -62,6 +63,7 @@ export class HealthController {
     private readonly codexService: CodexService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly anthropicApiService: AnthropicApiService,
+    private readonly kiroService: KiroService,
     private readonly usageStats: UsageStatsService,
     private readonly chatSessions: ChatSessionManager
   ) {}
@@ -108,6 +110,7 @@ export class HealthController {
         claudeApi: this.redactBackendPoolStatus(
           this.anthropicApiService.getPoolStatus()
         ),
+        kiro: this.redactBackendPoolStatus(this.kiroService.getPoolStatus()),
       },
     }
   }
@@ -239,6 +242,17 @@ export class HealthController {
   @ApiOperation({ summary: "Get daily token usage for heatmap calendar" })
   getDailyUsage() {
     return this.usageStats.getDailyUsage()
+  }
+
+  @Get("quota/kiro")
+  @ApiOperation({ summary: "Get Kiro per-account usage and subscription info" })
+  async getKiroQuotaStatus() {
+    const accounts = await this.kiroService.getQuotaSnapshots()
+    return {
+      timestamp: new Date().toISOString(),
+      totalAccounts: accounts.length,
+      accounts,
+    }
   }
 
   @Get("quota/codex")

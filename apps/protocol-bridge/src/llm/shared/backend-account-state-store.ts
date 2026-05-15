@@ -4,6 +4,7 @@ export type BackendAccountStateNamespace =
   | "claude-api"
   | "openai-compat"
   | "codex"
+  | "kiro"
 
 export interface PersistedBackendAccountModelState {
   model: string

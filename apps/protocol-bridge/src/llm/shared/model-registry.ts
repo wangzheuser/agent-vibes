@@ -150,6 +150,33 @@ const CLAUDE_MODELS: Record<
   string,
   Omit<ModelEntry, "family" | "isClaudeThroughGoogle">
 > = {
+  // --- Opus 4.7 ---
+  "claude-opus-4-7": {
+    cloudCodeId: "claude-opus-4-7-thinking",
+    displayName: "Claude Opus 4.7",
+    isThinking: false,
+  },
+  "claude-opus-4.7": {
+    cloudCodeId: "claude-opus-4-7-thinking",
+    displayName: "Claude Opus 4.7",
+    isThinking: false,
+  },
+  "claude-opus-4-7-thinking": {
+    cloudCodeId: "claude-opus-4-7-thinking",
+    displayName: "Claude Opus 4.7 Thinking",
+    isThinking: true,
+  },
+  "claude-4.7-opus": {
+    cloudCodeId: "claude-opus-4-7-thinking",
+    displayName: "Claude Opus 4.7",
+    isThinking: true,
+  },
+  "claude-4.7-opus-thinking": {
+    cloudCodeId: "claude-opus-4-7-thinking",
+    displayName: "Claude Opus 4.7 Thinking",
+    isThinking: true,
+  },
+
   // --- Opus 4.6 (latest) ---
   "claude-opus-4-6": {
     cloudCodeId: "claude-opus-4-6-thinking",
@@ -221,12 +248,12 @@ const CLAUDE_MODELS: Record<
 
   // --- Generic Opus (resolve to latest) ---
   "claude-opus-4": {
-    cloudCodeId: "claude-opus-4-6-thinking",
+    cloudCodeId: "claude-opus-4-7-thinking",
     displayName: "Claude Opus 4",
     isThinking: true,
   },
   "claude-4-opus": {
-    cloudCodeId: "claude-opus-4-6-thinking",
+    cloudCodeId: "claude-opus-4-7-thinking",
     displayName: "Claude Opus 4",
     isThinking: true,
   },
@@ -1013,6 +1040,20 @@ export const GEMINI_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
 
 export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   {
+    name: "claude-opus-4-7",
+    displayName: "Claude Opus 4.7",
+    shortName: "Opus 4.7",
+    family: "claude",
+    isThinking: false,
+  },
+  {
+    name: "claude-opus-4-7-thinking",
+    displayName: "Claude Opus 4.7 (Thinking)",
+    shortName: "Opus 4.7 Thinking",
+    family: "claude",
+    isThinking: true,
+  },
+  {
     name: "claude-opus-4-6",
     displayName: "Claude Opus 4.6",
     shortName: "Opus 4.6",
@@ -1245,6 +1286,25 @@ export function canPublicClaudeModelUseGoogle(modelId: string): boolean {
     normalized.includes("sonnet") ||
     !!resolveModelThinkingCapability(normalized) ||
     !resolved.cloudCodeId.includes("thinking")
+  )
+}
+
+/**
+ * Determine whether a Claude public model ID can be served by the Kiro backend
+ * (AWS CodeWhisperer / Q). Kiro currently exposes Sonnet, Opus, and Haiku
+ * variants via Anthropic's branded model IDs.
+ */
+export function canPublicClaudeModelUseKiro(modelId: string): boolean {
+  const normalized = parseModelRequest(modelId).normalizedBaseModel
+  const resolved = resolveCloudCodeModel(normalized)
+  if (!resolved || resolved.family !== "claude") {
+    return false
+  }
+
+  return (
+    normalized.includes("sonnet") ||
+    normalized.includes("opus") ||
+    normalized.includes("haiku")
   )
 }
 

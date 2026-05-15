@@ -211,7 +211,6 @@ export interface SessionTopLevelContinuationBudget {
 export interface SessionTopLevelMutationBarrier {
   mutatingBatchCount: number
   verificationReadOnlyBatchCount: number
-  sameFileEditCounts: Record<string, number>
   lastEditedPaths: string[]
 }
 
@@ -219,7 +218,6 @@ export interface SessionTopLevelAgentTurnState {
   llmTurnCount: number
   readOnlyBatchCount: number
   hasMutatingToolCall: boolean
-  forcedSynthesisAttempted: boolean
   lastReadOnlyContinuationHistoryTokens?: number
   stalledReadOnlyContinuationCount: number
   continuationBudget: SessionTopLevelContinuationBudget
@@ -414,6 +412,13 @@ export interface PendingToolCall {
   editFailureContext?: EditFailureContext
   beforeContent?: string // File content before edit (for edit tools)
   afterContent?: string // File content after edit (computed from applyEditInputToFileText)
+  /**
+   * 释放 path-level edit mutex 的回调（仅 edit_file_v2 类工具持有）。
+   * 在 detachPendingToolCall 中统一调用，保证 consume / clear / 异常路径
+   * 都能释放锁，避免死锁。设计动机见 cursor-connect-stream.service.ts
+   * `acquireEditPathLock` 的注释。
+   */
+  editPathLockRelease?: () => void
   // Which BiDi stream this tool call was dispatched on
   streamId: string
   // Shell stream accumulation (for streaming shell output)
@@ -646,7 +651,6 @@ interface PersistedTopLevelAgentTurnState {
   llmTurnCount: number
   readOnlyBatchCount: number
   hasMutatingToolCall: boolean
-  forcedSynthesisAttempted: boolean
   lastReadOnlyContinuationHistoryTokens?: number
   stalledReadOnlyContinuationCount: number
   continuationBudget?: SessionTopLevelContinuationBudget
@@ -946,7 +950,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       llmTurnCount: 1,
       readOnlyBatchCount: 0,
       hasMutatingToolCall: false,
-      forcedSynthesisAttempted: false,
       stalledReadOnlyContinuationCount: 0,
       continuationBudget: {
         continuationCount: 0,
@@ -957,7 +960,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       mutationBarrier: {
         mutatingBatchCount: 0,
         verificationReadOnlyBatchCount: 0,
-        sameFileEditCounts: {},
         lastEditedPaths: [],
       },
     }
@@ -1180,8 +1182,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         llmTurnCount: session.topLevelAgentTurnState.llmTurnCount,
         readOnlyBatchCount: session.topLevelAgentTurnState.readOnlyBatchCount,
         hasMutatingToolCall: session.topLevelAgentTurnState.hasMutatingToolCall,
-        forcedSynthesisAttempted:
-          session.topLevelAgentTurnState.forcedSynthesisAttempted,
         lastReadOnlyContinuationHistoryTokens:
           session.topLevelAgentTurnState.lastReadOnlyContinuationHistoryTokens,
         stalledReadOnlyContinuationCount:
@@ -1202,10 +1202,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           verificationReadOnlyBatchCount:
             session.topLevelAgentTurnState.mutationBarrier
               .verificationReadOnlyBatchCount,
-          sameFileEditCounts: {
-            ...session.topLevelAgentTurnState.mutationBarrier
-              .sameFileEditCounts,
-          },
           lastEditedPaths: [
             ...session.topLevelAgentTurnState.mutationBarrier.lastEditedPaths,
           ],
@@ -1843,8 +1839,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
               : 0,
           hasMutatingToolCall:
             persisted.topLevelAgentTurnState.hasMutatingToolCall === true,
-          forcedSynthesisAttempted:
-            persisted.topLevelAgentTurnState.forcedSynthesisAttempted === true,
           lastReadOnlyContinuationHistoryTokens:
             typeof persisted.topLevelAgentTurnState
               .lastReadOnlyContinuationHistoryTokens === "number" &&
@@ -1933,29 +1927,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
                       ? persisted.topLevelAgentTurnState.mutationBarrier
                           .verificationReadOnlyBatchCount
                       : 0,
-                  sameFileEditCounts:
-                    persisted.topLevelAgentTurnState.mutationBarrier
-                      .sameFileEditCounts &&
-                    typeof persisted.topLevelAgentTurnState.mutationBarrier
-                      .sameFileEditCounts === "object" &&
-                    !Array.isArray(
-                      persisted.topLevelAgentTurnState.mutationBarrier
-                        .sameFileEditCounts
-                    )
-                      ? Object.fromEntries(
-                          Object.entries(
-                            persisted.topLevelAgentTurnState.mutationBarrier
-                              .sameFileEditCounts
-                          ).map(([path, count]) => [
-                            path,
-                            typeof count === "number" &&
-                            Number.isFinite(count) &&
-                            count > 0
-                              ? Math.floor(count)
-                              : 0,
-                          ])
-                        )
-                      : {},
                   lastEditedPaths: Array.isArray(
                     persisted.topLevelAgentTurnState.mutationBarrier
                       .lastEditedPaths
@@ -1971,7 +1942,6 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
               : {
                   mutatingBatchCount: 0,
                   verificationReadOnlyBatchCount: 0,
-                  sameFileEditCounts: {},
                   lastEditedPaths: [],
                 },
           activeToolBatch: persisted.topLevelAgentTurnState.activeToolBatch
@@ -2263,7 +2233,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     )
     const contextState = this.createContextState(messageRecords)
 
-    return {
+    const freshSession: ChatSession = {
       conversationId,
       messages: initialMessages,
       messageRecords,
@@ -2321,6 +2291,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       restartRecovery: undefined,
       activeAssistantToolBatch: undefined,
     }
+    this.logMcpAdvisoryIfMissing(freshSession, "fresh_session")
+    return freshSession
   }
 
   /**
@@ -2331,6 +2303,39 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     if (!session) return false
     session.lastActivityAt = new Date()
     return true
+  }
+
+  /**
+   * Emit an advisory log when a session has no MCP tool definitions attached.
+   * `mcp_*` user-facing tools (`mcp_tool` / `list_mcp_resources` /
+   * `read_mcp_resource` / `mcp_auth`) all rely on at least one MCP server being
+   * configured upstream by the Cursor / Claude Code client. When none are
+   * declared, those tools will reliably return `unavailable` — so we surface
+   * a one-shot debug hint pointing at the user's MCP config rather than
+   * leaving smoke / regression runs to silently misdiagnose this as a bridge
+   * failure. The log is per-session-state, so it never spams.
+   */
+  private mcpAdvisoryEmitted = new WeakSet<ChatSession>()
+  private logMcpAdvisoryIfMissing(
+    session: ChatSession,
+    reason: "fresh_session" | "session_reuse"
+  ): void {
+    const defs = session.mcpToolDefs
+    if (Array.isArray(defs) && defs.length > 0) {
+      // Definitions present — drop any earlier advisory so a future
+      // configuration-removed transition can re-log.
+      this.mcpAdvisoryEmitted.delete(session)
+      return
+    }
+    if (this.mcpAdvisoryEmitted.has(session)) return
+    this.mcpAdvisoryEmitted.add(session)
+    this.logger.warn(
+      `[mcp-advisory] conversation=${session.conversationId} ` +
+        `reason=${reason}: no MCP servers declared by client; ` +
+        "mcp_tool / list_mcp_resources / read_mcp_resource / mcp_auth will " +
+        "return unavailable. Configure MCP servers in the Cursor / Claude " +
+        "Code client (e.g. ~/.cursor/mcp.json) to enable them."
+    )
   }
 
   markSessionDirty(conversationId: string): boolean {
@@ -2403,6 +2408,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       if (initialRequest) {
         session.mcpToolDefs = initialRequest.mcpToolDefs
       }
+      this.logMcpAdvisoryIfMissing(session, "session_reuse")
       if (initialRequest?.useWeb !== undefined) {
         session.useWeb = initialRequest.useWeb
       }
@@ -3255,7 +3261,47 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     session.pendingToolCalls.delete(toolCallId)
     session.lastActivityAt = new Date()
 
+    // 释放 path-level edit mutex（若该工具持有）。统一在 detach 出口做，
+    // 保证 consume / clear / 异常路径都能 release，避免后续 edit 永久阻塞。
+    const release = toolCall.editPathLockRelease
+    if (release) {
+      toolCall.editPathLockRelease = undefined
+      try {
+        release()
+      } catch (err) {
+        this.logger.warn(
+          `Edit path lock release threw for ${toolCallId}: ${(err as Error).message}`
+        )
+      }
+    }
+
     return toolCall
+  }
+
+  /**
+   * 把 path-level edit mutex 的 release 回调挂到 pending tool call 上。
+   * 调用方（cursor-connect-stream.service）在 acquire lock 后立刻 attach；
+   * release 由 detachPendingToolCall 在 consume / clear / 异常路径统一执行。
+   *
+   * 如果 pending 已经不存在（极端竞态：tool 被提前清理），立即 release
+   * 防止 lock 泄漏。
+   */
+  attachEditPathLockRelease(
+    conversationId: string,
+    toolCallId: string,
+    release: () => void
+  ): void {
+    const session = this.getSession(conversationId)
+    const pending = session?.pendingToolCalls.get(toolCallId)
+    if (!pending) {
+      try {
+        release()
+      } catch {
+        // ignore — release 是同步且应当幂等
+      }
+      return
+    }
+    pending.editPathLockRelease = release
   }
 
   consumePendingToolCall(

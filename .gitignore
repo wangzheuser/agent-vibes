@@ -10,6 +10,10 @@ cursor.log
 .log/
 *.tsbuildinfo
 
+# Smoke / regression workspaces (must live outside the repo)
+.cursor-protocol-smoke/
+.agent-vibes-smoke/
+
 # Local environment files
 .env
 .env.*
@@ -30,8 +34,10 @@ scripts/cursor/
 backups/
 logs/codex-cases/
 scripts/capture/traffic_dumps/
+scripts/capture/kiro_traffic_dumps/
 scripts/capture/.clash-script-backup.js
 scripts/capture/antigravity_traffic.log
+scripts/capture/kiro_traffic.log
 
 # Runtime data
 *.pem

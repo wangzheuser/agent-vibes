@@ -42,6 +42,7 @@ import {
   AnthropicApiService,
   DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS,
 } from "../../llm/anthropic/anthropic-api.service"
+import { KiroService } from "../../llm/aws/kiro.service"
 import { GoogleService } from "../../llm/google/google.service"
 import { type CodexExecutionRequest } from "../../llm/openai/codex-request-builder"
 import { CodexService } from "../../llm/openai/codex.service"
@@ -457,15 +458,12 @@ interface PreparedToolInvocation {
 
 interface TopLevelContinuationDecision {
   adviseSynthesis: boolean
-  forceSynthesis: boolean
   historyTokens: number
   promptTokens: number
   availableHistoryBudgetTokens: number
   continuationCount: number
-  diminishingReturns: boolean
   consecutiveReadOnlyBatches: number
   verificationReadOnlyBatches: number
-  repeatedEditPaths: string[]
   reasons: string[]
 }
 
@@ -767,72 +765,10 @@ export class CursorConnectStreamService {
   ])
   private readonly GREP_RESULT_PREVIEW_MAX_LINES = 120
   private readonly TOP_LEVEL_AGENT_READONLY_ADVISORY_TURNS = 3
-  private readonly TOP_LEVEL_AGENT_READONLY_FORCE_TURNS = 5
   private readonly TOP_LEVEL_AGENT_READONLY_ADVISORY_WATERMARK = 0.72
-  private readonly TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK = 0.82
   private readonly TOP_LEVEL_AGENT_CONTINUATION_COMPLETION_THRESHOLD = 0.9
-  private readonly TOP_LEVEL_AGENT_CONTINUATION_DIMINISHING_DELTA_TOKENS = 500
-  private readonly TOP_LEVEL_AGENT_REPEAT_EDIT_FORCE_COUNT = 2
   private readonly TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT = 8
   private readonly TOOL_BATCH_SUMMARY_DETAILS_LIMIT = 6
-  private readonly TOP_LEVEL_FORCED_SYNTHESIS_BLOCKED_TOOL_NAMES = new Set([
-    "client_side_tool_v2_run_terminal_command_v2",
-    "client_side_tool_v2_background_composer_followup",
-    "client_side_tool_v2_create_diagram",
-    "client_side_tool_v2_fix_lints",
-    "client_side_tool_v2_generate_image",
-    "client_side_tool_v2_todo_read",
-    "client_side_tool_v2_todo_write",
-    "client_side_tool_v2_update_project",
-    "background_composer_followup",
-    "canvas_destroy",
-    "canvas_get_url",
-    "canvas_register",
-    "command_status",
-    "create_diagram",
-    "deep_search",
-    "exec_command",
-    "execute_hook",
-    "fetch_rules",
-    "file_search",
-    "fix_lints",
-    "force_background_shell",
-    "force_background_subagent",
-    "generate_image",
-    "get_mcp_tools",
-    "glob_search",
-    "go_to_definition",
-    "grep_search",
-    "knowledge_base",
-    "list_directory",
-    "list_mcp_resources",
-    "read_file",
-    "read_file_v2",
-    "read_lints",
-    "read_mcp_resource",
-    "read_project",
-    "read_semsearch_files",
-    "read_todos",
-    "request_context",
-    "run_command",
-    "run_terminal_command",
-    "run_terminal_command_v2",
-    "search_symbols",
-    "semantic_search",
-    "shell",
-    "subagent_await",
-    "todo_read",
-    "todo_write",
-    "truncated",
-    "truncated_tool_call",
-    "update_todos",
-    "update_project",
-    "web_fetch",
-    "web_search",
-    "write_shell_stdin",
-  ])
-  private readonly TOP_LEVEL_FORCED_SYNTHESIS_ALLOWED_DEFERRED_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
-    new Set<DeferredToolFamily>(["apply_agent_diff", "apply_patch", "reapply"])
   private readonly LEGACY_WEB_DOCUMENT_CHUNK_SIZE = 4_000
   private readonly MAX_LEGACY_WEB_DOCUMENTS_PER_CONVERSATION = 12
   private readonly EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT: ContextAttachmentSnapshot =
@@ -875,7 +811,8 @@ export class CursorConnectStreamService {
     private readonly semanticSearchProvider: SemanticSearchProviderService,
     private readonly tokenCounter: TokenCounterService,
     private readonly toolIntegrity: ToolIntegrityService,
-    private readonly knowledgeBaseService: KnowledgeBaseService
+    private readonly knowledgeBaseService: KnowledgeBaseService,
+    private readonly kiroService: KiroService
   ) {
     // Register provider adapter cleanup on session expiry/deletion.
     // This ensures provider resources (Codex WS connections, warmup caches) are released.
@@ -2050,6 +1987,18 @@ export class CursorConnectStreamService {
           options?.abortSignal
         )
       }
+      case "kiro": {
+        const routedDto = options?.buildDtoForRoute?.(route)
+        if (!routedDto) {
+          throw new Error(
+            `Missing DTO builder for backend ${route.backend} (${route.model})`
+          )
+        }
+        return this.kiroService.sendClaudeMessageStream(
+          routedDto,
+          options?.abortSignal
+        )
+      }
       case "openai-compat": {
         const routedDto = options?.buildDtoForRoute?.(route)
         if (!routedDto) {
@@ -2131,6 +2080,9 @@ export class CursorConnectStreamService {
         this.anthropicApiService.getConfiguredMaxContextTokens(model) ??
         DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS
       )
+    }
+    if (backend === "kiro" && model) {
+      return this.kiroService.getConfiguredMaxContextTokens(model) ?? 1_000_000
     }
     if (backend === "openai-compat") {
       return this.openaiCompatService.getConfiguredMaxContextTokens(model)
@@ -4334,7 +4286,10 @@ ${raw}
               typeof delta.thinking === "string" &&
               delta.thinking.length > 0
             ) {
-              yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
+              yield this.grpcService.createThinkingDeltaResponse(
+                delta.thinking,
+                session.model
+              )
             }
           } else if (delta?.type === "signature_delta") {
             this.setAssistantThinkingSignature(
@@ -8493,11 +8448,14 @@ ${raw}
     const inlineOnlyToolCase =
       this.grpcService.getProtocolInlineOnlyToolCase(toolName)
     if (inlineOnlyToolCase) {
-      return {
-        errorMessage:
-          `Tool "${toolName}" maps to ${inlineOnlyToolCase} and must stay inline; ` +
-          "exec hop is forbidden by agent.v1 protocol mapping",
-      }
+      // Inline-only tools must not be encoded as ExecServerMessage. Return an
+      // empty resolution so the deferred/inline tool path in
+      // buildPreparedToolInvocation -> runDeferredToolIfNeeded can take over.
+      // Returning an errorMessage here would short-circuit the deferred path
+      // and surface a hard "exec hop is forbidden" failure to the caller, even
+      // though the tool itself is perfectly callable through the inline
+      // InteractionQuery / inline tool-result channel.
+      return {}
     }
 
     if (this.grpcService.isExecDispatchableTool(toolName)) {
@@ -9560,6 +9518,95 @@ ${raw}
     }
   }
 
+  /**
+   * Dispatch a web_search query to the backend currently routing the session
+   * (or fall back to a configured Google search pool when the active backend
+   * cannot perform server-side search natively).
+   *
+   * Each backend has its own server-side web_search surface, reverse-engineered
+   * from the official client binaries:
+   *   - google / google-claude → Cloud Code grounded search (already available
+   *     via googleService.executeWebSearch())
+   *   - claude-api             → Anthropic /v1/messages with the
+   *     `web_search_20250305` server tool (anthropicApiService.executeWebSearch)
+   *   - codex / openai-compat  → OpenAI Responses API with the
+   *     `web_search` server tool (codexService.executeWebSearch)
+   *   - kiro                   → AWS CodeWhisperer Streaming generateAssistant
+   *     Response does not expose a server-side web_search tool. The Kiro
+   *     desktop client itself never executes any search logic. So when a Kiro
+   *     session asks for web_search we fall back to the configured Google
+   *     account pool — this is the only deterministic way to honour the
+   *     request without inventing a generic search provider.
+   */
+  private async dispatchWebSearchByBackend(
+    conversationId: string,
+    query: string
+  ): Promise<{
+    text: string
+    references: Array<{ title: string; url: string; chunk: string }>
+  }> {
+    const session = this.sessionManager.getSession(conversationId)
+    let backend: BackendType | undefined
+    if (session?.model) {
+      try {
+        backend = this.modelRouter.resolveModel(session.model).backend
+      } catch (error) {
+        this.logger.debug(
+          `[web_search] model router could not resolve backend for session ` +
+            `${conversationId} model=${session.model}: ` +
+            `${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
+
+    const tryGoogle = async () => {
+      if (!this.googleService.isLocallyConfigured()) {
+        throw new Error(
+          "Google Cloud Code backend is not configured; web_search " +
+            "fallback unavailable"
+        )
+      }
+      return this.googleService.executeWebSearch(query)
+    }
+
+    switch (backend) {
+      case "google":
+      case "google-claude":
+        return tryGoogle()
+
+      case "claude-api":
+        if (!this.anthropicApiService.isAvailable?.()) {
+          this.logger.warn(
+            "[web_search] claude-api backend is not available; falling back to Google"
+          )
+          return tryGoogle()
+        }
+        return this.anthropicApiService.executeWebSearch({ query })
+
+      case "codex":
+      case "openai-compat":
+        if (!this.codexService.isAvailable?.()) {
+          this.logger.warn(
+            "[web_search] codex backend is not available; falling back to Google"
+          )
+          return tryGoogle()
+        }
+        return this.codexService.executeWebSearch({ query })
+
+      case "kiro":
+        // CodeWhisperer Streaming has no server-side web_search; route to
+        // the Google account pool exactly like a Gemini session would.
+        this.logger.debug(
+          "[web_search] Kiro session detected; routing to Google account pool"
+        )
+        return tryGoogle()
+
+      default:
+        // Unknown / unrouted session — best-effort Google fallback.
+        return tryGoogle()
+    }
+  }
+
   private async executeInlineWebTool(
     conversationId: string,
     toolName: string,
@@ -9603,8 +9650,10 @@ ${raw}
         const effectiveQuery = domain
           ? `${normalizedQuery} site:${domain}`
           : normalizedQuery
-        const searchResult =
-          await this.googleService.executeWebSearch(effectiveQuery)
+        const searchResult = await this.dispatchWebSearchByBackend(
+          conversationId,
+          effectiveQuery
+        )
         const maxChars = 18_000
         const summary =
           searchResult.text.length > maxChars
@@ -14168,7 +14217,6 @@ ${raw}
       llmTurnCount: 1,
       readOnlyBatchCount: 0,
       hasMutatingToolCall: false,
-      forcedSynthesisAttempted: false,
       stalledReadOnlyContinuationCount: 0,
       continuationBudget: {
         continuationCount: 0,
@@ -14179,7 +14227,6 @@ ${raw}
       mutationBarrier: {
         mutatingBatchCount: 0,
         verificationReadOnlyBatchCount: 0,
-        sameFileEditCounts: {},
         lastEditedPaths: [],
       },
     }
@@ -14290,10 +14337,6 @@ ${raw}
         state.mutationBarrier.mutatingBatchCount += 1
         state.mutationBarrier.lastEditedPaths = uniquePaths
         this.resetMutationVerificationBarrier(state)
-        for (const editedPath of uniquePaths) {
-          state.mutationBarrier.sameFileEditCounts[editedPath] =
-            (state.mutationBarrier.sameFileEditCounts[editedPath] || 0) + 1
-        }
       }
     }
     state.activeToolBatch = undefined
@@ -14753,12 +14796,6 @@ ${raw}
       0,
       promptTokens - continuationBudget.lastHistoryTokens
     )
-    const diminishingReturns =
-      continuationBudget.continuationCount >= 3 &&
-      promptDelta <
-        this.TOP_LEVEL_AGENT_CONTINUATION_DIMINISHING_DELTA_TOKENS &&
-      continuationBudget.lastDeltaTokens <
-        this.TOP_LEVEL_AGENT_CONTINUATION_DIMINISHING_DELTA_TOKENS
     continuationBudget.continuationCount += 1
     continuationBudget.lastDeltaTokens = promptDelta
     continuationBudget.lastHistoryTokens = promptTokens
@@ -14768,16 +14805,6 @@ ${raw}
     ) {
       continuationBudget.startedAt = Date.now()
     }
-
-    const repeatedEditPaths = Object.entries(
-      state.mutationBarrier.sameFileEditCounts
-    )
-      .filter(
-        ([pathValue, count]) =>
-          pathValue.trim().length > 0 &&
-          count >= this.TOP_LEVEL_AGENT_REPEAT_EDIT_FORCE_COUNT
-      )
-      .map(([pathValue]) => pathValue)
 
     const reasons: string[] = []
     if (
@@ -14790,60 +14817,38 @@ ${raw}
         `projected_prompt_budget=${Math.round(promptUtilization * 100)}%`
       )
     }
-    if (diminishingReturns) {
-      reasons.push("diminishing_returns")
-    }
     if (state.mutationBarrier.verificationReadOnlyBatchCount > 0) {
       reasons.push(
         `post_mutation_verification_batches=${state.mutationBarrier.verificationReadOnlyBatchCount}`
       )
     }
-    if (repeatedEditPaths.length > 0) {
-      reasons.push(
-        `repeated_same_file_edits=${repeatedEditPaths
-          .map((pathValue) => path.basename(pathValue))
-          .join(",")}`
-      )
-    }
 
+    // Advise-only mode (aligned with claude-code: no force-stop, no tool
+    // filtering). The advisory prompt nudges the model toward synthesis but
+    // leaves the full tool set available so edits / writes can still run.
     const adviseSynthesis =
       state.readOnlyBatchCount >=
         this.TOP_LEVEL_AGENT_READONLY_ADVISORY_TURNS ||
       promptUtilization >= this.TOP_LEVEL_AGENT_READONLY_ADVISORY_WATERMARK ||
-      diminishingReturns ||
-      state.mutationBarrier.verificationReadOnlyBatchCount > 0 ||
-      repeatedEditPaths.length > 0
-    const forceSynthesis =
-      (state.mutationBarrier.mutatingBatchCount === 0 &&
-        (state.readOnlyBatchCount >=
-          this.TOP_LEVEL_AGENT_READONLY_FORCE_TURNS ||
-          promptUtilization >= this.TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK ||
-          diminishingReturns)) ||
-      (repeatedEditPaths.length > 0 &&
-        (state.mutationBarrier.verificationReadOnlyBatchCount > 0 ||
-          promptUtilization >= this.TOP_LEVEL_AGENT_READONLY_FORCE_WATERMARK ||
-          diminishingReturns))
+      state.mutationBarrier.verificationReadOnlyBatchCount > 0
     this.sessionManager.markSessionDirty(conversationId)
 
     return {
-      adviseSynthesis: adviseSynthesis || forceSynthesis,
-      forceSynthesis,
+      adviseSynthesis,
       historyTokens,
       promptTokens,
       availableHistoryBudgetTokens,
       continuationCount: continuationBudget.continuationCount,
-      diminishingReturns,
       consecutiveReadOnlyBatches: state.readOnlyBatchCount,
       verificationReadOnlyBatches:
         state.mutationBarrier.verificationReadOnlyBatchCount,
-      repeatedEditPaths,
       reasons,
     }
   }
 
   private buildTopLevelContinuationAdvisoryPrompt(
     session: ChatSession,
-    decision: TopLevelContinuationDecision
+    _decision: TopLevelContinuationDecision
   ): string {
     const state = session.topLevelAgentTurnState
     const readOnlyTurns = state?.readOnlyBatchCount || 0
@@ -14856,11 +14861,6 @@ ${raw}
             `This top-level turn already produced successful edits for: ${editedPaths
               .map((pathValue) => path.basename(pathValue))
               .join(", ")}.`,
-            decision.repeatedEditPaths.length > 0
-              ? `The same file has already been edited multiple times: ${decision.repeatedEditPaths
-                  .map((pathValue) => path.basename(pathValue))
-                  .join(", ")}.`
-              : "",
             state?.mutationBarrier.verificationReadOnlyBatchCount
               ? `A read-only verification batch has already happened ${state.mutationBarrier.verificationReadOnlyBatchCount} time(s) after the latest successful edit.`
               : "",
@@ -14880,48 +14880,6 @@ ${raw}
       )
     }
     return lines.join("\n\n")
-  }
-
-  private filterToolsForForcedSynthesis(
-    toolDefinitions: ToolDefinition[]
-  ): ToolDefinition[] {
-    return toolDefinitions.filter((tool) => {
-      const normalizedName = tool.name.trim().toLowerCase()
-      const deferredFamily = this.normalizeDeferredToolFamily(normalizedName)
-      if (
-        deferredFamily &&
-        !this.TOP_LEVEL_FORCED_SYNTHESIS_ALLOWED_DEFERRED_TOOL_FAMILIES.has(
-          deferredFamily
-        )
-      ) {
-        return false
-      }
-
-      return !this.TOP_LEVEL_FORCED_SYNTHESIS_BLOCKED_TOOL_NAMES.has(
-        normalizedName
-      )
-    })
-  }
-
-  private buildForcedSynthesisPrompt(
-    toolDefinitions: ToolDefinition[]
-  ): string {
-    const visibleToolNames = Array.from(
-      new Set(toolDefinitions.map((tool) => tool.name.trim()).filter(Boolean))
-    )
-    const toolPreview =
-      visibleToolNames.length > 0
-        ? `${visibleToolNames.slice(0, 8).join(", ")}${visibleToolNames.length > 8 ? ", ..." : ""}`
-        : ""
-
-    return [
-      "Synthesis mode is now active because the top-level turn has exhausted its investigation budget.",
-      "Investigative and shell tools have been removed for this continuation. Do not continue browsing, grepping, listing directories, reading files, or running terminal commands.",
-      "Synthesize from the evidence already gathered. If the task requires creating a report or artifact, create it now with an available write/edit tool instead of describing what you will do next.",
-      toolPreview ? `Remaining non-read-only tools: ${toolPreview}.` : "",
-    ]
-      .filter((line) => line.length > 0)
-      .join("\n\n")
   }
 
   private createPendingToolCheckpointResponse(
@@ -15056,19 +15014,81 @@ ${raw}
     }
   }
 
-  private *dispatchExecMessagesForTool(
+  /**
+   * Path-level edit mutex.
+   *
+   * 防止同一文件被并发 edit_file_v2 抢占覆盖：
+   * 同 path 的下一个 edit 必须等前一个 edit 的 write_result 到达
+   * （即 detachPendingToolCall 触发 release）才能发 readArgs。
+   *
+   * 设计参考：
+   *  - claude-code 的 readFileState 时间戳防并发（写时验证 mtime）
+   *  - codex 的 apply_patch 串行落盘（一次性原子写）
+   *
+   * Cursor 协议本身只对单 toolCallId 内的
+   *   readArgs(id=1) -> writeArgs(id=2)
+   * 有序，跨 toolCallId **无任何串行约束**。模型一次产生 N 个
+   * edit_file_v2 时，N 个 readArgs 会并行到达 client，read_result
+   * 都返回原始文件，N 个 writeArgs 用各自基于原文件的 fileText
+   * 全量覆盖磁盘 —— 最后一个 write 抹掉所有前序修改。
+   * 这里加 path-level mutex 修这个竞态。
+   */
+  private readonly editingPathLocks = new Map<string, Promise<void>>()
+
+  private async acquireEditPathLock(path: string): Promise<() => void> {
+    const normalizedPath = (path || "").trim()
+    if (!normalizedPath) {
+      // 没有 path 不上锁，但仍然返回 noop release 让调用方逻辑统一
+      return () => {}
+    }
+
+    const previous =
+      this.editingPathLocks.get(normalizedPath) ?? Promise.resolve()
+    let release!: () => void
+    const next = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const ownTail = previous.then(() => next)
+    this.editingPathLocks.set(normalizedPath, ownTail)
+
+    await previous
+
+    return () => {
+      release()
+      // 自己是当前尾巴时清理映射，避免 Map 无界增长
+      if (this.editingPathLocks.get(normalizedPath) === ownTail) {
+        this.editingPathLocks.delete(normalizedPath)
+      }
+    }
+  }
+
+  private async *dispatchExecMessagesForTool(
     conversationId: string,
     session: ChatSession,
     toolCall: ActiveToolCall,
     input: Record<string, unknown>,
     dispatchTarget: ExecDispatchTarget
-  ): Generator<Buffer> {
+  ): AsyncGenerator<Buffer> {
     if (this.isEditToolInvocation(dispatchTarget.toolName)) {
       const typedInput = dispatchTarget.input as ToolInputWithPath
+      const editPath = String(typedInput.path || "")
+
+      // 同 path 串行化：等前一个 edit 的 write_result 释放锁后再发 readArgs。
+      // 这样新 read 拿到的 beforeContent 已经反映前一个 edit 的写入，
+      // applyEditInputToFileText 不会基于过期快照计算覆盖前序修改。
+      // release 由 detachPendingToolCall 在 consume / clear / 异常路径
+      // 统一执行（见 chat-session.service.ts attachEditPathLockRelease）。
+      const releaseEditPathLock = await this.acquireEditPathLock(editPath)
+      this.sessionManager.attachEditPathLockRelease(
+        conversationId,
+        toolCall.id,
+        releaseEditPathLock
+      )
+
       const readExecId = this.sessionManager.nextExecId(conversationId)
       const readExecMsg = this.grpcService.createReadExecMessage(
         toolCall.id,
-        String(typedInput.path || ""),
+        editPath,
         readExecId
       )
       this.sessionManager.registerPendingToolExecId(
@@ -18309,27 +18329,8 @@ ${raw}
         normalizedContinuationHistory
       )
       const adviseSynthesis = continuationDecision.adviseSynthesis
-      const forceSynthesis = continuationDecision.forceSynthesis
-      let continuationTools = allContinuationTools
-      let forcedSynthesisPrompt: string | undefined
-      if (forceSynthesis) {
-        topLevelTurnState.forcedSynthesisAttempted = true
-        const filteredContinuationTools =
-          this.filterToolsForForcedSynthesis(allContinuationTools)
-        if (filteredContinuationTools.length > 0) {
-          continuationTools = filteredContinuationTools
-        }
-        forcedSynthesisPrompt =
-          this.buildForcedSynthesisPrompt(continuationTools)
-        const removedToolCount =
-          allContinuationTools.length - continuationTools.length
-        this.logger.warn(
-          `Top-level agent turn forcing synthesis after ${continuationDecision.consecutiveReadOnlyBatches} consecutive read-only batches; ` +
-            `history=${continuationDecision.historyTokens}, prompt=${continuationDecision.promptTokens}/${continuationDecision.availableHistoryBudgetTokens} tokens, ` +
-            `continuations=${continuationDecision.continuationCount}, reasons=${continuationDecision.reasons.join(", ") || "budget_exhausted"}; ` +
-            `active tools=${continuationTools.length}/${allContinuationTools.length} (${removedToolCount} restricted tools removed)`
-        )
-      } else if (adviseSynthesis) {
+      const continuationTools = allContinuationTools
+      if (adviseSynthesis) {
         this.logger.warn(
           `Top-level agent turn advising synthesis after ${continuationDecision.consecutiveReadOnlyBatches} consecutive read-only batches; ` +
             `history=${continuationDecision.historyTokens}, prompt=${continuationDecision.promptTokens}/${continuationDecision.availableHistoryBudgetTokens} tokens, ` +
@@ -18344,10 +18345,7 @@ ${raw}
             continuationDecision
           )
         : undefined
-      const additionalSystemPrompt =
-        [synthesisAdvisoryPrompt, forcedSynthesisPrompt]
-          .filter((prompt): prompt is string => typeof prompt === "string")
-          .join("\n\n") || undefined
+      const additionalSystemPrompt = synthesisAdvisoryPrompt
 
       const buildContinuationDtoForRoute = (streamRoute: ModelRouteResult) =>
         this.buildStreamingDtoForRoute(streamRoute, {

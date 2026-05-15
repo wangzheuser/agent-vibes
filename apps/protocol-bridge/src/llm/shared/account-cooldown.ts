@@ -22,7 +22,7 @@ const QUOTA_BACKOFF_BASE_MS = 30_000 // 30 seconds
 const QUOTA_BACKOFF_MAX_MS = 15 * 60_000 // 15 minutes
 
 /** 401/402/403 cooldown */
-const AUTH_COOLDOWN_MS = 30 * 60_000 // 30 minutes
+const AUTH_COOLDOWN_MS = 60_000 // 1 minute
 
 /** 404 (model not supported) cooldown */
 const NOT_FOUND_COOLDOWN_MS = 12 * 3600_000 // 12 hours
@@ -148,8 +148,8 @@ export function isAccountAvailableForModel(
  *
  * Status code handling (aligned with CLIProxyAPI conductor.go):
  *  - 429: Per-model cooldown with exponential backoff (or Retry-After)
- *  - 401: Global cooldown 30 min (unauthorized)
- *  - 402/403: Global cooldown 30 min (payment required)
+ *  - 401: Global cooldown 1 min (unauthorized)
+ *  - 402/403: Global cooldown 1 min (payment required)
  *  - 404: Per-model cooldown 12 hours (model not supported)
  *  - 5xx: Global cooldown 1 min (transient)
  */
@@ -203,13 +203,13 @@ export function markAccountCooldown(
 
     case 401:
       account.cooldownUntil = now + AUTH_COOLDOWN_MS
-      logger.warn(`[${label}] 401 unauthorized, cooldown 30min`)
+      logger.warn(`[${label}] 401 unauthorized, cooldown 1min`)
       break
 
     case 402:
     case 403:
       account.cooldownUntil = now + AUTH_COOLDOWN_MS
-      logger.warn(`[${label}] ${statusCode} payment/forbidden, cooldown 30min`)
+      logger.warn(`[${label}] ${statusCode} payment/forbidden, cooldown 1min`)
       break
 
     case 404:

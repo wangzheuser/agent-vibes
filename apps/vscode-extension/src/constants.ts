@@ -29,6 +29,8 @@ export const CMD = {
   IMPORT_CODEX_CPA_JSONS: "agentVibes.importCodexCpaJsons",
   OPEN_OPENAI_COMPAT_ACCOUNTS: "agentVibes.openOpenAICompatAccounts",
   OPEN_CLAUDE_API_ACCOUNTS: "agentVibes.openClaudeApiAccounts",
+  OPEN_KIRO_ACCOUNTS: "agentVibes.openKiroAccounts",
+  SYNC_KIRO_IDE: "agentVibes.syncKiroIDE",
   GENERATE_CERT: "agentVibes.generateCert",
   ENABLE_FORWARDING: "agentVibes.enableForwarding",
   DISABLE_FORWARDING: "agentVibes.disableForwarding",

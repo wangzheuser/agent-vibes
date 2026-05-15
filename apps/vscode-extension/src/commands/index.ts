@@ -487,6 +487,101 @@ export function registerCommands(
     })
   )
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.OPEN_KIRO_ACCOUNTS, async () => {
+      try {
+        await openJsonFile(config.kiroAccountsPath)
+      } catch (err) {
+        logger.error("Failed to open Kiro accounts file", err)
+        vscode.window.showErrorMessage(
+          tFmt("file.openKiroFailed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
+        )
+      }
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD.SYNC_KIRO_IDE, async () => {
+      try {
+        if (!bridge.isRunning) {
+          await bridge.start()
+        }
+        const https = await import("https")
+        const fs = await import("fs")
+        const caPath = config.caCertPath
+        const caData = fs.existsSync(caPath)
+          ? fs.readFileSync(caPath)
+          : undefined
+
+        const body = await new Promise<string>((resolve, reject) => {
+          const options: import("https").RequestOptions = {
+            hostname: "localhost",
+            port: config.port,
+            path: "/api/kiro/sync-local",
+            method: "POST",
+            ca: caData,
+            rejectUnauthorized: !!caData,
+            timeout: 15000,
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Length": "2",
+            },
+          }
+          const req = https.request(options, (res) => {
+            let responseBody = ""
+            res.on("data", (chunk: Buffer) => {
+              responseBody += chunk.toString()
+            })
+            res.on("end", () => {
+              if ((res.statusCode ?? 500) >= 400) {
+                reject(
+                  new Error(
+                    `Kiro sync failed (${res.statusCode}): ${responseBody.slice(0, 200)}`
+                  )
+                )
+                return
+              }
+              resolve(responseBody)
+            })
+          })
+          req.on("error", reject)
+          req.setTimeout(15000, () => {
+            req.destroy(new Error("Kiro sync request timed out"))
+          })
+          req.write("{}")
+          req.end()
+        })
+
+        const result = JSON.parse(body) as {
+          synced?: boolean
+          imported?: number
+          accountCount?: number
+          error?: string
+        }
+        if (result.error) {
+          vscode.window.showErrorMessage(`Kiro sync: ${result.error}`)
+        } else if (result.synced && result.imported) {
+          vscode.window.showInformationMessage(
+            `Kiro: synced ${result.imported} account(s) from local cache (${result.accountCount} total)`
+          )
+        } else {
+          vscode.window.showWarningMessage(
+            "Kiro: no local credentials found. Log in to Kiro IDE first, or use Builder ID OAuth from the Dashboard."
+          )
+        }
+      } catch (err) {
+        logger.error("Failed to sync Kiro IDE credentials", err)
+        vscode.window.showErrorMessage(
+          tFmt("file.openKiroFailed", {
+            message: err instanceof Error ? err.message : String(err),
+          })
+        )
+      }
+    })
+  )
+
   // ── SSL certificates ──────────────────────────────────────────────
 
   context.subscriptions.push(

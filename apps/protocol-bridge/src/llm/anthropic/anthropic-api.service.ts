@@ -175,6 +175,19 @@ const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 export const DEFAULT_CLAUDE_API_CONTEXT_LIMIT_TOKENS = 200_000
 
+/**
+ * Models that ship Anthropic's server-side `web_search_20250305` tool. We try
+ * them in order when the caller does not pin a model — falling back to the
+ * first candidate even if it cannot be routed, so the upstream returns a
+ * deterministic error rather than an internal "no candidate" surprise.
+ */
+const ANTHROPIC_WEB_SEARCH_DEFAULT_MODEL_CANDIDATES = [
+  "claude-sonnet-4-5",
+  "claude-sonnet-4-6",
+  "claude-3-7-sonnet-latest",
+  "claude-3-5-sonnet-latest",
+] as const
+
 const DEFAULT_PUBLIC_CLAUDE_MODEL_IDS = [
   "claude-sonnet-4-6",
   "claude-sonnet-4-5",
@@ -723,6 +736,169 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       new Set(),
       abortSignal
     )
+  }
+
+  /**
+   * Execute a one-shot web search via the Anthropic Messages API server-side
+   * `web_search_20250305` tool. We synthesize a small CreateMessageDto, run it
+   * through the standard candidate / cooldown machinery, and then collect any
+   * `server_tool_use` / `web_search_tool_result` blocks plus the final
+   * assistant text into the same shape the Google backend returns —
+   * `{ text, references: [{ title, url, chunk }] }` — so callers can stay
+   * backend-agnostic.
+   */
+  async executeWebSearch(input: {
+    query: string
+    model?: string
+    maxUses?: number
+  }): Promise<{
+    text: string
+    references: Array<{ title: string; url: string; chunk: string }>
+  }> {
+    const query = input.query.trim()
+    if (!query) {
+      return { text: "", references: [] }
+    }
+
+    if (!this.hasConfiguredAccounts()) {
+      throw new Error(
+        "Claude API backend not configured: no accounts available for web_search"
+      )
+    }
+
+    const requestedModel = input.model?.trim() || ""
+    const model =
+      requestedModel ||
+      ANTHROPIC_WEB_SEARCH_DEFAULT_MODEL_CANDIDATES.find((candidate) =>
+        this.canRouteModelForWebSearch(candidate)
+      ) ||
+      ANTHROPIC_WEB_SEARCH_DEFAULT_MODEL_CANDIDATES[0]
+
+    // Anthropic server-side web_search tool descriptor. Cast through unknown
+    // because ToolDto only types standard function-tool fields, but the API
+    // accepts the broader server-tool schema (extra fields are forwarded
+    // verbatim by buildUpstreamRequestPayload).
+    const webSearchTool = {
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses:
+        typeof input.maxUses === "number" && input.maxUses > 0
+          ? input.maxUses
+          : 5,
+    } as unknown as NonNullable<CreateMessageDto["tools"]>[number]
+
+    const dto: CreateMessageDto = {
+      model,
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content:
+            "Use the web_search tool to find authoritative, recent results for " +
+            "the following query, then summarize the findings in a few " +
+            "sentences and list the sources you used.\n\n" +
+            `Query: ${query}`,
+        },
+      ],
+      tools: [webSearchTool],
+      stream: false,
+    }
+
+    const result = await this.sendClaudeMessage(dto)
+    return this.extractWebSearchResultFromResponse(result)
+  }
+
+  private extractWebSearchResultFromResponse(response: AnthropicResponse): {
+    text: string
+    references: Array<{ title: string; url: string; chunk: string }>
+  } {
+    const summaryParts: string[] = []
+    const references: Array<{ title: string; url: string; chunk: string }> = []
+    const seenUrls = new Set<string>()
+
+    const pushReference = (
+      url: string,
+      title?: string,
+      chunk?: string
+    ): void => {
+      const trimmed = url.trim()
+      if (!trimmed || seenUrls.has(trimmed)) return
+      seenUrls.add(trimmed)
+      references.push({
+        title: (title || "").trim() || trimmed,
+        url: trimmed,
+        chunk: chunk || "",
+      })
+    }
+
+    const collectFromCitation = (citation: unknown): void => {
+      if (!citation || typeof citation !== "object") return
+      const c = citation as Record<string, unknown>
+      const url = typeof c.url === "string" ? c.url : ""
+      const title = typeof c.title === "string" ? c.title : undefined
+      const cited =
+        typeof c.cited_text === "string"
+          ? c.cited_text
+          : typeof c.text === "string"
+            ? c.text
+            : undefined
+      if (url) pushReference(url, title, cited)
+    }
+
+    const blocks = (response.content as unknown[] | undefined) || []
+    for (const raw of blocks) {
+      if (!raw || typeof raw !== "object") continue
+      const block = raw as Record<string, unknown>
+      const blockType = block.type
+
+      if (blockType === "text") {
+        const text = typeof block.text === "string" ? block.text : ""
+        if (text.trim()) summaryParts.push(text)
+        const annotations = block.citations
+        if (Array.isArray(annotations)) {
+          for (const ann of annotations) collectFromCitation(ann)
+        }
+        continue
+      }
+
+      // Server tool result block emitted by the Anthropic web_search tool.
+      if (
+        blockType === "web_search_tool_result" ||
+        blockType === "server_tool_use"
+      ) {
+        const content = block.content
+        if (Array.isArray(content)) {
+          for (const item of content) {
+            if (!item || typeof item !== "object") continue
+            const it = item as Record<string, unknown>
+            const url = typeof it.url === "string" ? it.url : ""
+            const title = typeof it.title === "string" ? it.title : undefined
+            const snippet =
+              typeof it.page_content === "string"
+                ? it.page_content
+                : typeof it.text === "string"
+                  ? it.text
+                  : ""
+            if (url) pushReference(url, title, snippet)
+          }
+        }
+      }
+    }
+
+    return { text: summaryParts.join("\n").trim(), references }
+  }
+
+  private hasConfiguredAccounts(): boolean {
+    return Array.isArray(this.accounts) && this.accounts.length > 0
+  }
+
+  private canRouteModelForWebSearch(model: string): boolean {
+    try {
+      this.nextCandidate(model)
+      return true
+    } catch {
+      return false
+    }
   }
 
   private async executeWithCooldownRetry(

@@ -380,6 +380,9 @@
       .be-cl {
         border-left-color: #f87171;
       }
+      .be-kr {
+        border-left-color: #a78bfa;
+      }
       .be-top {
         display: flex;
         align-items: baseline;
@@ -542,6 +545,9 @@
       }
       .ch-bar-cl {
         background: #f87171;
+      }
+      .ch-bar-kr {
+        background: #a78bfa;
       }
       .ch-name {
         font-size: var(--text-lg);
@@ -1752,6 +1758,7 @@
         CH.codex.sync[1].label = L("ch.sync.cpa")
         CH["openai-compat"].label = L("ch.openaiCompat")
         CH["claude-api"].label = L("ch.claudeApi")
+        CH.kiro.label = L("ch.kiro")
         CH["claude-api"].sync[0].label = L("ch.sync.claude")
         var oif = CH["openai-compat"].fields
         oif[0].label = L("field.label")
@@ -1896,6 +1903,28 @@
           ],
           name: (a) => a.label || L("acct.unnamed", "Unnamed"),
           info: (a) => (a.apiKey ? a.apiKey.slice(0, 16) + "..." : ""),
+        },
+        kiro: {
+          label: "Kiro",
+          barCls: "ch-bar-kr",
+          beCls: "be-kr",
+          color: "#a78bfa",
+          mode: "kiro-oauth",
+          sync: [
+            {
+              label: "Sync Kiro IDE",
+              cmd: "agentVibes.syncKiroIDE",
+            },
+          ],
+          fields: [],
+          name: (a) => a.label || a.email || L("acct.unnamed", "Unnamed"),
+          info: (a) =>
+            (a.authMethod || "idc") +
+            " | " +
+            (a.region || "us-east-1") +
+            (a.accessToken
+              ? " | " + String(a.accessToken).slice(0, 16) + "..."
+              : ""),
         },
       }
 
@@ -2139,6 +2168,8 @@
         if (m.type === "testResult") handleTestResult(m.data)
         if (m.type === "oauthStatus") handleOAuthStatus(m.data)
         if (m.type === "codexOAuthStatus") handleCodexOAuthStatus(m.data)
+        if (m.type === "kiroOAuthStatus") handleKiroOAuthStatus(m.data)
+        if (m.type === "kiroQuotaUpdate") handleKiroQuotaUpdate(m.data)
       })
 
       window.addEventListener("resize", function () {
@@ -2635,6 +2666,7 @@
           codex: [L("model.gpt"), L("model.codex")],
           "openai-compat": [L("model.custom")],
           "claude-api": [L("model.claudeOpus")],
+          kiro: [L("model.claudeSonnet"), L("model.claudeOpus")],
         }
         let h = ""
         for (const [k, d] of Object.entries(CH)) {
@@ -2727,6 +2759,12 @@
           barCls: "ch-bar-cl",
           channels: ["claude-api"],
         },
+        {
+          key: "amazon",
+          label: "Amazon",
+          barCls: "ch-bar-kr",
+          channels: ["kiro"],
+        },
       ]
 
       function getAccountSidebarGroups() {
@@ -2808,6 +2846,9 @@
         codexSubView = "accounts"
         acctPage = 0
         renderAccounts(allData || {})
+        if (selectedChannel === "kiro") {
+          vscode.postMessage({ type: "getKiroQuota" })
+        }
         if (
           selectedChannel === "codex" &&
           codexQuotaData &&
@@ -3452,6 +3493,23 @@
                 esc(tierLabel) +
                 "</span>"
             }
+            // Kiro subscription badge
+            if (selectedChannel === "kiro") {
+              var kiroQBadge = getKiroQuotaForAccount(i)
+              if (kiroQBadge && kiroQBadge.subscriptionType) {
+                var kSubType = kiroQBadge.subscriptionType
+                var kBadgeCls =
+                  kSubType === "FREE"
+                    ? "setting-badge-info"
+                    : "setting-badge-ok"
+                h +=
+                  '<span class="setting-badge ' +
+                  kBadgeCls +
+                  '">' +
+                  esc(kSubType) +
+                  "</span>"
+              }
+            }
             if (effectivePoolEntry) {
               var rowCooldownInfo = ""
               var rowCooldownUntil = parseDateValue(
@@ -3549,6 +3607,14 @@
               h += '<div data-codex-quota-index="' + i + '">'
               h += renderCodexRateLimitRows(codexQuotaAcct)
               h += "</div>"
+            }
+
+            // Usage / subscription bar for Kiro
+            if (selectedChannel === "kiro") {
+              var kiroQ = getKiroQuotaForAccount(i)
+              if (kiroQ) {
+                h += renderKiroQuotaBar(kiroQ)
+              }
             }
 
             h += "</div>"
@@ -3933,6 +3999,13 @@
           )
           codexOAuthTab = "oauth"
           renderCodexDlg()
+        } else if (d.mode === "kiro-oauth") {
+          title.textContent = formatL(
+            L(dlgMode === "edit" ? "dlg.editAccount" : "dlg.addAccount"),
+            { channel: d.label }
+          )
+          kiroOAuthTab = "oauth"
+          renderKiroDlg()
         } else if (d.mode === "sync") {
           title.textContent = formatL(
             L(dlgMode === "edit" ? "dlg.editToken" : "dlg.addToken"),
@@ -4122,6 +4195,214 @@
             btn.onclick = startOAuth
           }
         }
+      }
+
+      // ── Kiro OAuth Dialog ──
+      var kiroOAuthTab = "oauth"
+
+      function renderKiroDlg() {
+        var fields = document.getElementById("dlg-fields")
+        var okBtn = document.getElementById("dlg-ok")
+        var isOAuth = kiroOAuthTab === "oauth"
+        var h = ""
+
+        // Tab bar
+        h += '<div class="oauth-tabs">'
+        h +=
+          '<button type="button" class="oauth-tab' +
+          (isOAuth ? " active" : "") +
+          '" onclick="switchKiroOAuthTab(\'oauth\')">' +
+          "Builder ID" +
+          "</button>"
+        h +=
+          '<button type="button" class="oauth-tab' +
+          (!isOAuth ? " active" : "") +
+          '" onclick="switchKiroOAuthTab(\'token\')">' +
+          esc(L("oauth.tokenTab")) +
+          "</button>"
+        h += "</div>"
+
+        h += '<div class="dlg-body">'
+
+        if (isOAuth) {
+          h += '<div style="padding:var(--sp-3) 0">'
+          h +=
+            '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6">'
+          h +=
+            "Click the button below to start AWS Builder ID authorization. A browser window will open for you to approve access."
+          h += "</div>"
+          h +=
+            '<div id="kiro-oauth-status" style="margin-top:var(--sp-3)"></div>'
+          h += "</div>"
+
+          okBtn.textContent = L("oauth.startAuth")
+          okBtn.disabled = false
+          okBtn.onclick = startKiroOAuth
+        } else {
+          // Token paste tab
+          h +=
+            '<div class="field"><label>' +
+            "Kiro Token JSON" +
+            "</label>" +
+            '<textarea id="f-token" placeholder="' +
+            esc(
+              'Paste kiro-auth-token.json content or { "accessToken": "...", "refreshToken": "..." }'
+            ) +
+            '" style="min-height:100px;font-size:12px"></textarea>' +
+            '<div class="field-hint">' +
+            "Paste the content of ~/.aws/sso/cache/*.json or Kiro IDE token file." +
+            "</div></div>"
+
+          okBtn.textContent = L("dlg.add")
+          okBtn.disabled = false
+          okBtn.onclick = submitKiroToken
+        }
+
+        h += "</div>"
+        fields.innerHTML = h
+      }
+
+      function switchKiroOAuthTab(tab) {
+        kiroOAuthTab = tab
+        renderKiroDlg()
+      }
+
+      function startKiroOAuth() {
+        var btn = document.getElementById("dlg-ok")
+        if (btn) {
+          btn.disabled = true
+          btn.textContent = L("oauth.openingBrowser")
+        }
+        vscode.postMessage({ type: "startKiroOAuth" })
+      }
+
+      function submitKiroToken() {
+        var ta = document.getElementById("f-token")
+        var raw = (ta ? ta.value : "").trim()
+        if (!raw) return
+        vscode.postMessage({ type: "importKiroToken", raw: raw })
+        closeDlg()
+      }
+
+      function handleKiroOAuthStatus(data) {
+        var el = document.getElementById("kiro-oauth-status")
+        if (!el) return
+        var btn = document.getElementById("dlg-ok")
+        if (data.status === "loading") {
+          el.innerHTML =
+            '<div style="color:var(--fg-2);font-size:var(--text-sm)">' +
+            esc(data.message || L("oauth.waiting")) +
+            "</div>"
+        } else if (data.status === "success") {
+          el.innerHTML =
+            '<div style="color:var(--good);font-size:var(--text-sm)">' +
+            esc(data.message || "Account saved") +
+            "</div>"
+          if (btn) {
+            btn.disabled = false
+            btn.textContent = L("dlg.add")
+            btn.onclick = function () {
+              closeDlg()
+            }
+          }
+        } else if (data.status === "error") {
+          el.innerHTML =
+            '<div style="color:var(--bad);font-size:var(--text-sm)">' +
+            esc(data.message || "Authorization failed") +
+            "</div>"
+          if (btn) {
+            btn.disabled = false
+            btn.textContent = L("oauth.retry")
+            btn.onclick = startKiroOAuth
+          }
+        }
+      }
+
+      // ── Kiro Quota Rendering ──
+      var kiroQuotaData = null
+
+      function handleKiroQuotaUpdate(data) {
+        kiroQuotaData = data
+        // Re-render accounts if kiro is selected
+        if (selectedChannel === "kiro" && allData) {
+          renderChannelDetail()
+        }
+      }
+
+      function getKiroQuotaForAccount(index) {
+        if (
+          !kiroQuotaData ||
+          !kiroQuotaData.accounts ||
+          index >= kiroQuotaData.accounts.length
+        ) {
+          return null
+        }
+        return kiroQuotaData.accounts[index]
+      }
+
+      function renderKiroQuotaBar(quota) {
+        if (!quota || quota.state !== "ready") return ""
+        var h = ""
+        if (
+          quota.usageLimit != null &&
+          quota.usageLimit > 0 &&
+          quota.usageCurrent != null
+        ) {
+          var pctUsed = Math.min(
+            100,
+            Math.round((quota.usageCurrent / quota.usageLimit) * 100)
+          )
+          var pctLeft = Math.max(0, 100 - pctUsed)
+          var isOverage =
+            quota.currentOverages != null && quota.currentOverages > 0
+          var barColor = isOverage
+            ? "var(--bad)"
+            : pctLeft > 50
+              ? "var(--good)"
+              : pctLeft > 20
+                ? "var(--warn)"
+                : "var(--bad)"
+          var resetInfo = quota.nextResetDate
+            ? " (resets " +
+              new Date(quota.nextResetDate).toLocaleDateString() +
+              ")"
+            : ""
+
+          if (isOverage) {
+            var overageNum =
+              typeof quota.currentOverages === "number"
+                ? quota.currentOverages.toFixed(2)
+                : "0"
+            var chargeStr =
+              typeof quota.overageCharges === "number"
+                ? " ($" + quota.overageCharges.toFixed(2) + ")"
+                : ""
+            h += '<div class="quota-row" style="margin-top:8px">'
+            h +=
+              '<div class="quota-label"><span>Overage ' +
+              overageNum +
+              chargeStr +
+              "</span><span>"
+            h += "0% left" + resetInfo
+            h += "</span></div>"
+            h +=
+              '<div class="progress-track"><div class="progress-fill" style="width:0%;background:var(--bad)"></div></div>'
+            h += "</div>"
+          } else {
+            h += '<div class="quota-row" style="margin-top:8px">'
+            h += '<div class="quota-label"><span>Usage</span><span>'
+            h += pctLeft + "% left" + resetInfo
+            h += "</span></div>"
+            h +=
+              '<div class="progress-track"><div class="progress-fill" style="width:' +
+              pctLeft +
+              "%;background:" +
+              barColor +
+              '"></div></div>'
+            h += "</div>"
+          }
+        }
+        return h
       }
 
       // ── Codex OAuth Dialog ──
@@ -5037,6 +5318,7 @@
           google: { label: L("ch.antigravity"), cls: "be-ag" },
           "openai-compat": { label: L("ch.openaiCompat"), cls: "be-oai" },
           "claude-api": { label: L("ch.claudeApi"), cls: "be-cl" },
+          kiro: { label: L("ch.kiro"), cls: "be-kr" },
         }
 
         function routeLabel(backend, transport) {

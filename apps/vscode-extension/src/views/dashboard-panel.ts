@@ -32,7 +32,12 @@ import { detectCurrentCursorVersion } from "../utils/cursor-version"
 import { logger } from "../utils/logger"
 import { getCursorProductMetadata } from "../utils/platform"
 
-type AccountChannel = "antigravity" | "claude-api" | "codex" | "openai-compat"
+type AccountChannel =
+  | "antigravity"
+  | "claude-api"
+  | "codex"
+  | "openai-compat"
+  | "kiro"
 
 type DashboardAccountChannelData = {
   accounts: Record<string, unknown>[]
@@ -321,6 +326,10 @@ export class DashboardPanel {
         void this.sendCodexQuotaStatus(Boolean(msg.data?.force))
         break
 
+      case "getKiroQuota":
+        void this.sendKiroQuotaStatus()
+        break
+
       case "getUsageSummary":
         void this.sendUsageSummary()
         break
@@ -347,6 +356,16 @@ export class DashboardPanel {
 
       case "startCodexOAuth":
         void this.handleStartCodexOAuth()
+        break
+
+      case "startKiroOAuth":
+        void this.handleStartKiroOAuth()
+        break
+
+      case "importKiroToken":
+        if (msg.raw) {
+          this.handleImportKiroToken(msg.raw)
+        }
         break
     }
   }
@@ -558,6 +577,25 @@ export class DashboardPanel {
     }
   }
 
+  private async sendKiroQuotaStatus(): Promise<void> {
+    if (this.bridge.state !== "running") {
+      this.panel.webview.postMessage({ type: "kiroQuotaUpdate", data: null })
+      return
+    }
+    try {
+      const data = await this.callBridgeApi<Record<string, unknown>>(
+        "/quota/kiro",
+        "GET"
+      )
+      this.panel.webview.postMessage({ type: "kiroQuotaUpdate", data })
+    } catch (err) {
+      logger.debug(
+        `Kiro quota fetch failed: ${err instanceof Error ? err.message : String(err)}`
+      )
+      this.panel.webview.postMessage({ type: "kiroQuotaUpdate", data: null })
+    }
+  }
+
   private async sendUsageSummary(): Promise<void> {
     if (this.bridge.state !== "running") {
       this.panel.webview.postMessage({
@@ -694,6 +732,7 @@ export class DashboardPanel {
       "codexAccountsPath",
       "openaiCompatAccountsPath",
       "claudeApiAccountsPath",
+      "kiroAccountsPath",
     ])
     const config = vscode.workspace.getConfiguration("agentVibes")
 
@@ -739,7 +778,8 @@ export class DashboardPanel {
         key === "antigravityAccountsPath" ||
         key === "codexAccountsPath" ||
         key === "openaiCompatAccountsPath" ||
-        key === "claudeApiAccountsPath"
+        key === "claudeApiAccountsPath" ||
+        key === "kiroAccountsPath"
       ) {
         this.config.ensureDirectories()
         this.watchAccountFiles()
@@ -879,6 +919,7 @@ export class DashboardPanel {
       "openai-compat": this.getChannelData("openai-compat"),
       "claude-api": this.getChannelData("claude-api"),
       antigravity: this.getChannelData("antigravity"),
+      kiro: this.getChannelData("kiro"),
     }
     const accountsData = {
       ...channelAccountsData,
@@ -1058,6 +1099,14 @@ export class DashboardPanel {
                 key: "claudeApiAccountsPath",
                 value: agentCfg.get<string>("claudeApiAccountsPath") || "",
                 placeholder: this.config.claudeApiAccountsPath,
+              },
+              {
+                label: st.groups.storage.items.kiroAccountsPath.label,
+                desc: st.groups.storage.items.kiroAccountsPath.desc,
+                type: "path",
+                key: "kiroAccountsPath",
+                value: agentCfg.get<string>("kiroAccountsPath") || "",
+                placeholder: this.config.kiroAccountsPath,
               },
             ],
           },
@@ -1711,6 +1760,7 @@ export class DashboardPanel {
             "codex",
             "openai-compat",
             "claude-api",
+            "kiro",
           ]
           let total = 0
           for (const ch of channels) {
@@ -1864,6 +1914,171 @@ export class DashboardPanel {
         data: { status: "error", message: errorMsg },
       })
     }
+  }
+
+  /**
+   * Kiro Builder ID device-flow OAuth — calls bridge endpoints.
+   */
+  private async handleStartKiroOAuth(): Promise<void> {
+    try {
+      this.panel.webview.postMessage({
+        type: "kiroOAuthStatus",
+        data: { status: "loading", message: "Starting Builder ID flow..." },
+      })
+
+      const startResult = await this.callBridgeApi<{
+        sessionId: string
+        verificationUriComplete: string
+        userCode: string
+        intervalMs: number
+        expiresAt: number
+      }>("/api/kiro/login/start", "POST", {})
+
+      if (!startResult?.sessionId) {
+        throw new Error("Bridge returned invalid Kiro login session")
+      }
+
+      // Open browser
+      await vscode.env.openExternal(
+        vscode.Uri.parse(startResult.verificationUriComplete)
+      )
+
+      this.panel.webview.postMessage({
+        type: "kiroOAuthStatus",
+        data: {
+          status: "loading",
+          message: `Waiting for approval... (code: ${startResult.userCode})`,
+        },
+      })
+
+      // Poll until completed or expired
+      let intervalMs = startResult.intervalMs || 5000
+      const deadline = startResult.expiresAt || Date.now() + 600_000
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs))
+
+        const poll = await this.callBridgeApi<{
+          status: string
+          intervalMs?: number
+          accountCount?: number
+          path?: string
+        }>("/api/kiro/login/poll", "POST", {
+          sessionId: startResult.sessionId,
+        })
+
+        if (!poll) {
+          throw new Error("Bridge poll returned empty response")
+        }
+
+        if (poll.status === "completed") {
+          this.panel.webview.postMessage({
+            type: "kiroOAuthStatus",
+            data: {
+              status: "success",
+              message: `Kiro account added (${poll.accountCount} total)`,
+            },
+          })
+          this.sendAllData()
+          return
+        }
+
+        if (poll.status === "expired") {
+          throw new Error("Builder ID device code expired")
+        }
+
+        if (poll.status === "slow_down" && poll.intervalMs) {
+          intervalMs = poll.intervalMs
+        }
+      }
+
+      throw new Error("Builder ID authorization timed out")
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      logger.error("Kiro OAuth flow failed", err)
+
+      this.panel.webview.postMessage({
+        type: "kiroOAuthStatus",
+        data: { status: "error", message: errorMsg },
+      })
+    }
+  }
+
+  /**
+   * Kiro manual token paste — calls bridge /api/kiro/import.
+   */
+  private handleImportKiroToken(raw: string): void {
+    this.callBridgeApi<{
+      imported: number
+      accountCount: number
+      error?: string
+    }>("/api/kiro/import", "POST", { raw })
+      .then((result) => {
+        if (result?.error) {
+          vscode.window.showErrorMessage(`Kiro import: ${result.error}`)
+        } else if (result && result.imported > 0) {
+          vscode.window.showInformationMessage(
+            `Kiro: imported ${result.imported} account(s)`
+          )
+        } else {
+          vscode.window.showWarningMessage(
+            "Kiro: no valid tokens found in the pasted JSON"
+          )
+        }
+        this.sendAllData()
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        vscode.window.showErrorMessage(`Kiro import failed: ${msg}`)
+      })
+  }
+
+  /**
+   * Generic bridge API caller for Kiro endpoints.
+   */
+  private async callBridgeApi<T>(
+    apiPath: string,
+    method: "GET" | "POST",
+    body?: Record<string, unknown>
+  ): Promise<T | null> {
+    const https = require("https") as typeof import("https")
+    const caCert = this.config.caCertPath
+    const caData = fs.existsSync(caCert) ? fs.readFileSync(caCert) : undefined
+    const payload = body ? JSON.stringify(body) : ""
+
+    return new Promise<T | null>((resolve, reject) => {
+      const options: import("https").RequestOptions = {
+        hostname: "localhost",
+        port: this.config.port,
+        path: apiPath,
+        method,
+        ca: caData,
+        rejectUnauthorized: !!caData,
+        timeout: 30_000,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+      }
+      const req = https.request(options, (res) => {
+        let responseBody = ""
+        res.on("data", (chunk: Buffer) => {
+          responseBody += chunk.toString()
+        })
+        res.on("end", () => {
+          try {
+            resolve(responseBody ? (JSON.parse(responseBody) as T) : null)
+          } catch {
+            resolve(null)
+          }
+        })
+      })
+      req.on("error", reject)
+      req.setTimeout(30_000, () => {
+        req.destroy(new Error("Bridge API request timed out"))
+      })
+      if (payload) req.write(payload)
+      req.end()
+    })
   }
 
   private upsertAntigravityAccount(account: Record<string, unknown>): void {
@@ -2049,6 +2264,10 @@ export class DashboardPanel {
         return this.config.hasCustomAccountPath("openaiCompatAccountsPath")
           ? "custom"
           : "default"
+      case "kiro":
+        return this.config.hasCustomAccountPath("kiroAccountsPath")
+          ? "custom"
+          : "default"
     }
   }
 
@@ -2118,6 +2337,8 @@ export class DashboardPanel {
         return this.config.claudeApiAccountsPath
       case "antigravity":
         return this.config.antigravityAccountsPath
+      case "kiro":
+        return this.config.kiroAccountsPath
       default:
         return null
     }
@@ -2216,6 +2437,7 @@ export class DashboardPanel {
       "codex",
       "openai-compat",
       "claude-api",
+      "kiro",
     ]
     const watchedFiles = new Set<string>()
 

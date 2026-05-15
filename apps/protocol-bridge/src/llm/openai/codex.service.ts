@@ -3139,6 +3139,210 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     )
   }
 
+  /**
+   * Execute a one-shot web search via the Codex Responses API server-side
+   * `web_search` tool. The model is asked a single user question that wraps
+   * the supplied query, the server runs `web_search_call` items end-to-end,
+   * and we collect every `url_citation` annotation plus any final assistant
+   * text into the same shape the Google backend returns from
+   * `executeWebSearch()` — so callers can stay backend-agnostic.
+   */
+  async executeWebSearch(input: {
+    query: string
+    model?: string
+    conversationId?: string
+  }): Promise<{
+    text: string
+    references: Array<{ title: string; url: string; chunk: string }>
+  }> {
+    const query = input.query.trim()
+    if (!query) {
+      return { text: "", references: [] }
+    }
+
+    if (this.accounts.length === 0) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+
+    const requestedModel = input.model?.trim() || ""
+    const modelName =
+      requestedModel && this.hasSupportingAccount(requestedModel)
+        ? requestedModel
+        : DEFAULT_CODEX_RATE_LIMIT_MODEL
+    const conversationId =
+      input.conversationId || `web-search-${crypto.randomUUID()}`
+    const slot = this.selectRequestSlot(modelName, conversationId, {
+      preferWarmPool: false,
+    })
+    const token = await this.getBearerToken(slot)
+    if (!token) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+
+    const codexRequest = buildCodexRequest(
+      {
+        model: modelName,
+        conversationId,
+        messages: [
+          {
+            role: "user",
+            content:
+              "Use the web_search tool to find authoritative, recent results " +
+              "for the following query, then summarize the findings in a few " +
+              "sentences and list the sources you used.\n\n" +
+              `Query: ${query}`,
+          },
+        ],
+        tools: [
+          {
+            type: "web_search",
+            name: "web_search",
+            description: "Server-side web search backed by the Codex backend.",
+          },
+        ],
+        parallelToolCalls: false,
+        textVerbosity: "low",
+      },
+      modelName
+    ) as Record<string, unknown>
+
+    const url = this.buildUrl(slot, "responses")
+    const headers = this.buildHeaders(slot, token, true, undefined, {
+      conversationId,
+    })
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers,
+      body: JSON.stringify(codexRequest),
+      signal: AbortSignal.timeout(120_000),
+    }
+    const dispatcher = this.buildProxyDispatcher(slot)
+    if (dispatcher) {
+      fetchOptions.dispatcher = dispatcher
+    }
+
+    const response = await fetch(url, fetchOptions)
+    if (!response.ok) {
+      const errorBody = await response.text()
+      throw this.createCodexApiError(response.status, errorBody)
+    }
+    this.captureCodexRateLimitHeaders(
+      response.headers,
+      slot,
+      modelName,
+      "request"
+    )
+
+    const fullBody = await response.text()
+    const summaryParts: string[] = []
+    const references: Array<{ title: string; url: string; chunk: string }> = []
+    const seenUrls = new Set<string>()
+
+    const collectFromContentBlock = (block: unknown): void => {
+      if (!block || typeof block !== "object") return
+      const record = block as Record<string, unknown>
+      if (typeof record.text === "string" && record.text.trim()) {
+        summaryParts.push(record.text)
+      }
+      const annotations = record.annotations
+      if (Array.isArray(annotations)) {
+        for (const ann of annotations) {
+          if (!ann || typeof ann !== "object") continue
+          const a = ann as Record<string, unknown>
+          if (a.type !== "url_citation" && a.type !== "web_search_citation") {
+            continue
+          }
+          const refUrl = typeof a.url === "string" ? a.url.trim() : ""
+          if (!refUrl || seenUrls.has(refUrl)) continue
+          seenUrls.add(refUrl)
+          references.push({
+            title: (typeof a.title === "string" && a.title.trim()) || refUrl,
+            url: refUrl,
+            chunk:
+              typeof a.quote === "string"
+                ? a.quote
+                : typeof a.text === "string"
+                  ? a.text
+                  : "",
+          })
+        }
+      }
+    }
+
+    const collectFromOutputItem = (item: unknown): void => {
+      if (!item || typeof item !== "object") return
+      const record = item as Record<string, unknown>
+      const itemType = record.type
+      if (itemType === "message") {
+        const content = record.content
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            collectFromContentBlock(block)
+          }
+        }
+      }
+      // web_search_call items can carry sources / queries on completion.
+      if (itemType === "web_search_call") {
+        const action = record.action
+        if (action && typeof action === "object") {
+          const sources = (action as Record<string, unknown>).sources
+          if (Array.isArray(sources)) {
+            for (const src of sources) {
+              if (!src || typeof src !== "object") continue
+              const s = src as Record<string, unknown>
+              const srcUrl = typeof s.url === "string" ? s.url.trim() : ""
+              if (!srcUrl || seenUrls.has(srcUrl)) continue
+              seenUrls.add(srcUrl)
+              references.push({
+                title:
+                  (typeof s.title === "string" && s.title.trim()) || srcUrl,
+                url: srcUrl,
+                chunk:
+                  typeof s.snippet === "string"
+                    ? s.snippet
+                    : typeof s.text === "string"
+                      ? s.text
+                      : "",
+              })
+            }
+          }
+        }
+      }
+    }
+
+    for (const line of fullBody.split("\n")) {
+      const payload = this.parseCodexSsePayload(line.trim())
+      if (!payload) continue
+
+      if (payload.type === "response.output_item.done" && payload.item) {
+        collectFromOutputItem(payload.item)
+      }
+
+      if (
+        payload.type === "response.completed" &&
+        payload.response &&
+        typeof payload.response === "object"
+      ) {
+        const responseOutput = (payload.response as Record<string, unknown>)
+          .output
+        if (Array.isArray(responseOutput)) {
+          for (const outputItem of responseOutput) {
+            collectFromOutputItem(outputItem)
+          }
+        }
+      }
+    }
+
+    markAccountSuccess(slot, modelName)
+
+    const text = summaryParts.length > 0 ? summaryParts.join("\n").trim() : ""
+    return { text, references }
+  }
+
   async generateImage(input: {
     prompt: string
     model?: string

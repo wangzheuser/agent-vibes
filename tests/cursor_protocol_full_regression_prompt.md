@@ -15,7 +15,8 @@
 6. 执行方式是任务驱动，但覆盖清单不能缩水；所有当前 Cursor 协议 ToolCall / Interaction / Exec / ConversationAction / InteractionUpdate / aiserver 兼容项都必须通过 trace 观察或明确判定 gap。
 7. 不输出 Layer 1-8 全量矩阵；但最终报告必须按下方完整覆盖清单逐项给出状态，不能遗漏工具、功能或状态机分支。
 8. 最终报告重点是：任务目标、期望客户端工具、实际触发工具、结果、证据、gap；覆盖清单用紧凑分组摘要表达。
-9. 写操作只允许发生在 `.cursor-protocol-smoke/` 下。
+9. 写操作只允许发生在 smoke 工作目录下（默认 `~/.agent-vibes/smoke/`，可通过环境变量 `$AGENT_VIBES_SMOKE_DIR` 覆盖）。
+   **禁止**把 smoke 文件、trace 文件或其他临时产物写到仓库工作树内，包括 `.cursor-protocol-smoke/`、`apps/**/.log/`、`.log/`、`tmp/` 等子路径。
 10. 禁止执行：`git reset --hard`、`git checkout --`、`git clean`、`rm -rf`、`sudo`、安装依赖、提交 commit、修改业务源码、访问敏感凭据。
 11. 网络、MCP、子代理、PR、图像、VM 等外部能力可以失败；失败必须记录原因，不要因此中断整轮。
 12. 如果某个工具需要用户授权或 IDE 内部状态，按实际结果记录，不要伪造成功。
@@ -26,9 +27,10 @@
 开始前尝试定位 protocol trace 文件并记录基线行数或 mtime。优先路径：
 
 1. `$CURSOR_PROTOCOL_TRACE_FILE`
-2. `~/.agent-vibes/logs/cursor_protocol_trace.jsonl`
-3. `apps/vscode-extension/.log/cursor_protocol_trace.jsonl`
-4. `.log/cursor_protocol_trace.jsonl`
+2. `$AGENT_VIBES_LOG_DIR/cursor_protocol_trace.jsonl`
+3. `~/.agent-vibes/logs/cursor_protocol_trace.jsonl`（默认 fallback；agent-vibes bridge 写入位置）
+
+trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`.log/`、`<repo>/cursor_protocol_trace*` 等位置看到 trace 文件，视为污染，需要记录并删除，不能用作基线。
 
 最终报告只需要给出本轮新增 trace 的摘要：
 
@@ -42,14 +44,14 @@
 
 ## Smoke 工作区
 
-所有文件任务都使用 `.cursor-protocol-smoke/`。开始时创建或重置以下文件；不得删除该目录之外任何内容：
+所有文件任务都使用 smoke 工作目录（默认 `~/.agent-vibes/smoke/`，下文用 `<SMOKE>` 占位；如设置了 `$AGENT_VIBES_SMOKE_DIR` 则用其值）。**禁止在仓库内创建 `.cursor-protocol-smoke/` 或其他 smoke 目录**。开始时创建或重置以下文件；不得删除该目录之外任何内容：
 
-- `.cursor-protocol-smoke/a.txt`：内容 `alpha`
-- `.cursor-protocol-smoke/b.txt`：内容 `beta`
-- `.cursor-protocol-smoke/delete_me.txt`：内容 `delete`
-- `.cursor-protocol-smoke/todo-seed.md`：至少两行文本
-- `.cursor-protocol-smoke/subdir/nested.txt`：内容 `nested alpha beta`
-- `.cursor-protocol-smoke/env.txt`：内容 `PLACEHOLDER_ENV=old`
+- `<SMOKE>/a.txt`：内容 `alpha`
+- `<SMOKE>/b.txt`：内容 `beta`
+- `<SMOKE>/delete_me.txt`：内容 `delete`
+- `<SMOKE>/todo-seed.md`：至少两行文本
+- `<SMOKE>/subdir/nested.txt`：内容 `nested alpha beta`
+- `<SMOKE>/env.txt`：内容 `PLACEHOLDER_ENV=old`
 
 ## 完整覆盖清单（不得删减）
 
@@ -140,23 +142,23 @@
 ### 任务 1：基础终端与流式输出
 
 调用客户端可见工具 `run_terminal_command` 执行一个安全命令，完成以下目标：
-确认当前项目工作目录，展示 `.cursor-protocol-smoke/` 下的文件，并产生 3 行间隔很短的进度输出，方便观察流式 stdout。
+确认当前项目工作目录，展示 `<SMOKE>` 下的文件，并产生 3 行间隔很短的进度输出，方便观察流式 stdout。
 
 验收：stdout 可见，exit code 为 0；trace 中应能看到 shell 相关 tool call 和 shell stream/输出增量。
 
 ### 任务 2：文件与代码检索
 
 调用客户端可见工具完成以下目标：用 `list_directory` 检查 smoke 工作区里有哪些文件，
-用 `read_file` 确认 `.cursor-protocol-smoke/a.txt` 的内容；再用 `glob_search` 或 `file_search` 找出 Cursor 协议相关 TypeScript 文件，
+用 `read_file` 确认 `<SMOKE>/a.txt` 的内容；再用 `glob_search` 或 `file_search` 找出 Cursor 协议相关 TypeScript 文件，
 并用 `grep_search` 定位 `ExecServerMessage` 在源码中的使用位置。
 
 验收：能读到 `alpha`；源码文件搜索和文本搜索返回非空或合理结果；trace 中能看到对应 started/completed 或 exec/result 摘要。
 
 ### 任务 3：编辑与删除闭环
 
-调用客户端可见工具完成以下目标：先用 `read_file` 读取 `.cursor-protocol-smoke/a.txt`，
+调用客户端可见工具完成以下目标：先用 `read_file` 读取 `<SMOKE>/a.txt`，
 再用 `edit_file_v2` 把其中的 `alpha` 更新为 `alpha-1`，然后再次读取确认；
-接着用 `delete_file` 删除 `.cursor-protocol-smoke/delete_me.txt`，最后确认 smoke 目录中已经没有这个文件。
+接着用 `delete_file` 删除 `<SMOKE>/delete_me.txt`，最后确认 smoke 目录中已经没有这个文件。
 
 验收：编辑和删除都有可见副作用；如果编辑失败，记录失败原因。
 
@@ -186,18 +188,32 @@
 
 ### 任务 7：MCP 能力发现
 
-调用客户端可见 MCP 相关工具完成以下目标：用 `get_mcp_tools`、`list_mcp_resources` 检查当前会话是否配置了 MCP server、tools 或 resources；
-如果发现可安全读取的 resource，再用 `read_mcp_resource` 读取一个；
-如果存在可安全调用的 MCP tool，再通过客户端提供的 MCP tool 调用方式执行一个最小示例。
+调用客户端可见 MCP 相关工具完成以下目标：
 
-验收：有 MCP 时至少完成一次资源或工具调用；无 MCP 时记录 `unavailable: no MCP tools/resources configured`。
+1. 用 `get_mcp_tools` 列出当前会话挂载的 MCP server / tool 清单。
+   只要返回至少 1 个 tool，就认为 **MCP 通道是通的**，不要笼统记 "no MCP available"。
+2. 在拿到的真实 server 名单中挑一个最小 / 最安全的 tool 实际调一次（推荐 `user-context7-resolve-library-id` + `user-context7-query-docs`，这两个不需要任何账号、只读、有真实远程响应），
+   验证 MCP 通道端到端可用，并把返回内容里的关键字段（如 `Context7-compatible library ID`、Source URL）写进证据栏。
+3. 用 `list_mcp_resources(<具体 server 名>)` 探测 resource 列表。如果返回 `Server "..." not found`，
+   说明该 server 未挂载，不是 MCP 通道坏；要在 gap 里写明"`<server>` 未配置"，并继续在已挂载的 server 上跑 `read_mcp_resource`（如果它真有 resource）。
+
+验收：
+
+- 如果 `get_mcp_tools` 至少返回 1 个 tool 且 step 2 成功，记 `pass` —— `mcp_tool` / `get_mcp_tools` / `list_mcp_resources` / `read_mcp_resource` 全部归 pass，gap 写明哪些 server 未挂载。
+- 如果 `get_mcp_tools` 返回空，记 `unavailable: no MCP servers configured in this session`。
+- 不允许仅凭 `list_mcp_resources(<某个 server>)` 报 not found 就判定整条 MCP 通道 unavailable；那只是单个 server 没挂。
 
 ### 任务 8：子代理 / 后台 / stdin 能力
 
-调用客户端可见工具完成以下目标：如果暴露了 `task` 或子代理工具，就委托一个最小子任务概括 `.cursor-protocol-smoke/` 当前状态，
+调用客户端可见工具完成以下目标：如果暴露了 `task` 或子代理工具，就委托一个最小子任务概括 `<SMOKE>` 当前状态，
 并在返回 task id 时用 `await_task` 或 `await` 等当前可见等待工具等待完成；
-再用 `background_shell_spawn` 或可见后台命令能力运行一个短时命令观察是否进入 background。
+再用 `background_shell_spawn` 或可见后台命令能力运行一个**长寿命**命令观察是否进入 background；
+推荐用 `read -r line; echo "got: $line"` 或 `sleep 60` 这种会**阻塞等待**的脚本，
+确保后续 `write_shell_stdin` 探测到达时进程还活着。
+
 只有当真实返回可用 shellId 时，才用 `write_shell_stdin` 向该 shell 写入 stdin；不要为了覆盖而伪造 shellId 或重复调用。
+注意 `Shell not found` 通常意味着进程已自然退出（短命脚本 lifecycle 问题，**不是协议层 mapper 错**）；
+如果命中这条错误，需要在 gap 里说明原因（"bg shell 已退出，stdin 没有目标"），并尝试用阻塞式命令重新跑一次。
 
 验收：parent tool 不重复结算；没有 pending 泄漏；不可用时说明缺少 task/subagent/shellId。
 
@@ -205,8 +221,14 @@
 
 根据当前客户端可见工具面做最小安全调用或判定：如果暴露了 `ask_question`、`switch_mode`、`apply_agent_diff`、`generate_image`、
 `record_screen`、`computer_use`、`fetch_pull_request`、`report_bugfix_results`、`ai_attribution`、`setup_vm_environment`、`mcp_auth` 等工具，
-则各尝试一次最小安全用例；写入类能力只能作用于 `.cursor-protocol-smoke/` 或安全占位。
+则各尝试一次最小安全用例；写入类能力只能作用于 `<SMOKE>` 或安全占位。
 不要为了覆盖而硬造 PR、图片、VM、shellId 或外部状态；未暴露的工具记为 `not_directly_invokable`。
+
+调用约定（避免误把业务校验记成协议错）：
+
+- `fix_lints`：必须传 repo 工作区根下的真实 ts 文件（例如 `apps/protocol-bridge/src/protocol/cursor/cursor-protocol-trace.service.ts`），不要传 `<SMOKE>` 下的文件，否则会被 IDE 校验拒绝（`path is outside workspace root`），那是输入约束不是协议错。
+- `report_bugfix_results`：必须传至少 1 项 dummy result（例如 `[{ "id": "smoke-probe", "status": "nop" }]`），传空数组会被入参校验拒绝。
+- `setup_vm_environment`：当前桥已经从 user-facing surface 移除该工具（mapper 不再暴露）。如果客户端 surface 上看不到它，记 `not_directly_invokable`，**不要硬调**；如果意外能调到，按实际后端响应记录。
 
 验收：每项记录 `pass/unavailable/not_directly_invokable/failed` 与原因。
 
@@ -249,7 +271,7 @@
 
 ### Visible Side Effects
 
-用 Markdown 列表或表格只列 `.cursor-protocol-smoke/` 下文件。每项至少包含：
+用 Markdown 列表或表格只列 `<SMOKE>` 下文件。每项至少包含：
 
 - 路径
 - 动作：`created | modified | deleted | read`
@@ -305,7 +327,7 @@
 
 ### Safety Check
 
-- `.cursor-protocol-smoke/` 之外是否改动：`Yes/No`
+- `<SMOKE>` 之外是否改动：`Yes/No`
 - 是否执行受禁命令：`Yes/No`
 - 是否提交 commit：`Yes/No`
 - 是否修改业务源码：`Yes/No`

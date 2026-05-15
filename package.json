@@ -56,10 +56,14 @@
     "antigravity:sync": "node bin/agent-vibes sync",
     "claude:sync": "node bin/agent-vibes sync --claude",
     "codex:sync": "node bin/agent-vibes sync --codex",
-    "antigravity:capture:start": "node bin/agent-vibes capture start",
-    "antigravity:capture:stop": "node bin/agent-vibes capture stop",
-    "antigravity:capture:status": "node bin/agent-vibes capture status",
-    "antigravity:capture:repair": "node bin/agent-vibes capture repair",
+    "google:capture:start": "node bin/agent-vibes capture start",
+    "google:capture:stop": "node bin/agent-vibes capture stop",
+    "google:capture:status": "node bin/agent-vibes capture status",
+    "google:capture:repair": "node bin/agent-vibes capture repair",
+    "kiro:capture:start": "node scripts/capture/capture-kiro.js start",
+    "kiro:capture:stop": "node scripts/capture/capture-kiro.js stop",
+    "kiro:capture:status": "node scripts/capture/capture-kiro.js status",
+    "kiro:capture:repair": "node scripts/capture/capture-kiro.js repair",
     "deploy:sync": "node bin/agent-vibes sync --deploy"
   },
   "devDependencies": {

@@ -5,6 +5,7 @@ import {
 } from "./backend-errors"
 import {
   canPublicClaudeModelUseGoogle,
+  canPublicClaudeModelUseKiro,
   detectModelFamily,
   doesModelSupportThinking,
   isOpusModel,
@@ -18,6 +19,7 @@ import {
  * - codex: OpenAI GPT/O-series models via Codex reverse proxy
  * - openai-compat: Third-party OpenAI-compatible API (Chat Completions)
  * - claude-api: Anthropic-compatible Claude API with third-party key/account pool
+ * - kiro: AWS CodeWhisperer / Kiro-IDE backend serving Claude models via AWS Event Stream
  */
 export type BackendType =
   | "google"
@@ -25,6 +27,7 @@ export type BackendType =
   | "codex"
   | "openai-compat"
   | "claude-api"
+  | "kiro"
 
 /**
  * Model routing result
@@ -48,11 +51,13 @@ export class ModelRouterService {
   private codexAvailable = false
   private openaiCompatAvailable = false
   private claudeApiAvailable = false
+  private kiroAvailable = false
   private codexAvailabilityProvider?: () => boolean
   private openaiCompatAvailabilityProvider?: () => boolean
   private codexModelSupportProvider?: (model: string) => boolean
   private openaiCompatModelSupportProvider?: (model: string) => boolean
   private claudeApiAvailabilityProvider?: (model: string) => boolean
+  private kiroAvailabilityProvider?: (model: string) => boolean
 
   /**
    * Keep availability check so startup behavior remains explicit.
@@ -61,7 +66,8 @@ export class ModelRouterService {
     googleCheck: () => Promise<boolean>,
     codexCheck?: () => Promise<boolean>,
     openaiCompatCheck?: () => Promise<boolean>,
-    claudeApiCheck?: () => Promise<boolean>
+    claudeApiCheck?: () => Promise<boolean>,
+    kiroCheck?: () => Promise<boolean>
   ): Promise<void> {
     this.logger.log("=== Testing Backend APIs ===")
 
@@ -95,6 +101,13 @@ export class ModelRouterService {
       })
     }
 
+    if (kiroCheck) {
+      this.kiroAvailable = await kiroCheck().catch((e) => {
+        this.logger.error(`Kiro check error: ${(e as Error).message}`)
+        return false
+      })
+    }
+
     this.logger.log("=== Backend Availability ===")
     this.logger.log(`  Google Cloud Code: ${this.googleAvailable ? "✓" : "✗"}`)
     this.logger.log(`  Codex (OpenAI):    ${this.codexAvailable ? "✓" : "✗"}`)
@@ -104,16 +117,21 @@ export class ModelRouterService {
     this.logger.log(
       `  Claude API:        ${this.claudeApiAvailable ? "✓" : "✗"}`
     )
+    this.logger.log(`  Kiro (AWS):        ${this.kiroAvailable ? "✓" : "✗"}`)
     this.logger.log("=== Routing Decision ===")
     this.logger.log("  Gemini models       -> Google backend")
-    if (this.claudeApiAvailable && this.googleAvailable) {
+    const claudeBackends: string[] = []
+    if (this.claudeApiAvailable) claudeBackends.push("Claude API")
+    if (this.kiroAvailable) claudeBackends.push("Kiro")
+    if (this.googleAvailable) claudeBackends.push("Google")
+    if (claudeBackends.length > 1) {
       this.logger.log(
-        "  Claude models       -> Capability-based routing (Claude API or Google)"
+        `  Claude models       -> Capability-based routing (${claudeBackends.join(", ")})`
       )
-    } else if (this.claudeApiAvailable) {
-      this.logger.log("  Claude models       -> Claude API backend")
+    } else if (claudeBackends.length === 1) {
+      this.logger.log(`  Claude models       -> ${claudeBackends[0]} backend`)
     } else {
-      this.logger.log("  Claude models       -> Google backend")
+      this.logger.log("  Claude models       -> ERROR (no Claude backend)")
     }
     if (this.codexAvailable && this.openaiCompatAvailable) {
       this.logger.log(
@@ -156,6 +174,9 @@ export class ModelRouterService {
   get isClaudeApiAvailable(): boolean {
     return this.claudeApiAvailable
   }
+  get isKiroAvailable(): boolean {
+    return this.kiroAvailable
+  }
 
   setGptAvailabilityProviders(providers: {
     codex?: () => boolean
@@ -171,6 +192,10 @@ export class ModelRouterService {
 
   setClaudeAvailabilityProvider(provider?: (model: string) => boolean): void {
     this.claudeApiAvailabilityProvider = provider
+  }
+
+  setKiroAvailabilityProvider(provider?: (model: string) => boolean): void {
+    this.kiroAvailabilityProvider = provider
   }
 
   private getCodexAvailability(): boolean {
@@ -201,6 +226,12 @@ export class ModelRouterService {
     return this.claudeApiAvailabilityProvider
       ? this.claudeApiAvailabilityProvider(model)
       : this.claudeApiAvailable
+  }
+
+  private getKiroAvailability(model: string): boolean {
+    return this.kiroAvailabilityProvider
+      ? this.kiroAvailabilityProvider(model)
+      : this.kiroAvailable
   }
 
   private buildGptBackendCandidatesFromTarget(target: {
@@ -279,10 +310,17 @@ export class ModelRouterService {
     const normalized = cursorModel.toLowerCase().trim()
     const family = detectModelFamily(normalized)
     const claudeApiAvailable = this.getClaudeApiAvailability(cursorModel)
+    const kiroAvailable = this.getKiroAvailability(cursorModel)
     const hasExplicitClaudeMapping =
       this.claudeApiAvailabilityProvider != null && claudeApiAvailable
+    const hasExplicitKiroMapping =
+      this.kiroAvailabilityProvider != null && kiroAvailable
 
-    if (!hasExplicitClaudeMapping && family !== "claude") {
+    if (
+      !hasExplicitClaudeMapping &&
+      !hasExplicitKiroMapping &&
+      family !== "claude"
+    ) {
       return null
     }
 
@@ -295,6 +333,15 @@ export class ModelRouterService {
     if (claudeApiAvailable) {
       candidates.push({
         backend: "claude-api",
+        model: normalized,
+        isThinking: entry?.isThinking ?? doesModelSupportThinking(normalized),
+      })
+    }
+
+    // Kiro (AWS) supports Claude Sonnet/Opus/Haiku families.
+    if (kiroAvailable && canPublicClaudeModelUseKiro(normalized)) {
+      candidates.push({
+        backend: "kiro",
         model: normalized,
         isThinking: entry?.isThinking ?? doesModelSupportThinking(normalized),
       })
@@ -387,10 +434,15 @@ export class ModelRouterService {
       (currentBackend !== "openai-compat" && currentBackend !== "codex") ||
       (fallbackBackend !== "openai-compat" && fallbackBackend !== "codex")
     ) {
+      const claudeBackends: BackendType[] = [
+        "claude-api",
+        "google-claude",
+        "kiro",
+      ]
       const claudePair =
-        (currentBackend === "claude-api" &&
-          fallbackBackend === "google-claude") ||
-        (currentBackend === "google-claude" && fallbackBackend === "claude-api")
+        claudeBackends.includes(currentBackend) &&
+        claudeBackends.includes(fallbackBackend) &&
+        currentBackend !== fallbackBackend
       if (!claudePair) {
         return false
       }
@@ -424,7 +476,7 @@ export class ModelRouterService {
       }
     }
 
-    return /timeout|timed out|fetch failed|socket hang up|econn|enotfound|eai_again|network|html page|anti-bot|captcha|blocked|not configured|missing api key|missing base url|no available providers|temporarily unavailable|service unavailable|quota|rate(?:-| )limit(?:ed)?|retry after|all openai-compat accounts|all claude api accounts|anthropic/.test(
+    return /timeout|timed out|fetch failed|socket hang up|econn|enotfound|eai_again|network|html page|anti-bot|captcha|blocked|not configured|missing api key|missing base url|no available providers|temporarily unavailable|service unavailable|quota|rate(?:-| )limit(?:ed)?|retry after|all openai-compat accounts|all claude api accounts|all kiro accounts|anthropic|kiro/.test(
       message
     )
   }

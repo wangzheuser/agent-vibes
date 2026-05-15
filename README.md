@@ -14,7 +14,10 @@ English | [中文](README_zh.md)
 </p>
 
 <p align="center">
-  <strong>Unified Agent Gateway</strong> — Use <strong>Antigravity</strong> and <strong>Codex</strong> AI backends with <strong>Claude Code CLI</strong> and <strong>Cursor IDE</strong>.
+  <strong>Unified Agent Gateway</strong> — Use
+  <strong>Antigravity</strong>, <strong>Codex</strong>, and
+  <strong>Kiro (AWS)</strong> AI backends with
+  <strong>Claude Code CLI</strong> and <strong>Cursor IDE</strong>.
 </p>
 
 > [!WARNING]
@@ -30,7 +33,7 @@ English | [中文](README_zh.md)
 Agent Vibes is a unified agent gateway for AI coding clients.
 It not only translates protocols between clients and backends,
 but also implements Cursor's native ConnectRPC/gRPC agent channel with the full streaming tool loop,
-while routing requests across Antigravity, Claude-compatible, Codex, and OpenAI-compatible backends.
+while routing requests across Antigravity, Claude-compatible, Codex, OpenAI-compatible, and Kiro (AWS CodeWhisperer) backends.
 
 **Clients** (front-end):
 
@@ -42,6 +45,7 @@ while routing requests across Antigravity, Claude-compatible, Codex, and OpenAI-
 - **Antigravity IDE** — Google Cloud Code API with protocol-compliant requests
 - **Codex CLI** — OpenAI-compatible API for GPT and Codex models
 - **Claude-Compatible API** — Anthropic-compatible `/v1/messages` with third-party keys
+- **Kiro (AWS)** — AWS CodeWhisperer / Q Developer streaming endpoint via Builder ID, IdC, or social login
 
 > **Disclaimer:** This project is for educational and research purposes only.
 >
@@ -64,6 +68,7 @@ while routing requests across Antigravity, Claude-compatible, Codex, and OpenAI-
 │                                                             │
 │  Gemini           → Antigravity IDE (Cloud Code)            │
 │  Claude           → Claude-Compatible API / Antigravity     │
+│                     / Kiro (AWS CodeWhisperer)              │
 │  GPT              → Codex CLI / OpenAI-compatible API       │
 │                                                             │
 + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
@@ -71,14 +76,14 @@ while routing requests across Antigravity, Claude-compatible, Codex, and OpenAI-
 
 ## Features
 
-| Area                             | Capabilities                                                                                                                                                                                                                     |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Protocols and clients            | Native support for Claude Code CLI and Cursor IDE; Claude Code CLI uses Anthropic Messages API (SSE), while Cursor IDE uses a native ConnectRPC/gRPC agent channel implementation.                                               |
-| Cursor protocol implementation   | Direct implementation of the Cursor protocol, including the full streaming tool loop and the related tool protocol mapping, not just compatibility endpoints or simple forwarding.                                               |
-| Routing and backends             | Routes requests across Antigravity IDE, Claude-compatible API, Codex CLI, and OpenAI-compatible API; covers Gemini, Claude, and GPT / O-series models with routing decisions based on backend availability and model capability. |
-| Account pools and quotas         | Native worker / process pools, backend account state, cooldowns, model-level cooldowns, Google / Codex quota views, rate-limit views, and multi-account rotation for availability.                                               |
-| Extension and operations         | Dashboard, account management, OAuth / token import, manual account JSON editing, SSL certificate generation, forwarding setup, logs, built-in diagnostics, usage / analytics, and update checks.                                |
-| Sessions, context, and toolchain | Session state management, context compaction / projection / summary, tool integrity handling, knowledge base support, semantic search, MCP tool integration, and related persistence.                                            |
+| Area                             | Capabilities                                                                                                                                                                                                                                               |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Protocols and clients            | Native support for Claude Code CLI and Cursor IDE; Claude Code CLI uses Anthropic Messages API (SSE), while Cursor IDE uses a native ConnectRPC/gRPC agent channel implementation.                                                                         |
+| Cursor protocol implementation   | Direct implementation of the Cursor protocol, including the full streaming tool loop and the related tool protocol mapping, not just compatibility endpoints or simple forwarding.                                                                         |
+| Routing and backends             | Routes requests across Antigravity IDE, Claude-compatible API, Codex CLI, OpenAI-compatible API, and Kiro (AWS CodeWhisperer); covers Gemini, Claude, and GPT / O-series models with routing decisions based on backend availability and model capability. |
+| Account pools and quotas         | Native worker / process pools, backend account state, cooldowns, model-level cooldowns, Google / Codex / Kiro quota views, rate-limit views, and multi-account rotation for availability.                                                                  |
+| Extension and operations         | Dashboard, account management, OAuth / token import, manual account JSON editing, SSL certificate generation, forwarding setup, logs, built-in diagnostics, usage / analytics, and update checks.                                                          |
+| Sessions, context, and toolchain | Session state management, context compaction / projection / summary, tool integrity handling, knowledge base support, semantic search, MCP tool integration, and related persistence.                                                                      |
 
 ## Compared with [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
 
@@ -273,6 +278,19 @@ codex --login
 agent-vibes sync --codex
 ```
 
+Kiro (AWS Builder ID / IdC / Kiro IDE):
+
+- **Easiest:** open Dashboard → Accounts → Kiro → Add account → **Builder ID** tab.
+  The bridge starts an OAuth device flow, opens your browser, and writes the
+  resulting tokens to `~/.agent-vibes/data/kiro-accounts.json`.
+- **From an existing Kiro IDE / AWS CLI login:** Command Palette →
+  `Agent Vibes: Sync Kiro IDE Credentials`. The bridge scans
+  `~/.aws/sso/cache/*.json` and Kiro IDE's
+  `globalStorage/kiro.kiroagent/kiro-cache/` and imports any usable tokens.
+- **Manual paste:** Dashboard → Accounts → Kiro → Add account → **Token** tab.
+  Paste any of: an SSO cache JSON, a `kiro-auth-token.json`, or the
+  `kiro-accounts.json` shape itself.
+
 ### Extension Commands
 
 The extension keeps a small set of installation / configuration commands in the Command Palette, while the Dashboard handles most runtime management and detailed operations.
@@ -290,6 +308,8 @@ The extension keeps a small set of installation / configuration commands in the 
 | 3    | Agent Vibes: Sync Codex Credentials               | `agentVibes.syncCodex`                | Sync Codex credentials into Agent Vibes.                                                   |
 | 3    | Agent Vibes: Open OpenAI-Compatible Accounts JSON | `agentVibes.openOpenAICompatAccounts` | Open `openai-compat-accounts.json` for manual configuration.                               |
 | 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`    | Open `claude-api-accounts.json` for manual configuration.                                  |
+| 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`         | Open `kiro-accounts.json` for manual configuration.                                        |
+| 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`              | Import Kiro / AWS SSO tokens cached locally by Kiro IDE or AWS CLI.                        |
 | 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | Start the local bridge after certificates and at least one account are ready.              |
 | 5    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`         | Enable local forwarding required for Cursor traffic interception.                          |
 | 5    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`        | Disable local forwarding.                                                                  |
@@ -471,6 +491,23 @@ Behavior:
 - `maxContextTokens` sets a per-account input/context cap. When multiple Claude API accounts can serve the same model, the bridge clamps to the smallest
   configured cap among the currently available candidates so retries do not overflow a smaller provider window.
 - Official `api.anthropic.com` accounts use `x-api-key`; third-party endpoints use `Authorization: Bearer ...`.
+
+### 4. Kiro (AWS CodeWhisperer / Q Developer)
+
+Use for Claude Sonnet / Opus / Haiku via AWS Builder ID, IAM Identity
+Center (IdC), or social-login Kiro accounts.
+
+Configuration (any of):
+
+- **Builder ID OAuth (recommended):** Dashboard → Accounts → Kiro → Add → **Builder ID**.
+- **Sync local cache:** Command Palette → `Agent Vibes: Sync Kiro IDE Credentials`. Imports tokens from `~/.aws/sso/cache/` and Kiro IDE's `globalStorage`.
+- **Manual paste:** Dashboard → Accounts → Kiro → Add → **Token**.
+
+Behavior:
+
+- `authMethod`: `"idc"` (Builder ID / IdC, needs `clientId` + `clientSecret`) or `"social"` (GitHub / Google).
+- AWS does not return Anthropic cache token counts; the bridge simulates `cache_read_input_tokens` / `cache_creation_input_tokens` client-side.
+- Refreshed tokens are written back to `~/.agent-vibes/data/kiro-accounts.json` and re-refreshed every 15 minutes in the background.
 
 ## SSH Remote Development
 
@@ -691,6 +728,7 @@ agent-vibes/
 │       │   │
 │       │   ├── llm/                           # ← Provider implementations + shared routing
 │       │   │   ├── anthropic/                 #   AnthropicApiModule — Claude-compatible key pool
+│       │   │   ├── aws/                       #   KiroModule — AWS CodeWhisperer / Kiro IDE backend
 │       │   │   ├── google/                    #   GoogleModule — Cloud Code API + Go worker pool
 │       │   │   ├── openai/                    #   Codex + OpenAI-compatible providers
 │       │   │   └── shared/                    #   Model routing, registry, backend utilities

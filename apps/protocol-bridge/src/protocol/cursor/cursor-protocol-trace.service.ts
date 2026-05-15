@@ -1,5 +1,6 @@
 import { fromBinary } from "@bufbuild/protobuf"
 import * as fs from "fs"
+import * as os from "os"
 import * as path from "path"
 
 import {
@@ -174,7 +175,14 @@ export class CursorProtocolTraceService {
         "cursor_protocol_trace.jsonl"
       )
     }
-    return path.resolve(process.cwd(), ".log/cursor_protocol_trace.jsonl")
+    // Default to the canonical Agent Vibes data dir so dev/test runs never
+    // leak trace files into the repository working tree.
+    return path.resolve(
+      os.homedir(),
+      ".agent-vibes",
+      "logs",
+      "cursor_protocol_trace.jsonl"
+    )
   }
 
   private static append(record: TraceRecord): void {

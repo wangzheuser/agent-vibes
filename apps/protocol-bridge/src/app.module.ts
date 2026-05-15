@@ -2,13 +2,14 @@ import { Module } from "@nestjs/common"
 import { ConfigModule } from "@nestjs/config"
 import * as os from "os"
 import * as path from "path"
-import { GoogleModule } from "./llm/google/google.module"
-import { AnthropicModule } from "./protocol/anthropic/anthropic.module"
-import { CursorModule } from "./protocol/cursor/cursor.module"
 import { ContextModule } from "./context/context.module"
 import { HealthController } from "./health.controller"
+import { GoogleModule } from "./llm/google/google.module"
+import { KiroModule } from "./llm/aws/kiro.module"
 import { ModelModule } from "./llm/shared/model.module"
 import { PersistenceModule } from "./persistence"
+import { AnthropicModule } from "./protocol/anthropic/anthropic.module"
+import { CursorModule } from "./protocol/cursor/cursor.module"
 import { validateEnv } from "./shared/env.validation"
 import { UsageStatsModule } from "./usage"
 
@@ -39,6 +40,7 @@ const ENV_FILE_CANDIDATES = [
     ContextModule,
     ModelModule,
     UsageStatsModule,
+    KiroModule,
   ],
   controllers: [HealthController],
 })

@@ -84,10 +84,12 @@ const UI_EN: Record<string, string> = {
   "group.google": "Google",
   "group.openai": "OpenAI",
   "group.anthropic": "Anthropic",
+  "group.amazon": "Amazon",
   "ch.antigravity": "Antigravity IDE",
   "ch.codex": "Codex CLI",
   "ch.openaiCompat": "OpenAI-Compatible",
   "ch.claudeApi": "Claude Code CLI",
+  "ch.kiro": "Kiro",
   "ch.sync.antigravityIde": "Sync Antigravity IDE",
   "ch.sync.antigravityTool": "Sync Antigravity Tool",
   "ch.sync.codexCli": "Sync Codex CLI",
@@ -281,6 +283,7 @@ const UI_EN: Record<string, string> = {
   "test.accounts.desc": "Check at least one account is configured",
   "model.gemini": "Gemini Pro 3.1 High",
   "model.claudeOpus": "Claude Opus 4.6",
+  "model.claudeSonnet": "Claude Sonnet 4.6",
   "model.custom": "Custom Models",
   "model.gpt": "GPT-5.5",
   "model.codex": "Codex",
@@ -391,10 +394,12 @@ const UI_ZH: Record<string, string> = {
   "group.google": "Google",
   "group.openai": "OpenAI",
   "group.anthropic": "Anthropic",
+  "group.amazon": "Amazon",
   "ch.antigravity": "Antigravity IDE",
   "ch.codex": "Codex CLI",
   "ch.openaiCompat": "OpenAI 兼容",
   "ch.claudeApi": "Claude Code CLI",
+  "ch.kiro": "Kiro",
   "ch.sync.antigravityIde": "同步 Antigravity IDE",
   "ch.sync.antigravityTool": "同步 Antigravity 工具",
   "ch.sync.codexCli": "同步 Codex CLI",
@@ -577,6 +582,7 @@ const UI_ZH: Record<string, string> = {
   "test.accounts.desc": "检查是否至少配置了一个账号",
   "model.gemini": "Gemini Pro 3.1 High",
   "model.claudeOpus": "Claude Opus 4.6",
+  "model.claudeSonnet": "Claude Sonnet 4.6",
   "model.custom": "自定义模型",
   "model.gpt": "GPT-5.5",
   "model.codex": "Codex",
@@ -819,6 +825,7 @@ type StorageSettingsItems = {
   codexAccountsPath: SettingsItemCopy
   openaiCompatAccountsPath: SettingsItemCopy
   claudeApiAccountsPath: SettingsItemCopy
+  kiroAccountsPath: SettingsItemCopy
 }
 
 type PatchSettingsItems = {
@@ -936,6 +943,10 @@ const SETTINGS_EN: SettingsCopy = {
         claudeApiAccountsPath: {
           label: "Claude API Accounts File",
           desc: "Custom path for claude-api-accounts.json",
+        },
+        kiroAccountsPath: {
+          label: "Kiro Accounts File",
+          desc: "Custom path for kiro-accounts.json",
         },
       },
     },
@@ -1060,6 +1071,10 @@ const SETTINGS_ZH: SettingsCopy = {
         claudeApiAccountsPath: {
           label: "Claude API 账号文件",
           desc: "claude-api-accounts.json 的自定义路径",
+        },
+        kiroAccountsPath: {
+          label: "Kiro 账号文件",
+          desc: "kiro-accounts.json 的自定义路径",
         },
       },
     },

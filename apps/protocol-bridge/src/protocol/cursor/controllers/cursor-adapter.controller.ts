@@ -1,22 +1,6 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
 import { Controller, Logger, Post, Req, Res } from "@nestjs/common"
-import type { CreateMessageDto } from "../../anthropic/dto/create-message.dto"
-import { MessagesService } from "../../anthropic/messages.service"
 import { FastifyReply, FastifyRequest } from "fastify"
-import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.service"
-import { CodexService } from "../../../llm/openai/codex.service"
-import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.service"
-import { parseModelRequest } from "../../../llm/shared/model-request"
-import { ModelRouterService } from "../../../llm/shared/model-router.service"
-import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
-import {
-  canPublicClaudeModelUseGoogle,
-  getCursorDisplayModels,
-  resolveCloudCodeModel,
-} from "../../../llm/shared/model-registry"
-import type { AnthropicResponse } from "../../../shared/anthropic"
-import { connectRPCHandler } from "../connect-rpc-handler"
-import { CursorConnectStreamService } from "../cursor-connect-stream.service"
 import {
   GetAllowedModelIntentsResponseSchema,
   GetUsableModelsRequestSchema,
@@ -43,11 +27,28 @@ import {
   type GetDiffReviewRequest_SimpleFileDiff,
   type StreamBugBotRequest,
 } from "../../../gen/aiserver/v1_pb"
-import { KvStorageService } from "../kv-storage.service"
+import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.service"
+import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.service"
+import { KiroService } from "../../../llm/aws/kiro.service"
+import { CodexService } from "../../../llm/openai/codex.service"
+import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
+import {
+  canPublicClaudeModelUseGoogle,
+  getCursorDisplayModels,
+  resolveCloudCodeModel,
+} from "../../../llm/shared/model-registry"
+import { parseModelRequest } from "../../../llm/shared/model-request"
+import { ModelRouterService } from "../../../llm/shared/model-router.service"
+import type { AnthropicResponse } from "../../../shared/anthropic"
+import type { CreateMessageDto } from "../../anthropic/dto/create-message.dto"
+import { MessagesService } from "../../anthropic/messages.service"
+import { connectRPCHandler } from "../connect-rpc-handler"
+import { CursorConnectStreamService } from "../cursor-connect-stream.service"
 import {
   appendRequestedCursorModels,
   buildCursorUsableModel,
 } from "../cursor-model-protocol"
+import { KvStorageService } from "../kv-storage.service"
 
 /**
  * Cursor ConnectRPC Adapter Controller
@@ -67,6 +68,7 @@ export class CursorAdapterController {
     private readonly connectStreamService: CursorConnectStreamService,
     private readonly googleModelCache: GoogleModelCacheService,
     private readonly anthropicApiService: AnthropicApiService,
+    private readonly kiroService: KiroService,
     private readonly codexService: CodexService,
     private readonly modelRouter: ModelRouterService,
     private readonly openaiCompatService: OpenaiCompatService,
@@ -91,6 +93,11 @@ export class CursorAdapterController {
   }
 
   private isCursorModelCurrentlyRoutable(modelId: string): boolean {
+    // Kiro dynamically discovered models are always routable when Kiro is available.
+    if (this.kiroService.supportsModel(modelId)) {
+      return true
+    }
+
     const resolved = resolveCloudCodeModel(modelId)
     if (!resolved) {
       return this.anthropicApiService.supportsModel(modelId)

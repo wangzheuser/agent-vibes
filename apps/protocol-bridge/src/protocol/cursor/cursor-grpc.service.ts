@@ -321,6 +321,7 @@ import {
   TextDeltaUpdateSchema,
   ThinkingCompletedUpdateSchema,
   ThinkingDeltaUpdateSchema,
+  ThinkingStyle,
   TimeoutBehavior,
   // Todo & Phase
   TodoItemSchema,
@@ -396,6 +397,28 @@ function safeString(value: unknown, defaultValue: string = ""): string {
 type ToolCallOneOf = ToolCall["tool"]
 type InteractionUpdateOneOf = InteractionUpdate["message"]
 type InteractionQueryOneOf = InteractionQuery["query"]
+
+function resolveThinkingStyleForModel(model?: string): ThinkingStyle {
+  const normalized = (model || "").trim().toLowerCase()
+  if (!normalized) {
+    return ThinkingStyle.DEFAULT
+  }
+
+  if (normalized.includes("codex")) {
+    return ThinkingStyle.CODEX
+  }
+
+  if (
+    normalized.startsWith("gpt-5") ||
+    normalized.startsWith("o1") ||
+    normalized.startsWith("o3") ||
+    normalized.startsWith("o4")
+  ) {
+    return ThinkingStyle.GPT5
+  }
+
+  return ThinkingStyle.DEFAULT
+}
 
 /**
  * Parse unknown input into protobuf-compatible uint32.
@@ -1271,12 +1294,12 @@ export class CursorGrpcService {
   /**
    * Create Thinking Delta response
    */
-  createThinkingDeltaResponse(thinking: string): Buffer {
+  createThinkingDeltaResponse(thinking: string, model?: string): Buffer {
     return this.wrapInteractionUpdate(
       "thinkingDelta",
       create(ThinkingDeltaUpdateSchema, {
         text: thinking,
-        thinkingStyle: 1, // THINKING_STYLE_DEFAULT
+        thinkingStyle: resolveThinkingStyleForModel(model),
       })
     )
   }

@@ -142,6 +142,10 @@ export class ConfigManager {
     )
   }
 
+  get kiroAccountsPath(): string {
+    return this.resolveAccountPath("kiroAccountsPath", "kiro-accounts.json")
+  }
+
   get accountPathEnvOverrides(): Record<string, string> {
     const overrides: Record<string, string> = {}
 
@@ -170,6 +174,11 @@ export class ConfigManager {
     if (openaiCompatPath) {
       overrides.AGENT_VIBES_OPENAI_COMPAT_ACCOUNTS_PATH =
         path.resolve(openaiCompatPath)
+    }
+
+    const kiroPath = this.getConfiguredAccountPath("kiroAccountsPath")
+    if (kiroPath) {
+      overrides.AGENT_VIBES_KIRO_ACCOUNTS_PATH = path.resolve(kiroPath)
     }
 
     return overrides
@@ -328,5 +337,6 @@ export class ConfigManager {
     ensureDir(path.dirname(this.claudeApiAccountsPath))
     ensureDir(path.dirname(this.codexAccountsPath))
     ensureDir(path.dirname(this.openaiCompatAccountsPath))
+    ensureDir(path.dirname(this.kiroAccountsPath))
   }
 }
