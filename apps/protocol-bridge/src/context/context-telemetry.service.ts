@@ -19,6 +19,8 @@ export type ContextTelemetryEvent =
   | "compaction.microcompact_preflight"
   | "compaction.microcompact_reactive"
   | "compaction.microcompact_idle"
+  | "compaction.microcompact_skipped_cached"
+  | "compaction.replacement_state_pruned"
   | "compaction.hard_fit_truncation"
   // Reactive prompt-too-long recovery
   | "reactive.recovery_attempted"

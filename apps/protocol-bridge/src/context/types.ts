@@ -142,6 +142,26 @@ export interface ContextProjectionAttachment {
   tokenCount: number
 }
 
+/**
+ * One entry in the compaction history chain.
+ *
+ * **Scope contract** (compared to claude-code):
+ *
+ *   claude-code distinguishes two boundary types in its message stream:
+ *   `compact_boundary` (heavy summary compaction, like our commit) and
+ *   `microcompact_boundary` (lightweight tool-result clearing, with
+ *   `compactedToolIds[]` recorded on the boundary message).  This shape
+ *   only models the heavy variant — microcompact in our pipeline rewrites
+ *   tool_result blocks in place via `recordsOverride` and a persisted
+ *   replacement dictionary, without producing a commit.
+ *
+ *   That split is intentional: heavy compaction is irreversible and
+ *   needs a permanent audit trail; microcompact is a per-request
+ *   rendering optimisation whose state lives in
+ *   `ContextToolResultReplacementState`.  Both states are reset together
+ *   when a heavy commit is applied (see
+ *   `ContextCompactionService.pruneArchivedDerivedState`).
+ */
 export interface ContextCompactionCommit {
   id: string
   strategy: "auto" | "manual" | "reactive"
@@ -198,6 +218,37 @@ export interface InvestigationMemorySummaryLike {
   createdAt?: number
 }
 
+/**
+ * Aggregate root for one conversation's context state.
+ *
+ * **Mutability contract — single-writer**
+ *
+ * This object is mutated in place by `ContextCompactionService` and
+ * related services (records pushed, compaction history appended,
+ * investigation memory filtered, replacement state pruned, etc.).  The
+ * design only stays sound under a single-writer assumption: at any
+ * moment exactly one async task should be calling into the context
+ * services for a given state.
+ *
+ * Two callers in the bridge currently obey this:
+ *
+ * 1. `cursor-connect-stream.service.ts` serialises requests per session
+ *    via `ChatSessionManager` so the writer is the request handler.
+ * 2. `anthropic/messages.service.ts` is stateless — every request
+ *    creates an ephemeral state via `ContextManagerService`.
+ *
+ * If you ever introduce a new caller (background composer follow-up,
+ * push-driven session updates, etc.), wrap concurrent access in a
+ * per-session mutex BEFORE calling any context service.  The state
+ * shape is graph-y enough that interleaved mutation will produce
+ * silently corrupt projections (commit chain torn, replacement
+ * dictionary out of sync with records, etc.) and the test suite
+ * cannot catch that because tests run serially by construction.
+ *
+ * Do not "fix" this by deep-cloning on every read — it would be
+ * correct but allocates O(records × rounds) on every request and
+ * defeats the ledger's projected-token cache.
+ */
 export interface ContextConversationState {
   records: ContextTranscriptRecord[]
   compactionHistory: ContextCompactionCommit[]

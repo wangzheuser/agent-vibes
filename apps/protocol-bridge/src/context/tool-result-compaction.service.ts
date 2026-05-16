@@ -195,6 +195,32 @@ export class ToolResultCompactionService {
       persistedReplacements
     )
 
+    // Fast path: when there is nothing left to compact we can skip the
+    // expensive `applyReplacements` + tokenize loop entirely.  A round
+    // contributes "work" only when at least one eligible result is not
+    // yet covered by the persisted replacement dictionary.  This kicks in
+    // on the very common idle re-trigger case where every older round was
+    // compacted on a previous call and the canonical records still carry
+    // those replacements verbatim.
+    if (this.canShortCircuitCompaction(rounds, keepRecentRounds, options)) {
+      this.logger.debug(
+        `[${options.trigger}-microcompact] short-circuit: nothing new to compact ` +
+          `(rounds=${rounds.length}, kept-recent=${Math.min(
+            keepRecentRounds,
+            rounds.length
+          )})`
+      )
+      return {
+        records: records as ContextTranscriptRecord[],
+        changed: false,
+        trigger: options.trigger,
+        clearedToolResults: 0,
+        compactedRounds: 0,
+        keptRecentRounds: Math.min(keepRecentRounds, rounds.length),
+        estimatedTokens,
+      }
+    }
+
     let workingRecords =
       replacementTextByToolUseId.size > 0
         ? this.applyReplacements(records, replacementTextByToolUseId)
@@ -372,6 +398,53 @@ export class ToolResultCompactionService {
     }
 
     return rounds
+  }
+
+  /**
+   * Decide whether `compactRecords` can return early without doing any
+   * record-rewriting work.
+   *
+   * Short-circuit is safe when neither the older-rounds primary loop nor
+   * the budget-pressure fallback loop would produce a new compaction:
+   * every eligible result in the rounds those loops would touch already
+   * has a persisted replacement (priming covered it) or is no longer
+   * eligible (already compacted block).
+   *
+   * For idle and preflight triggers there is no fallback loop, so only
+   * the older-rounds slice needs checking.  For reactive trigger the
+   * fallback can extend into protected rounds (except the very last) so
+   * we must consider that scope too — but only when the caller actually
+   * has budget pressure (`targetTokens` set).
+   */
+  private canShortCircuitCompaction(
+    rounds: readonly ApiRound[],
+    keepRecentRounds: number,
+    options: ToolResultCompactionOptions
+  ): boolean {
+    if (rounds.length === 0) return true
+    const protectedRoundStart = Math.max(0, rounds.length - keepRecentRounds)
+    const primary = rounds.slice(0, protectedRoundStart)
+    if (this.roundsHaveUncompactedWork(primary)) return false
+
+    // Reactive trigger may dip into protected rounds (excluding the last
+    // one) when older rounds aren't enough.  Idle/preflight stop at the
+    // protected boundary so they can short-circuit without consulting it.
+    if (options.trigger === "reactive" && options.targetTokens != null) {
+      const fallback =
+        rounds.length > 1 ? rounds.slice(protectedRoundStart, -1) : []
+      if (this.roundsHaveUncompactedWork(fallback)) return false
+    }
+
+    return true
+  }
+
+  private roundsHaveUncompactedWork(rounds: readonly ApiRound[]): boolean {
+    for (const round of rounds) {
+      for (const result of round.results) {
+        if (result.eligibleForCompaction) return true
+      }
+    }
+    return false
   }
 
   private markRoundForCompaction(

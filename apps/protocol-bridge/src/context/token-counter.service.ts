@@ -1,5 +1,10 @@
 import { getTokenizer } from "@anthropic-ai/tokenizer"
-import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from "@nestjs/common"
 import type { Tiktoken } from "tiktoken/lite"
 import {
   ContentBlock,
@@ -24,9 +29,17 @@ import {
  * - Handles JSON string content (Cursor client sends content as JSON strings)
  * - Counts tool_use, tool_result, and tool_calls properly
  * - Image token estimation
+ *
+ * Lifecycle:
+ * - `onModuleInit` lazily loads the WASM-backed tokenizer.
+ * - `onModuleDestroy` releases the native handle so Nest reloads don't
+ *   leak heap.  Without this, repeated module init/destroy cycles (tests,
+ *   hot-reload, dynamic module rebuilds) accumulate WASM memory because
+ *   `@anthropic-ai/tokenizer.getTokenizer()` allocates fresh native state
+ *   on every call.
  */
 @Injectable()
-export class TokenCounterService implements OnModuleInit {
+export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TokenCounterService.name)
   private encoder: Tiktoken | null = null
 
@@ -82,6 +95,25 @@ export class TokenCounterService implements OnModuleInit {
       this.logger.warn(
         `Failed to initialize Claude tokenizer: ${String(error)}. Token counts will be estimated.`
       )
+    }
+  }
+
+  /**
+   * Release the WASM-backed tokenizer handle.  Idempotent: safe to call
+   * multiple times or before init has finished.  Errors during free() are
+   * swallowed because at module destruction we never want to mask the
+   * shutdown reason.
+   */
+  onModuleDestroy() {
+    if (!this.encoder) return
+    try {
+      this.encoder.free()
+    } catch (error) {
+      this.logger.debug(
+        `Tokenizer free() failed (likely already released): ${String(error)}`
+      )
+    } finally {
+      this.encoder = null
     }
   }
 

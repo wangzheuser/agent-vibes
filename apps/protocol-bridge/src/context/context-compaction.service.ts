@@ -235,6 +235,14 @@ export class ContextCompactionService {
         projected = idleCompaction.projectedMessages
         estimated = idleCompaction.estimatedTokens
         microcompactCompaction = idleCompaction.result
+      } else if (idleCompaction) {
+        // Idle trigger fired but the microcompact short-circuited because
+        // every eligible round was already cached.  Emit a lightweight
+        // signal so dashboards can distinguish "idle was a no-op" from
+        // "idle never ran".
+        this.telemetry.recordEvent({
+          event: "compaction.microcompact_skipped_cached",
+        })
       }
     }
 
@@ -484,30 +492,74 @@ export class ContextCompactionService {
         epoch: plan.commit.epoch ?? nextEpoch,
       },
     })
-    // Prune investigation memory entries whose evidence was fully archived
-    // by this compaction commit so stale references don't accumulate.
-    this.pruneArchivedInvestigationMemory(
-      state,
-      plan.commit.archivedThroughRecordId
-    )
+    // Prune state tied to records that this commit just archived.  Both
+    // investigation memory entries and tool-result replacement entries are
+    // keyed off live records; once the records are summarised away the
+    // related state is dead weight that only grows over a long session.
+    this.pruneArchivedDerivedState(state, plan.commit.archivedThroughRecordId)
   }
 
-  private pruneArchivedInvestigationMemory(
+  /**
+   * Drop derived state whose source records were archived by this commit.
+   *
+   * Two slices of state need clearing together:
+   * 1. `investigationMemory` entries created at or before the boundary
+   *    timestamp — their evidence is now in the commit summary.
+   * 2. `toolResultReplacementState` — the entire dictionary is reset to
+   *    empty.  This mirrors claude-code's per-boundary `compactedToolIds`
+   *    model: each boundary is a hard visibility cutoff, and the
+   *    replacement text is regenerated on demand by future microcompacts.
+   *
+   * Why a full reset is safe (despite looking aggressive):
+   *
+   *   `buildCompactedContent` in `ToolResultCompactionService` is a pure
+   *   function of `(toolName, toolInput, outputPreview)` derived from the
+   *   current record block.  Canonical `state.records` are never mutated
+   *   in-place, so re-running compaction over a retained tool_result
+   *   produces an identical replacement string.  The dictionary is
+   *   therefore a caching optimization, not a source of truth — and the
+   *   cost of rebuilding it on the next microcompact is O(eligible-rounds
+   *   in retained slice), which is bounded by `KEEP_RECENT_ROUNDS`.
+   *
+   *   Compared to selectively pruning by walking every retained block,
+   *   this is dramatically simpler and matches the "boundary = clean
+   *   slate" semantics that the rest of the projection layer already
+   *   relies on (commit chain, epoch monotonicity, archived-record
+   *   filtering).
+   */
+  private pruneArchivedDerivedState(
     state: ContextConversationState,
     archivedThroughRecordId: string
   ): void {
-    if (state.investigationMemory.length === 0) return
     const archivedRecord = state.records.find(
       (record) => record.id === archivedThroughRecordId
     )
     if (!archivedRecord) return
     const cutoff = archivedRecord.createdAt
-    state.investigationMemory = state.investigationMemory.filter(
-      // Use strict > because entries created at the same millisecond as
-      // the archived record boundary are fully covered by this compaction
-      // commit's summary and should be pruned to avoid accumulation.
-      (entry) => entry.createdAt > cutoff
-    )
+
+    if (state.investigationMemory.length > 0) {
+      state.investigationMemory = state.investigationMemory.filter(
+        // Use strict > because entries created at the same millisecond as
+        // the archived record boundary are fully covered by this commit's
+        // summary and should be pruned to avoid accumulation.
+        (entry) => entry.createdAt > cutoff
+      )
+    }
+
+    const replacementState = state.toolResultReplacementState
+    if (replacementState) {
+      const prunedCount =
+        Object.keys(replacementState.replacementByToolUseId).length +
+        replacementState.seenToolUseIds.length
+      if (prunedCount > 0) {
+        replacementState.replacementByToolUseId = {}
+        replacementState.seenToolUseIds = []
+        this.telemetry.recordEvent({
+          event: "compaction.replacement_state_pruned",
+          delta: prunedCount,
+        })
+      }
+    }
   }
 
   private resolveAttachmentBudget(
