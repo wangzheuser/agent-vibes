@@ -58,6 +58,19 @@ export interface ClaudeToKiroOptions {
   conversationId?: string
   /** Pre-resolved Kiro profile ARN, if known. */
   profileArn?: string
+  /**
+   * Whether this request is an agent-mode (tool-using) call.
+   *
+   * The official Kiro client only adds `agentTaskType` and
+   * `agentContinuationId` in agent-mode payloads; its plain `_streamChat`
+   * path omits them entirely. Mirroring that behavior keeps prompt-cache
+   * keys aligned with the upstream and avoids drift between simple chat
+   * and agent payloads.
+   *
+   * If `undefined`, the translator infers agent mode from the presence of
+   * tools in the dto.
+   */
+  agentMode?: boolean
 }
 
 export function mapKiroModel(model: string): string {
@@ -203,12 +216,16 @@ export function claudeToKiro(
       | undefined
   )
 
+  // Agent-mode resolution: caller can override via options.agentMode, otherwise
+  // we infer from tool presence (matches the official Kiro client, which only
+  // emits agentTaskType / agentContinuationId in its agent-mode path).
+  const isAgentMode =
+    options.agentMode ?? (kiroTools.length > 0 || currentToolResults.length > 0)
+
   const payload: KiroPayload = {
     conversationState: {
       chatTriggerType: "MANUAL",
       conversationId: options.conversationId || randomUUID(),
-      agentContinuationId: options.agentContinuationId || randomUUID(),
-      agentTaskType: "vibe",
       currentMessage: {
         userInputMessage: {
           // 抓包验证：currentMessage.userInputMessage 同时带 modelId / origin。
@@ -219,6 +236,12 @@ export function claudeToKiro(
         },
       },
     },
+  }
+
+  if (isAgentMode) {
+    payload.conversationState.agentTaskType = "vibe"
+    payload.conversationState.agentContinuationId =
+      options.agentContinuationId || randomUUID()
   }
 
   if (options.profileArn) {

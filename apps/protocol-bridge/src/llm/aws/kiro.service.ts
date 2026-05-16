@@ -103,7 +103,7 @@ interface KiroAccount extends CooldownableAccount {
   proxyUrl?: string
   maxContextTokens?: number
   priority: number
-  preferredEndpoint: "auto" | "kiro" | "codewhisperer" | "amazonq"
+  preferredEndpoint: "auto" | "kiro" | "codewhisperer"
   endpointFallback: boolean
   client?: Partial<KiroClientConfig>
   /** Promise guard so concurrent refreshes share one HTTP call. */
@@ -806,8 +806,7 @@ export class KiroService implements OnModuleInit {
           : 0,
       preferredEndpoint:
         entry.preferredEndpoint === "kiro" ||
-        entry.preferredEndpoint === "codewhisperer" ||
-        entry.preferredEndpoint === "amazonq"
+        entry.preferredEndpoint === "codewhisperer"
           ? entry.preferredEndpoint
           : "auto",
       endpointFallback: entry.endpointFallback !== false,
@@ -963,9 +962,6 @@ export class KiroService implements OnModuleInit {
       case "codewhisperer":
         primary = 1
         break
-      case "amazonq":
-        primary = 2
-        break
       default:
         return [...KIRO_ENDPOINTS]
     }
@@ -1077,8 +1073,12 @@ export class KiroService implements OnModuleInit {
             Accept: "*/*",
             "x-amzn-kiro-agent-mode": "vibe",
             "x-amzn-codewhisperer-optout": "true",
-            "Amz-Sdk-Request": "attempt=1; max=3",
-            "Amz-Sdk-Invocation-Id": randomUUID(),
+            // Lower-case header names match what the AWS SDK actually emits
+            // (verified in `kiro_traffic.log`). HTTP is case-insensitive so
+            // this is purely cosmetic, but it keeps captures diff-clean and
+            // avoids any anti-abuse fingerprinting on header casing.
+            "amz-sdk-request": "attempt=1; max=3",
+            "amz-sdk-invocation-id": randomUUID(),
           },
         })
         if (endpoint.amzTarget) {

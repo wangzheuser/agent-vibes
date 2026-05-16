@@ -11,7 +11,11 @@
  * Go implementation) and dispatches recognized event types via callbacks.
  */
 
-import type { KiroStreamCallback, KiroToolUse } from "./protocol-types"
+import type {
+  KiroCodeReference,
+  KiroStreamCallback,
+  KiroToolUse,
+} from "./protocol-types"
 
 interface ToolUseState {
   toolUseId: string
@@ -37,8 +41,6 @@ export async function parseKiroEventStream(
   let outputTokens = 0
   let totalCredits = 0
   let currentToolUse: ToolUseState | null = null
-  let lastAssistantContent = ""
-  let lastReasoningContent = ""
 
   const append = (chunk: Uint8Array): void => {
     if (pending.length === 0) {
@@ -126,33 +128,20 @@ export async function parseKiroEventStream(
         switch (eventType) {
           case "assistantResponseEvent": {
             const content = readString(event, "content")
-            if (content) {
-              const normalized = normalizeChunk(
-                content,
-                () => lastAssistantContent,
-                (next) => {
-                  lastAssistantContent = next
-                }
-              )
-              if (normalized && callback.onText) {
-                callback.onText(normalized, false)
-              }
+            if (content && callback.onText) {
+              // AWS CodeWhisperer streams text with HTML entities encoded
+              // (&quot;, &apos;, &amp;, &lt;, &gt;, plus numeric forms).
+              // The official Kiro client decodes per-chunk via unescape3()
+              // before yielding to consumers — match that behavior exactly.
+              // No dedup/overlap handling: each event is a clean delta.
+              callback.onText(unescapeHtmlEntities(content), false)
             }
             break
           }
           case "reasoningContentEvent": {
             const text = readString(event, "text")
-            if (text) {
-              const normalized = normalizeChunk(
-                text,
-                () => lastReasoningContent,
-                (next) => {
-                  lastReasoningContent = next
-                }
-              )
-              if (normalized && callback.onText) {
-                callback.onText(normalized, true)
-              }
+            if (text && callback.onText) {
+              callback.onText(unescapeHtmlEntities(text), true)
             }
             break
           }
@@ -174,10 +163,47 @@ export async function parseKiroEventStream(
             }
             break
           }
+          case "codeReferenceEvent": {
+            // License attribution metadata. Amazon Q Developer / Kiro must
+            // display these to comply with the commercial reference-tracker
+            // terms. The parser surfaces them via a callback; the proxy
+            // layer decides how (or whether) to render them.
+            const refs = extractCodeReferences(event)
+            if (refs.length > 0 && callback.onCodeReferences) {
+              callback.onCodeReferences(refs)
+            }
+            break
+          }
+          case "error":
+          case "invalidStateEvent":
+          case "internalServerException": {
+            // In-band stream error frames. The official Kiro client lets
+            // the AWS SDK throw these as typed exceptions; we don't get
+            // SDK deserialization for free, so route them through onError
+            // instead of silently dropping them.
+            const message =
+              readString(event, "message") ||
+              readString(event, "reason") ||
+              `Kiro stream emitted ${eventType}`
+            const err = new Error(`[${eventType}] ${message}`)
+            if (callback.onError) {
+              callback.onError(err)
+            }
+            // Stop further parsing — once the upstream signals a stream
+            // error, subsequent frames are unreliable.
+            throw err
+          }
           default:
             break
         }
       }
+    }
+
+    // Flush any tool_use that the upstream finished without a final
+    // `stop: true` marker (rare, but happens on abrupt stream close).
+    if (currentToolUse) {
+      finishToolUse(currentToolUse, callback)
+      currentToolUse = null
     }
 
     if (callback.onCredits && totalCredits > 0) {
@@ -358,39 +384,42 @@ function updateTokensFromEvent(
   return [inputTokens, outputTokens]
 }
 
-function normalizeChunk(
-  chunk: string,
-  read: () => string,
-  write: (next: string) => void
-): string {
-  if (chunk === "") return ""
-  const prev = read()
-  if (prev === "") {
-    write(chunk)
-    return chunk
-  }
-  if (chunk === prev) {
-    return ""
-  }
-  if (chunk.startsWith(prev)) {
-    const delta = chunk.slice(prev.length)
-    write(chunk)
-    return delta
-  }
-  if (prev.startsWith(chunk)) {
-    return ""
-  }
-
-  let maxOverlap = 0
-  const maxLen = Math.min(prev.length, chunk.length)
-  for (let i = maxLen; i > 0; i--) {
-    if (prev.endsWith(chunk.slice(0, i))) {
-      maxOverlap = i
-      break
-    }
-  }
-  write(chunk)
-  return maxOverlap > 0 ? chunk.slice(maxOverlap) : chunk
+/**
+ * Decode the HTML entities that AWS CodeWhisperer's assistantResponseEvent /
+ * reasoningContentEvent payloads use to escape quote-like characters.
+ *
+ * The set is intentionally identical to the official Kiro client's
+ * `unescape3` (sourced from `html-escaper`):
+ *   `&amp;` `&#38;` -> `&`
+ *   `&lt;`  `&#60;` -> `<`
+ *   `&gt;`  `&#62;` -> `>`
+ *   `&apos;` `&#39;` -> `'`
+ *   `&quot;` `&#34;` -> `"`
+ *
+ * Why this matters: when the model emits text containing `"` or `'`, the
+ * upstream serializes them as HTML entities. Without decoding, downstream
+ * markdown renderers see literal `&quot;` strings (or, worse, partial
+ * entities split across stream-frame boundaries) and the output ends up
+ * mis-formatted (e.g. unbalanced inline code).
+ */
+const HTML_ENTITY_RE = /&(?:amp|#38|lt|#60|gt|#62|apos|#39|quot|#34);/g
+const HTML_ENTITY_MAP: Record<string, string> = {
+  "&amp;": "&",
+  "&#38;": "&",
+  "&lt;": "<",
+  "&#60;": "<",
+  "&gt;": ">",
+  "&#62;": ">",
+  "&apos;": "'",
+  "&#39;": "'",
+  "&quot;": '"',
+  "&#34;": '"',
+}
+function unescapeHtmlEntities(input: string): string {
+  return input.replace(
+    HTML_ENTITY_RE,
+    (match) => HTML_ENTITY_MAP[match] ?? match
+  )
 }
 
 function handleToolUseEvent(
@@ -402,12 +431,20 @@ function handleToolUseEvent(
   const name = readString(event, "name")
   const isStop = event["stop"] === true
 
-  if (toolUseId && name) {
+  // Open or rotate the current tool-use buffer when a new toolUseId arrives.
+  // Per the official Kiro client, the FIRST chunk of a tool call carries
+  // both `toolUseId` and `name`; subsequent chunks carry only `input` and
+  // (optionally) `stop`. So we don't require `name` on every frame — only
+  // when allocating a fresh buffer.
+  if (toolUseId) {
     if (current === null) {
-      current = { toolUseId, name, inputBuffer: "" }
+      current = { toolUseId, name: name ?? "", inputBuffer: "" }
     } else if (current.toolUseId !== toolUseId) {
       finishToolUse(current, callback)
-      current = { toolUseId, name, inputBuffer: "" }
+      current = { toolUseId, name: name ?? "", inputBuffer: "" }
+    } else if (name && !current.name) {
+      // Edge case: id arrived first, name landed in a later frame.
+      current.name = name
     }
   }
 
@@ -416,6 +453,7 @@ function handleToolUseEvent(
     if (typeof input === "string") {
       current.inputBuffer += input
     } else if (input && typeof input === "object" && !Array.isArray(input)) {
+      // Defensive only: the official wire format streams `input` as a string.
       try {
         current.inputBuffer = JSON.stringify(input)
       } catch {
@@ -453,12 +491,48 @@ function finishToolUse(
   }
   if (!parsed) parsed = {}
 
+  if (!state.toolUseId || !state.name) {
+    // Drop malformed tool calls instead of emitting a half-baked block.
+    return
+  }
+
   const tu: KiroToolUse = {
     toolUseId: state.toolUseId,
     name: state.name,
     input: parsed,
   }
   callback.onToolUse?.(tu)
+}
+
+/**
+ * Extract `references` from a `codeReferenceEvent` payload.
+ * Mirrors the shape `Be3` produces in the official client.
+ */
+function extractCodeReferences(
+  event: Record<string, unknown>
+): KiroCodeReference[] {
+  const raw = event["references"]
+  if (!Array.isArray(raw)) return []
+  const refs: KiroCodeReference[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue
+    const r = item as Record<string, unknown>
+    const ref: KiroCodeReference = {}
+    if (typeof r.licenseName === "string") ref.licenseName = r.licenseName
+    if (typeof r.repository === "string") ref.repository = r.repository
+    if (typeof r.url === "string") ref.url = r.url
+    if (typeof r.information === "string") ref.information = r.information
+    const span = r.recommendationContentSpan
+    if (span && typeof span === "object" && !Array.isArray(span)) {
+      const s = span as Record<string, unknown>
+      ref.recommendationContentSpan = {
+        start: typeof s.start === "number" ? s.start : undefined,
+        end: typeof s.end === "number" ? s.end : undefined,
+      }
+    }
+    refs.push(ref)
+  }
+  return refs
 }
 
 /**

@@ -27,6 +27,17 @@ interface TraceRecord {
   bytes?: number
   compressedBytes?: number
   context?: string
+  // ConversationAction triggering metadata. Persisted so audit / replay
+  // can correlate which Cursor user / authId initiated each action.
+  triggeringAuthId?: string
+  triggeringUserAuthId?: string
+  triggeringUserId?: string | number
+  // Sub-case specific extras: only present when relevant. Lets audit/replay
+  // distinguish e.g. step_started vs step_completed (with stepName/status),
+  // active_branch_change (branchId/branchName), turn_ended (reason),
+  // summary_completed (summaryId), prompt_suggestion (suggestionId), etc.
+  // Values are flat string|number for cheap JSONL grep.
+  nestedExtras?: Record<string, string | number>
 }
 
 function firstString(...values: unknown[]): string | undefined {
@@ -51,6 +62,128 @@ function extractGenericToolCallId(value: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined
   const record = value as Record<string, unknown>
   return firstString(record.toolCallId, record.callId, record.id)
+}
+
+/**
+ * Best-effort flat extractor for "nested extras" — small key/value bag of
+ * scalar fields associated with a particular oneof sub-case. We deliberately
+ * avoid recursing into nested messages here; the goal is cheap JSONL grep,
+ * not a full structured dump.
+ */
+function pickScalarFields(
+  source: unknown,
+  keys: readonly string[]
+): Record<string, string | number> {
+  const out: Record<string, string | number> = {}
+  if (!source || typeof source !== "object") return out
+  const record = source as Record<string, unknown>
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === "string" && value.length > 0) {
+      out[key] = value
+    } else if (typeof value === "number" && Number.isFinite(value)) {
+      out[key] = value
+    } else if (typeof value === "bigint") {
+      out[key] = value.toString()
+    } else if (typeof value === "boolean") {
+      out[key] = value ? "true" : "false"
+    }
+  }
+  return out
+}
+
+function mergeExtras(
+  record: TraceRecord,
+  extras: Record<string, string | number>
+): void {
+  if (Object.keys(extras).length === 0) return
+  record.nestedExtras = { ...(record.nestedExtras || {}), ...extras }
+}
+
+/**
+ * Pull the inner ToolCall.tool oneof case ("readToolCall" / "shellToolCall"
+ * / "truncatedToolCall" / etc.) regardless of which wrapping update we are
+ * looking at. ToolCallStarted/Completed/Delta all carry the ToolCall on
+ * different field names, so we try a couple of common accessors.
+ */
+function extractAnyToolCase(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const record = value as Record<string, unknown>
+  const candidates = [
+    record.toolCall,
+    record.tool_call,
+    record.delta,
+    record.partialToolCall,
+  ]
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue
+    const inner = candidate as Record<string, unknown>
+    const tool = inner.tool
+    if (tool && typeof tool === "object") {
+      const tc = tool as { case?: string }
+      if (typeof tc.case === "string" && tc.case.length > 0) {
+        return tc.case
+      }
+    }
+    // Some deltas store the case directly on `delta.case`.
+    const innerCase = (inner as { case?: string }).case
+    if (typeof innerCase === "string" && innerCase.length > 0) {
+      return innerCase
+    }
+  }
+  return undefined
+}
+
+const INTERACTION_UPDATE_EXTRA_KEYS: Record<string, readonly string[]> = {
+  textDelta: ["modelCallId", "callId", "isFinal"],
+  thinkingDelta: ["modelCallId", "callId", "thinkingStyle"],
+  thinkingCompleted: ["modelCallId", "callId"],
+  tokenDelta: ["modelCallId", "inputTokens", "outputTokens", "totalTokens"],
+  heartbeat: ["modelCallId", "callId"],
+  shellOutputDelta: ["execId", "callId", "stream", "isStderr"],
+  toolCallStarted: ["callId", "modelCallId", "toolCallId"],
+  toolCallCompleted: [
+    "callId",
+    "modelCallId",
+    "toolCallId",
+    "status",
+    "errorReason",
+  ],
+  toolCallDelta: ["callId", "modelCallId", "toolCallId"],
+  partialToolCall: ["callId", "toolCallId", "partialIndex"],
+  stepStarted: ["stepId", "stepName", "stepKind", "modelCallId"],
+  stepCompleted: ["stepId", "stepName", "stepKind", "status", "modelCallId"],
+  summary: ["summaryId", "modelCallId"],
+  summaryStarted: ["summaryId", "modelCallId"],
+  summaryCompleted: ["summaryId", "modelCallId", "status"],
+  turnEnded: [
+    "modelCallId",
+    "endReason",
+    "reason",
+    "stopReason",
+    "outcome",
+    "isFinal",
+  ],
+  userMessageAppended: ["messageId", "callId"],
+  promptSuggestion: ["suggestionId", "modelCallId"],
+  postRequestPrompt: ["promptId", "modelCallId"],
+  activeBranchChange: ["branchId", "branchName", "modelCallId"],
+  feedbackRequest: ["requestId", "modelCallId", "kind"],
+}
+
+const CONVERSATION_ACTION_EXTRA_KEYS: Record<string, readonly string[]> = {
+  userMessageAction: ["messageId", "callId", "modelCallId"],
+  resumeAction: ["resumeReason", "callId"],
+  cancelAction: ["cancelReason", "callId"],
+  summarizeAction: ["summaryId", "callId"],
+  shellCommandAction: ["execId", "shellId", "command"],
+  startPlanAction: ["planId"],
+  executePlanAction: ["planId", "stepId"],
+  asyncAskQuestionCompletionAction: ["callId", "questionId"],
+  cancelSubagentAction: ["subagentId", "reason"],
+  backgroundTaskCompletionAction: ["taskId", "status"],
+  backgroundShellAction: ["shellId", "status"],
+  backgroundSubagentAction: ["subagentId", "status"],
 }
 
 function summarizeClientMessage(
@@ -95,6 +228,56 @@ function summarizeClientMessage(
       const action = msg.message.value.action
       record.nestedCase = action.case || undefined
       record.toolCallId = extractGenericToolCallId(action.value)
+      // Sub-case-specific scalar extras (executePlan / shellCommand /
+      // backgroundShell / cancelSubagent etc.) so each ConversationAction
+      // sub-case is distinguishable in trace without decoding payload.
+      const conversationExtraKeys = action.case
+        ? CONVERSATION_ACTION_EXTRA_KEYS[action.case]
+        : undefined
+      if (conversationExtraKeys) {
+        mergeExtras(
+          record,
+          pickScalarFields(action.value, conversationExtraKeys)
+        )
+      }
+      // Persist triggering metadata when Cursor includes it on the
+      // ConversationAction envelope. Cursor 3.x carries the authId on
+      // either `triggeringAuthId` (legacy) or
+      // `triggeringUserInfo.{authId,userId}` (current).
+      const conversationActionRecord = msg.message.value as unknown as Record<
+        string,
+        unknown
+      >
+      const triggeringUserInfo = (() => {
+        const value = conversationActionRecord.triggeringUserInfo
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          return value as Record<string, unknown>
+        }
+        return undefined
+      })()
+      const legacyAuthId = firstString(
+        conversationActionRecord.triggeringAuthId
+      )
+      if (legacyAuthId) {
+        record.triggeringAuthId = legacyAuthId
+      }
+      if (triggeringUserInfo) {
+        const infoAuthId = firstString(triggeringUserInfo.authId)
+        if (infoAuthId) {
+          record.triggeringUserAuthId = infoAuthId
+        }
+        const userIdRaw = triggeringUserInfo.userId
+        if (typeof userIdRaw === "string" && userIdRaw.length > 0) {
+          record.triggeringUserId = userIdRaw
+        } else if (
+          typeof userIdRaw === "number" &&
+          Number.isFinite(userIdRaw)
+        ) {
+          record.triggeringUserId = userIdRaw
+        } else if (typeof userIdRaw === "bigint") {
+          record.triggeringUserId = userIdRaw.toString()
+        }
+      }
       break
     }
     default:
@@ -125,9 +308,33 @@ function summarizeServerMessage(
       record.callId = firstString(value?.callId)
       record.modelCallId = firstString(value?.modelCallId)
       record.toolCase = extractToolCase(value?.toolCall as ToolCall | undefined)
+      if (!record.toolCase) {
+        record.toolCase = extractAnyToolCase(value)
+      }
       if (!record.toolCase && value?.toolCallDelta) {
         const delta = value.toolCallDelta as { delta?: { case?: string } }
         record.toolCase = delta.delta?.case
+      }
+      // Capture sub-case-specific scalars so audit / replay can distinguish
+      // turn_ended vs step_completed vs summary_completed without decoding
+      // the full envelope. Only fields that are flat scalars are captured.
+      const interactionExtraKeys = update.case
+        ? INTERACTION_UPDATE_EXTRA_KEYS[update.case]
+        : undefined
+      if (interactionExtraKeys) {
+        mergeExtras(record, pickScalarFields(value, interactionExtraKeys))
+      }
+      // The toolCallId on the inner ToolCall is the canonical correlation
+      // key for tool_call_started / completed / delta; pull it explicitly
+      // when the wrapping update did not carry callId itself.
+      if (!record.toolCallId) {
+        const innerToolCall = (value?.toolCall ||
+          value?.tool_call ||
+          value?.delta) as { toolCallId?: string; callId?: string } | undefined
+        record.toolCallId = firstString(
+          innerToolCall?.toolCallId,
+          innerToolCall?.callId
+        )
       }
       break
     }

@@ -11,6 +11,7 @@ import {
   statSync,
 } from "fs"
 import * as path from "path"
+import * as os from "os"
 import {
   type ContextAttachmentSnapshot,
   type ContextInvestigationMemoryEntry,
@@ -32,8 +33,10 @@ import {
   type DiagnosticsResult,
   ExecClientMessageSchema,
   type GrepResult,
+  type ListMcpResourcesExecResult,
   type LsDirectoryTreeNode,
   type LsResult,
+  type ReadMcpResourceExecResult,
   type ReadResult,
   type ShellResult,
   ShellStream,
@@ -1819,6 +1822,34 @@ export class CursorConnectStreamService {
     streamRoute: ModelRouteResult,
     hints?: BackendStreamHints
   ): CreateMessageDto {
+    // Pass the curated sub-agent tool surface so the model actually emits
+    // tool_use blocks instead of meta-thinking text. ctx.tools is built up
+    // front in executeSubAgentTask via buildToolsForApi().
+    const subAgentToolDefinitions = (() => {
+      const candidate = ctx.tools as unknown
+      if (!Array.isArray(candidate) || candidate.length === 0) {
+        return undefined
+      }
+      return candidate as ToolDefinition[]
+    })()
+
+    // Tell the sub-agent explicitly which tools it has and that it must
+    // commit a final summary after at most a few tool calls. This avoids
+    // the "think forever, never call a tool" failure mode observed during
+    // the smoke regression.
+    const availableToolNames = (subAgentToolDefinitions || [])
+      .map((tool) => tool?.name)
+      .filter((value): value is string => typeof value === "string")
+    const subAgentSystemAddendum =
+      "You are a sub-agent. Operate strictly within the tool surface " +
+      "below; never invent tools, never call shell/edit/filesystem tools " +
+      "(they are unavailable in sub-agent context). " +
+      (availableToolNames.length > 0
+        ? `Available tools: ${availableToolNames.join(", ")}. `
+        : "No tools are available in this sub-agent. ") +
+      "Use the smallest number of tool calls needed, then produce a final " +
+      "plain-text summary as your last assistant message (no tool_use)."
+
     const dto = this.buildStreamingDtoForRoute(streamRoute, {
       model: ctx.model,
       promptContext: this.buildPromptContextFromSession(session),
@@ -1827,6 +1858,8 @@ export class CursorConnectStreamService {
       thinkingLevel: session.thinkingLevel,
       thinkingDetailsRequested: session.thinkingDetailsRequested,
       budgetOverride: hints?.budgetOverride,
+      toolDefinitions: subAgentToolDefinitions,
+      additionalSystemPrompt: subAgentSystemAddendum,
       buildMessages: (budget) => {
         const compacted = this.contextManager.buildBackendMessagesFromMessages(
           ctx.messages.map((message) => ({
@@ -8397,6 +8430,149 @@ ${raw}
     }
   }
 
+  /**
+   * 把模型/客户端给出的 MCP server 名归一化到 IDE 实际挂载的 providerIdentifier。
+   *
+   * 背景：
+   *  - Cursor IDE 注册 user-defined MCP server 时会自动加 `user-` 前缀，
+   *    所以 cursor-mcp 端的 server registry 用 `user-context7` 之类作为 key。
+   *  - 模型 / 用户调用 list_mcp_resources / read_mcp_resource / mcp_tool 时
+   *    经常只传短名（"context7"），bridge 直接转发会导致 IDE
+   *    端 registry lookup miss、回报 `Server "context7" not found`，但实际
+   *    通道是健康的。
+   *  - 真实 providerIdentifier 集合在 session.mcpToolDefs 里，bridge 这一侧
+   *    完全有能力做对齐。
+   *
+   * 匹配策略（按优先级）：
+   *  1. 完全相等
+   *  2. 归一化字符串相等（去除非字母数字，忽略大小写）
+   *  3. 一方归一化字符串是另一方的前缀 / 后缀 / 子串
+   *
+   * 命中返回 mcpToolDefs 里真正的 providerIdentifier；找不到则原样返回，
+   * 让 IDE 端给出真实错误（比如 server 确实没挂）。
+   */
+  private resolveMountedMcpServer(
+    session: ChatSession,
+    requestedServer: string
+  ): string {
+    const trimmed = (requestedServer || "").trim()
+    if (!trimmed) return trimmed
+
+    const defs = session.mcpToolDefs || []
+    if (defs.length === 0) return trimmed
+
+    const knownProviders = new Set<string>()
+    for (const def of defs) {
+      const provider = (def?.providerIdentifier || "").trim()
+      if (provider) knownProviders.add(provider)
+    }
+    if (knownProviders.size === 0) return trimmed
+
+    if (knownProviders.has(trimmed)) return trimmed
+
+    const normalizedRequested = normalizeMcpToolIdentifier(trimmed)
+    if (!normalizedRequested) return trimmed
+
+    let bestMatch: string | undefined
+    let bestDelta = Number.POSITIVE_INFINITY
+    for (const provider of knownProviders) {
+      const normalizedProvider = normalizeMcpToolIdentifier(provider)
+      if (!normalizedProvider) continue
+
+      if (normalizedProvider === normalizedRequested) {
+        return provider
+      }
+
+      const isFuzzyMatch =
+        normalizedProvider.endsWith(normalizedRequested) ||
+        normalizedRequested.endsWith(normalizedProvider) ||
+        normalizedProvider.includes(normalizedRequested) ||
+        normalizedRequested.includes(normalizedProvider)
+      if (!isFuzzyMatch) continue
+
+      const delta = Math.abs(
+        normalizedProvider.length - normalizedRequested.length
+      )
+      if (delta < bestDelta) {
+        bestDelta = delta
+        bestMatch = provider
+      }
+    }
+
+    return bestMatch || trimmed
+  }
+
+  /**
+   * 对 mcp / list_mcp_resources / read_mcp_resource / get_mcp_tools 工具的
+   * input 做 server alias 归一化。返回新 input（不改原对象）。
+   *
+   * 触达字段：`serverName` / `server` / `server_name` /
+   * `providerIdentifier` / `provider_identifier`。任意一个被重写，其它字段
+   * 也跟着同步，避免 IDE 端拿到不一致的几个 server 字段。
+   */
+  private normalizeMcpServerInInput(
+    session: ChatSession,
+    input: Record<string, unknown>
+  ): Record<string, unknown> {
+    const candidateKeys = [
+      "serverName",
+      "server",
+      "server_name",
+      "providerIdentifier",
+      "provider_identifier",
+    ] as const
+
+    let requested = ""
+    for (const key of candidateKeys) {
+      const value = input[key]
+      if (typeof value === "string" && value.trim().length > 0) {
+        requested = value.trim()
+        break
+      }
+    }
+    if (!requested) return input
+
+    const resolved = this.resolveMountedMcpServer(session, requested)
+    if (!resolved || resolved === requested) return input
+
+    const next: Record<string, unknown> = { ...input }
+    for (const key of candidateKeys) {
+      const current = next[key]
+      if (typeof current === "string" && current.trim()) {
+        next[key] = resolved
+      }
+    }
+    this.logger.debug(
+      `MCP server alias rewrite: "${requested}" -> "${resolved}" ` +
+        `(matched against mounted providerIdentifier set)`
+    )
+    return next
+  }
+
+  /**
+   * 判断 toolName 是否需要 MCP server 名归一化。
+   *
+   * 包含 cursor-tool-mapper 暴露的 user-facing 名 + protocol case 名 +
+   * 内部 family 名（`mcp` / `mcp_tool` / `list_mcp_resources` /
+   * `read_mcp_resource` / `get_mcp_tools`）。
+   */
+  private isMcpServerScopedTool(toolName: string): boolean {
+    const normalized = (toolName || "").trim().toLowerCase()
+    if (!normalized) return false
+    return (
+      normalized === "mcp" ||
+      normalized === "mcp_tool" ||
+      normalized === "list_mcp_resources" ||
+      normalized === "read_mcp_resource" ||
+      normalized === "get_mcp_tools" ||
+      normalized === "client_side_tool_v2_mcp" ||
+      normalized === "client_side_tool_v2_call_mcp_tool" ||
+      normalized === "client_side_tool_v2_list_mcp_resources" ||
+      normalized === "client_side_tool_v2_read_mcp_resource" ||
+      normalized === "client_side_tool_v2_get_mcp_tools"
+    )
+  }
+
   private resolveExecDispatchTarget(
     session: ChatSession,
     toolName: string,
@@ -10662,6 +10838,49 @@ ${raw}
       return
     }
 
+    // Sub-agent tool surface.
+    //
+    // The sub-agent does NOT have a private ExecServerMessage channel back
+    // to the IDE, so it cannot run read_file / list_directory / grep_search
+    // / edit_file_v2 / run_terminal_command directly. We therefore restrict
+    // the sub-agent surface to tools that are fully serviceable by the
+    // proxy's inline executors. This still gives the sub-agent enough power
+    // to do useful research-style work (web search, web fetch, semantic
+    // search, todo / plan, MCP tool dispatch, reflection, fetch_rules,
+    // search_symbols, ...). Anything outside this list will be reported
+    // to the model with a clear "use one of the tools below" message so it
+    // can re-plan instead of looping on a non-existent tool.
+    const SUB_AGENT_INLINE_TOOL_KEYS = [
+      "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
+      "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
+      "CLIENT_SIDE_TOOL_V2_FETCH",
+      "CLIENT_SIDE_TOOL_V2_FILE_SEARCH",
+      "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH",
+      "CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL",
+      "CLIENT_SIDE_TOOL_V2_DEEP_SEARCH",
+      "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
+      "CLIENT_SIDE_TOOL_V2_TODO_READ",
+      "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
+      "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
+      "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
+      "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
+      "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
+      "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
+      "CLIENT_SIDE_TOOL_V2_REFLECT",
+      "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
+      "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
+      "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
+      "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
+      "CLIENT_SIDE_TOOL_V2_READ_LINTS",
+      "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
+    ]
+    const subAgentTools = buildToolsForApi(SUB_AGENT_INLINE_TOOL_KEYS, {
+      mcpToolDefs: session.mcpToolDefs,
+      backend: this.modelRouter.resolveModel(
+        session.model || "gemini-2.5-flash"
+      ).backend,
+    })
+
     // Create sub-agent context
     const subagentId = `subagent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const ctx: SubAgentContext = {
@@ -10675,7 +10894,7 @@ ${raw}
         },
       ],
       model: session.model || "gemini-2.5-flash",
-      tools: [],
+      tools: subAgentTools,
       accumulatedText: "",
       pendingToolCallIds: new Set(),
       startTime: Date.now(),
@@ -10878,14 +11097,32 @@ ${raw}
             })
           }
         } else {
-          // Not a deferred tool – unsupported in sub-agent
+          // Not a deferred tool – the sub-agent has no ExecServerMessage
+          // channel back to the IDE, so file/shell/edit tools cannot run
+          // here. Tell the model exactly which tools ARE available so it
+          // can re-plan instead of looping on a non-existent tool.
           this.logger.warn(
             `[SubAgent] Unsupported exec tool: ${tc.name} (${tc.id})`
           )
+          const availableToolNames = (
+            (ctx.tools as unknown as ToolDefinition[]) || []
+          )
+            .map((t) => t?.name)
+            .filter((value): value is string => typeof value === "string")
+          const availableHint =
+            availableToolNames.length > 0
+              ? `Available tools in this sub-agent: ${availableToolNames.join(", ")}.`
+              : "No tools are available in this sub-agent."
           toolResults.push({
             type: "tool_result",
             tool_use_id: tc.id,
-            content: `[tool error] Tool "${tc.name}" is not available in sub-agent context`,
+            content:
+              `[tool error] Tool "${tc.name}" is not available in sub-agent ` +
+              `context (sub-agents cannot run shell, edit, or filesystem ` +
+              `tools because they have no ExecServerMessage channel). ` +
+              availableHint +
+              " Please complete the task using only those tools, or " +
+              "summarize what you have so far if you cannot continue.",
           })
         }
       }
@@ -10945,6 +11182,24 @@ ${raw}
 
   /**
    * Classify a tool name to its DeferredToolFamily, or null if it's not deferred.
+   *
+   * IMPORTANT: only tools whose semantics actually match the named family
+   * may be listed here. Earlier versions wrongly mapped:
+   *   - read_file        -> read_semsearch_files (ID-based, not path-based)
+   *   - list_dir         -> file_search          (pattern-based, not dir listing)
+   *   - file_search      -> file_search          (OK)
+   *   - grep_search      -> semantic_search      (semantic, not regex)
+   *   - codebase_search  -> semantic_search      (OK only for codebase_search)
+   * Routing read_file/list_dir/grep_search through these inline executors
+   * silently fed wrong-shaped inputs into the wrong tool, which is why the
+   * sub-agent loop appeared to "do nothing" – the model received nonsense
+   * results, gave up, and produced only meta-thinking text.
+   *
+   * Tools that require an ExecServerMessage round-trip (read_file,
+   * list_directory, grep_search, edit_file_v2, run_terminal_command,
+   * delete_file, etc.) are NOT deferred and MUST be excluded from this map.
+   * Sub-agent surface separately filters tool definitions so the model is
+   * never invited to call them.
    */
   private classifyDeferredToolFamily(
     toolName: string
@@ -10956,11 +11211,39 @@ ${raw}
       read_url_content: "read_url_content",
       view_content_chunk: "view_content_chunk",
       fetch: "fetch",
-      read_file: "read_semsearch_files",
-      list_dir: "file_search",
       file_search: "file_search",
-      grep_search: "semantic_search",
+      glob_search: "file_search",
+      semantic_search: "semantic_search",
+      deep_search: "deep_search",
       codebase_search: "semantic_search",
+      read_semsearch_files: "read_semsearch_files",
+      read_todos: "read_todos",
+      update_todos: "update_todos",
+      reflect: "reflect",
+      fetch_rules: "fetch_rules",
+      search_symbols: "search_symbols",
+      go_to_definition: "go_to_definition",
+      knowledge_base: "knowledge_base",
+      fetch_pull_request: "fetch_pull_request",
+      fix_lints: "fix_lints",
+      read_lints: "fix_lints",
+      read_project: "read_project",
+      update_project: "update_project",
+      get_mcp_tools: "get_mcp_tools",
+      list_mcp_resource_templates: "list_mcp_resource_templates",
+      ai_attribution: "ai_attribution",
+      await: "await_task",
+      await_task: "await_task",
+      reapply: "reapply",
+      apply_agent_diff: "apply_agent_diff",
+      apply_patch: "apply_patch",
+      report_bugfix_results: "report_bugfix_results",
+      record_screen: "record_screen",
+      computer_use: "computer_use",
+      start_grind_execution: "start_grind_execution",
+      start_grind_planning: "start_grind_planning",
+      background_composer_followup: "background_composer_followup",
+      create_diagram: "create_diagram",
     }
     return DEFERRED_TOOL_MAP[toolName] || null
   }
@@ -12831,6 +13114,73 @@ ${raw}
     }
   }
 
+  /**
+   * AI Attribution inline executor.
+   *
+   * The Cursor proto exposes `ai_attribution` as a client-side analysis tool
+   * over `AiAttributionToolCall`. This proxy does not maintain the full AI
+   * attribution index that Cursor's IDE backend uses to map historical
+   * commits → AI-generated regions, so we cannot return real attribution
+   * data. Returning a structured "no_data" success envelope is preferable
+   * to the previous `unsupported deferred tool family` error because the
+   * model can read the JSON and continue without retry-looping.
+   */
+  private executeInlineAiAttribution(input: Record<string, unknown>): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+  } {
+    const filePaths = this.pickStringArray(input, [
+      "file_paths",
+      "filePaths",
+      "paths",
+    ])
+    const startLine = this.pickFirstNumber(input, ["start_line", "startLine"])
+    const endLine = this.pickFirstNumber(input, ["end_line", "endLine"])
+    const commitHashes = this.pickStringArray(input, [
+      "commit_hashes",
+      "commitHashes",
+    ])
+    const outputMode =
+      this.pickFirstString(input, ["output_mode", "outputMode"]) || ""
+    const maxCommits = this.pickFirstNumber(input, [
+      "max_commits",
+      "maxCommits",
+    ])
+    const includeLineRanges = (() => {
+      const raw = input["include_line_ranges"] ?? input["includeLineRanges"]
+      if (typeof raw === "boolean") return raw
+      if (typeof raw === "string")
+        return raw.toLowerCase() === "true" || raw === "1"
+      return undefined
+    })()
+
+    const payload = {
+      tool: "ai_attribution",
+      status: "no_data",
+      reason:
+        "ai_attribution index is not maintained by this proxy runtime; " +
+        "no historical AI-vs-human commit mapping is available. " +
+        "Returning empty attribution result rather than failing the tool call.",
+      request: {
+        ...(filePaths.length > 0 ? { file_paths: filePaths } : {}),
+        ...(typeof startLine === "number" ? { start_line: startLine } : {}),
+        ...(typeof endLine === "number" ? { end_line: endLine } : {}),
+        ...(commitHashes.length > 0 ? { commit_hashes: commitHashes } : {}),
+        ...(outputMode ? { output_mode: outputMode } : {}),
+        ...(typeof maxCommits === "number" ? { max_commits: maxCommits } : {}),
+        ...(typeof includeLineRanges === "boolean"
+          ? { include_line_ranges: includeLineRanges }
+          : {}),
+      },
+      attributions: [] as Array<Record<string, unknown>>,
+    }
+
+    return {
+      content: JSON.stringify(payload, null, 2),
+      state: { status: "success" },
+    }
+  }
+
   private async executeDeferredTool(
     conversationId: string,
     family: DeferredToolFamily,
@@ -12990,6 +13340,9 @@ ${raw}
     }
     if (family === "setup_vm_environment") {
       return this.executeInlineSetupVmEnvironment(input)
+    }
+    if (family === "ai_attribution") {
+      return this.executeInlineAiAttribution(input)
     }
     return {
       content: `[${family} error] unsupported deferred tool family`,
@@ -13602,18 +13955,27 @@ ${raw}
     }
 
     if (family === "mcp_auth") {
+      // Per agent.v1 proto: McpAuthRequestQuery { args: McpAuthArgs { server_identifier, tool_call_id } }
+      // Accept both snake_case and camelCase identifiers from the model, plus
+      // a few legacy aliases (serverName/server) for backward compatibility.
+      const serverIdentifier =
+        this.pickFirstString(input, [
+          "server_identifier",
+          "serverIdentifier",
+          "serverName",
+          "server_name",
+          "server",
+        ]) || ""
+      const callIdFromInput =
+        this.pickFirstString(input, ["tool_call_id", "toolCallId"]) || ""
       return this.grpcService.createInteractionQueryResponse(
         interactionQueryId,
         "mcpAuthRequestQuery",
         {
-          serverName:
-            this.pickFirstString(input, [
-              "serverName",
-              "server_name",
-              "server",
-            ]) || "",
-          url: this.pickFirstString(input, ["url"]) || "",
-          toolCallId,
+          args: {
+            serverIdentifier,
+            toolCallId: callIdFromInput || toolCallId,
+          },
         }
       )
     }
@@ -14082,17 +14444,31 @@ ${raw}
     const family =
       deferredToolFamily || this.normalizeDeferredToolFamily(toolName)
 
+    // Cursor protocol white-list: tools that have a dedicated ToolCall oneof
+    // case in agent.v1 AND are rendered as their own UI card by the IDE
+    // (todo list / plan tree / etc). Their lifecycle MUST emit
+    // toolCallStarted / toolCallCompleted carrying the proto-typed ToolCall
+    // envelope, otherwise the IDE never receives a render trigger and the
+    // card silently disappears even though the underlying state was updated.
+    //
+    // Historically these were lumped with the rest of `DeferredToolFamily`
+    // and got suppressed alongside `web_search` / `web_fetch` (which are
+    // pure InteractionQuery tools without a UI-card ToolCall). The result
+    // was a protocol-conformant InteractionQuery exchange but an empty UI.
+    //
+    // Keep `create_plan` here even though it also has an InteractionQuery
+    // round-trip — InteractionQuery selects plan content, ToolCall renders
+    // the plan card; both must fire.
+    const UI_CARD_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
+      new Set<DeferredToolFamily>(["read_todos", "update_todos", "create_plan"])
+    if (family && UI_CARD_TOOL_FAMILIES.has(family)) {
+      return undefined
+    }
+
     if (family) {
       return {
         family,
         reason: "bridge_inline_or_interaction_query_tool",
-      }
-    }
-
-    if (this.isReadTodosToolName(toolName)) {
-      return {
-        family: "read_todos",
-        reason: "bridge_inline_todo_tool",
       }
     }
 
@@ -14103,20 +14479,6 @@ ${raw}
     }
 
     return undefined
-  }
-
-  private isReadTodosToolName(toolName: string): boolean {
-    const normalized = toolName.trim().toLowerCase()
-    if (!normalized) return false
-    const compact = normalized.replace(/[^a-z0-9]/g, "")
-    return (
-      normalized === "read_todos" ||
-      normalized === "todo_read" ||
-      normalized === "client_side_tool_v2_todo_read" ||
-      compact === "readtodos" ||
-      compact === "todoread" ||
-      compact === "clientsidetoolv2todoread"
-    )
   }
 
   private isUiOnlyTruncatedToolName(toolName: string): boolean {
@@ -14713,22 +15075,69 @@ ${raw}
     command: string | null
   ): AvoidableShellCommandClassification | null {
     if (!command) return null
-    const normalized = command.trim().toLowerCase()
-    if (!normalized) return null
+    const trimmed = command.trim()
+    if (!trimmed) return null
+    const normalized = trimmed.toLowerCase()
 
     // Deterministic repository file writes must go through the edit protocol so
     // Cursor can render the diff and the model receives a structured result.
-    if (
+    //
+    // We split the detection into two phases:
+    //   1. Pattern match: does the command look like a write?
+    //   2. Target whitelist: if every detected write target lives inside an
+    //      ephemeral / smoke / tmp area, allow it through. Only block when at
+    //      least one target may be a workspace file.
+    const looksLikeRedirectionWrite =
       /(^|[\n;&|])\s*(?:cat|printf|echo)\b[^\n]*(?:>|>>)\s*[^&|;\s]+/.test(
         normalized
-      ) ||
-      /(^|[\n;&|])\s*tee\s+(?:-[a-z]+\s+)*[^&|;\s]+/.test(normalized) ||
-      /(^|[\n;&|])\s*(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-pi\b)/.test(
-        normalized
-      ) ||
+      )
+    const looksLikeTeeWrite =
+      /(^|[\n;&|])\s*tee\s+(?:-[a-z]+\s+)*[^&|;\s]+/.test(normalized)
+    const looksLikeInPlaceEdit =
+      /(^|[\n;&|])\s*(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-pi\b)/.test(normalized)
+    const looksLikeProgrammaticWrite =
       /\b(?:writefilesync|writefile|write_text)\s*\(/.test(normalized) ||
       /\bopen\s*\([^)]*["'](?:w|a|x)\+?["']/.test(normalized)
+
+    if (
+      looksLikeRedirectionWrite ||
+      looksLikeTeeWrite ||
+      looksLikeInPlaceEdit ||
+      looksLikeProgrammaticWrite
     ) {
+      // For `sed -i` / `perl -pi` / `WriteFile(...)` / `open(..., "w")` we
+      // cannot reliably extract the target without a real parser, so fall
+      // back to the conservative block.
+      const hasNonRedirectionWrite =
+        looksLikeInPlaceEdit || looksLikeProgrammaticWrite
+      if (hasNonRedirectionWrite) {
+        return {
+          kind: "file_write",
+          recommendedTool: "edit_file_v2",
+          reason: "deterministic file write through shell",
+        }
+      }
+
+      // Extract all `> target` / `>> target` / `tee target` paths from the
+      // ORIGINAL command (preserving case for the path resolver).
+      const targets = this.extractShellWriteTargets(trimmed)
+
+      // No target extracted → can't prove safety, conservatively block.
+      if (targets.length === 0) {
+        return {
+          kind: "file_write",
+          recommendedTool: "edit_file_v2",
+          reason: "deterministic file write through shell",
+        }
+      }
+
+      const allTargetsAreEphemeral = targets.every((target) =>
+        this.isEphemeralWritePath(target)
+      )
+      if (allTargetsAreEphemeral) {
+        return null
+      }
+
       return {
         kind: "file_write",
         recommendedTool: "edit_file_v2",
@@ -14764,6 +15173,130 @@ ${raw}
     }
 
     return null
+  }
+
+  /**
+   * Extract write target paths from a shell command string.
+   *
+   * Recognizes:
+   *   - `> path` and `>> path` redirection targets
+   *   - `tee [flags] path1 path2 ...`
+   *
+   * Quoted paths (`'..'`, `".."`) are unquoted. Variable expansions like
+   * `$HOME` or `${TMPDIR}` are best-effort resolved against `process.env`.
+   * Returns target paths in the original case so callers can match against
+   * filesystem-sensitive prefixes.
+   */
+  private extractShellWriteTargets(command: string): string[] {
+    const targets: string[] = []
+    if (!command) return targets
+
+    // 1. Redirections: capture the token following `>` or `>>`.
+    const redirectionRegex = />>?\s*('([^']*)'|"([^"]*)"|([^\s;&|<>]+))/g
+    let match: RegExpExecArray | null
+    while ((match = redirectionRegex.exec(command)) !== null) {
+      const raw = match[2] ?? match[3] ?? match[4] ?? ""
+      if (raw) targets.push(raw)
+    }
+
+    // 2. tee: capture path arguments after optional flag-prefixed tokens.
+    const teeRegex = /(^|[\n;&|])\s*tee\b([^\n;|&]*)/g
+    while ((match = teeRegex.exec(command)) !== null) {
+      const tail = match[2] || ""
+      const tokens = tail
+        .split(/\s+/)
+        .map((token) => token.trim())
+        .filter((token) => token.length > 0)
+      for (const token of tokens) {
+        if (token.startsWith("-")) continue
+        const stripped = token.replace(/^['"]/, "").replace(/['"]$/, "")
+        if (stripped.length > 0) targets.push(stripped)
+      }
+    }
+
+    // 3. Best-effort env expansion. Any unresolvable ${VAR} stays in the
+    //    string and will simply fail the whitelist check, which is what
+    //    we want.
+    return targets.map((target) =>
+      target.replace(
+        /\$\{?([A-Z_][A-Z0-9_]*)\}?/gi,
+        (whole: string, name: string) => {
+          const value = process.env[name]
+          return typeof value === "string" && value.length > 0 ? value : whole
+        }
+      )
+    )
+  }
+
+  /**
+   * Determines whether a shell write target lives in a path that is safe to
+   * write through the terminal (smoke / tmp / explicit ephemeral dirs).
+   *
+   * Anything inside `<repo>` should be routed through `edit_file_v2`, but a
+   * pipeline like `... | jq ... > $TMPDIR/buf.json` is legitimate and should
+   * not be rejected.
+   */
+  private isEphemeralWritePath(rawTarget: string): boolean {
+    if (!rawTarget) return false
+    let target = rawTarget.trim()
+    // Strip surrounding quotes one more time defensively.
+    if (
+      (target.startsWith("'") && target.endsWith("'")) ||
+      (target.startsWith('"') && target.endsWith('"'))
+    ) {
+      target = target.slice(1, -1)
+    }
+    if (!target) return false
+
+    // Resolve ~ and ~user expansion to HOME.
+    if (target === "~" || target.startsWith("~/")) {
+      const home = process.env.HOME || os.homedir()
+      target = path.join(home, target.slice(target === "~" ? 1 : 2))
+    }
+
+    // Reject obviously hostile destinations early.
+    if (target.includes("\0")) return false
+
+    let resolved: string
+    try {
+      resolved = path.resolve(target)
+    } catch {
+      return false
+    }
+
+    // Build the whitelist set.
+    const home = process.env.HOME || os.homedir()
+    const smokeDirEnv = process.env.AGENT_VIBES_SMOKE_DIR
+    const defaultSmokeDir = path.resolve(home, ".agent-vibes", "smoke")
+    const agentVibesDir = path.resolve(home, ".agent-vibes")
+    const tmpDirEnv = process.env.TMPDIR
+    const whitelist = new Set<string>(
+      [
+        smokeDirEnv && path.resolve(smokeDirEnv),
+        defaultSmokeDir,
+        // Allow the broader ~/.agent-vibes tree (logs/, runtime/) so
+        // diagnostic captures from the agent are not blocked. This still
+        // excludes the workspace.
+        agentVibesDir,
+        tmpDirEnv && path.resolve(tmpDirEnv),
+        "/tmp",
+        "/var/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+      ].filter(
+        (value): value is string =>
+          typeof value === "string" && value.length > 0
+      )
+    )
+
+    for (const allowedRoot of whitelist) {
+      if (resolved === allowedRoot) return true
+      const prefix = allowedRoot.endsWith(path.sep)
+        ? allowedRoot
+        : `${allowedRoot}${path.sep}`
+      if (resolved.startsWith(prefix)) return true
+    }
+    return false
   }
 
   private buildAvoidableShellDispatchError(
@@ -15226,10 +15759,13 @@ ${raw}
     }
 
     const execIdNumber = this.sessionManager.nextExecId(conversationId)
+    const dispatchInput = this.isMcpServerScopedTool(dispatchTarget.toolName)
+      ? this.normalizeMcpServerInInput(session, dispatchTarget.input)
+      : dispatchTarget.input
     const toolCallBuffer = this.grpcService.createAgentToolCallResponse(
       dispatchTarget.toolName,
       toolCall.id,
-      dispatchTarget.input,
+      dispatchInput,
       execIdNumber
     )
     this.sessionManager.registerPendingToolExecId(
@@ -18253,6 +18789,66 @@ ${raw}
                 resources,
               },
             }
+          } else if (listResult.case === "error") {
+            // Graceful degrade for "tool-only" MCP servers.
+            //
+            // Some MCP servers register tools but expose no `resources`
+            // surface. The MCP runtime answers list_resources with
+            //   `Server "X" not found`
+            // for those servers, even though they ARE mounted. From the
+            // agent's perspective that is misleading: the MCP channel is
+            // healthy, the server simply has no resources.
+            //
+            // Heuristic: if the requested server is a known mounted server
+            // in this session (provider identifier appears in mcpToolDefs),
+            // and the error message looks like a "not found" envelope,
+            // rewrite the result to a success with `resources: []`. The
+            // model can then continue without retry-looping or wrongly
+            // concluding that the entire MCP channel is broken.
+            const requestedServer =
+              this.pickFirstString(pendingToolCall.toolInput, [
+                "serverName",
+                "server",
+                "server_name",
+              ]) || ""
+            const errorMessage =
+              typeof listResult.value?.error === "string"
+                ? listResult.value.error
+                : ""
+            const looksLikeNotFound =
+              /server\s+"[^"]*"\s+not\s+found/i.test(errorMessage) ||
+              /not\s+found/i.test(errorMessage)
+            const session = this.sessionManager.getSession(conversationId)
+            const mountedProviders = new Set<string>(
+              (session?.mcpToolDefs || [])
+                .map((def) =>
+                  normalizeMcpToolIdentifier(def.providerIdentifier || "")
+                )
+                .filter((value) => value.length > 0)
+            )
+            const normalizedRequested =
+              normalizeMcpToolIdentifier(requestedServer)
+            const requestedServerIsMounted =
+              normalizedRequested.length > 0 &&
+              (mountedProviders.has(normalizedRequested) ||
+                Array.from(mountedProviders).some(
+                  (mounted) =>
+                    mounted.includes(normalizedRequested) ||
+                    normalizedRequested.includes(mounted)
+                ))
+
+            if (looksLikeNotFound && requestedServerIsMounted) {
+              this.logger.debug(
+                `list_mcp_resources: rewriting "${errorMessage}" to empty ` +
+                  `success for tool-only MCP server "${requestedServer}"`
+              )
+              extraData = {
+                ...(extraData || {}),
+                listMcpResourcesSuccess: {
+                  resources: [],
+                },
+              }
+            }
           }
         }
         if (execMsg.message.case === "readMcpResourceExecResult") {
@@ -19386,6 +19982,16 @@ ${raw}
         return this.formatBgShellSpawnTyped(execMsg.message.value)
       }
 
+      // ──── List MCP Resources Result ────
+      if (msgCase === "listMcpResourcesExecResult") {
+        return this.formatListMcpResourcesResultTyped(execMsg.message.value)
+      }
+
+      // ──── Read MCP Resource Result ────
+      if (msgCase === "readMcpResourceExecResult") {
+        return this.formatReadMcpResourceResultTyped(execMsg.message.value)
+      }
+
       // ──── 非标准结构 Result 专门格式化 ────
 
       // ForceBackgroundShellResult / ForceBackgroundSubagentResult: { status: enum }
@@ -19864,6 +20470,110 @@ ${raw}
     if (r.case === "permissionDenied")
       return "Background shell spawn permission denied"
     return "Background shell spawn completed"
+  }
+
+  /**
+   * Format ListMcpResourcesExecResult into a model-friendly string.
+   *
+   * Preserves enough context for the model to disambiguate between three
+   * common error shapes the IDE returns through this oneof:
+   *  - success with empty resources (server mounted, exposes 0 resources)
+   *  - error: server unreachable / generic transport failure
+   *  - rejected: user policy / safety hook denied the call
+   *
+   * Notably the IDE wraps `Server "X" not found` into the `error` arm even when
+   * the server is actually mounted but exposes no resource surface. That edge
+   * case is recognized upstream (see the listMcpResourcesExecResult branch in
+   * handleToolResult) and rewritten into an empty success before this
+   * formatter sees it; if it still reaches here, propagate the message
+   * verbatim so the model can decide whether to retry on a different server.
+   */
+  private formatListMcpResourcesResultTyped(
+    result: ListMcpResourcesExecResult
+  ): string {
+    const r = result.result
+    if (r.case === "success") {
+      const resources = Array.isArray(r.value.resources)
+        ? r.value.resources
+        : []
+      if (resources.length === 0) {
+        return "[list_mcp_resources success] no resources exposed by this server"
+      }
+      const lines = [
+        `[list_mcp_resources success] ${resources.length} resource(s)`,
+      ]
+      const maxItems = 50
+      for (const resource of resources.slice(0, maxItems)) {
+        const uri = resource.uri || "(no uri)"
+        const name = resource.name ? ` ${resource.name}` : ""
+        const description = resource.description
+          ? ` — ${resource.description}`
+          : ""
+        lines.push(`- ${uri}${name}${description}`)
+      }
+      if (resources.length > maxItems) {
+        lines.push(
+          `... ${resources.length - maxItems} more resource(s) truncated`
+        )
+      }
+      return lines.join("\n")
+    }
+    if (r.case === "error") {
+      return `[list_mcp_resources error] ${r.value.error || "Unknown error"}`
+    }
+    if (r.case === "rejected") {
+      return `[list_mcp_resources rejected] ${r.value.reason || "Call rejected"}`
+    }
+    return "list_mcp_resources completed"
+  }
+
+  /**
+   * Format ReadMcpResourceExecResult into a model-friendly string.
+   *
+   * Distinguishes the four oneof arms with explicit error wording so the
+   * model can tell apart "this URI isn't published by the server" (notFound)
+   * from "the server rejected the read" (rejected) from "transport / runtime
+   * error" (error). Without these distinctions the model previously got a
+   * generic `[file not found] <uri>` fallback that masked policy denials and
+   * generic MCP failures behind a misleading `read_file` style envelope.
+   */
+  private formatReadMcpResourceResultTyped(
+    result: ReadMcpResourceExecResult
+  ): string {
+    const r = result.result
+    if (r.case === "success") {
+      const v = r.value
+      const uri = v.uri || ""
+      const mimeType = v.mimeType ? ` (${v.mimeType})` : ""
+      const downloadPath = v.downloadPath ? `\nsaved to: ${v.downloadPath}` : ""
+      const header = `[read_mcp_resource success] ${uri}${mimeType}${downloadPath}`
+      const content = v.content
+      if (content.case === "text" && typeof content.value === "string") {
+        return `${header}\n\n${content.value}`
+      }
+      if (content.case === "blob" && content.value) {
+        const length = content.value.length || 0
+        return `${header}\n\n[binary content: ${length} bytes]`
+      }
+      return header
+    }
+    if (r.case === "error") {
+      const uri = r.value.uri ? ` (uri: ${r.value.uri})` : ""
+      return `[read_mcp_resource error]${uri} ${r.value.error || "Unknown error"}`
+    }
+    if (r.case === "rejected") {
+      const uri = r.value.uri ? ` (uri: ${r.value.uri})` : ""
+      return `[read_mcp_resource rejected]${uri} ${r.value.reason || "Call rejected"}`
+    }
+    if (r.case === "notFound") {
+      // Distinguish from a `[file not found]` fallback. notFound here means the
+      // MCP server is reachable and accepted the call, but does not publish
+      // the requested resource URI; this is a server-surface mismatch, not a
+      // filesystem error. Including the URI helps the model decide whether to
+      // retry against a different server or list resources first.
+      return `[read_mcp_resource not_found] resource "${r.value.uri || "(no uri)"}" is not published by the server`
+    }
+    return "read_mcp_resource completed"
   }
 
   /**

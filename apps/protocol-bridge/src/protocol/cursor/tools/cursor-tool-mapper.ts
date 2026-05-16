@@ -859,18 +859,60 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS: {
     name: "report_bugfix_results",
-    description: "Report bugfix verification results",
+    description:
+      "Report bugfix verification results. Each result item must include " +
+      "a non-empty bugId, bugTitle, explanation, and a verdict (one of " +
+      '"fixed", "false_positive", "could_not_fix", or the integer 1/2/3).',
     input_schema: {
       type: "object",
       properties: {
         summary: { type: "string", description: "Bugfix summary" },
         results: {
           type: "array",
-          description: "Structured bugfix results",
-          items: { type: "object" },
+          description:
+            "Structured bugfix results. Must contain at least one item.",
+          items: {
+            type: "object",
+            properties: {
+              bugId: {
+                type: "string",
+                description:
+                  'Identifier of the bug being verified (also accepts "bug_id" or "id").',
+              },
+              bugTitle: {
+                type: "string",
+                description:
+                  'Short title of the bug (also accepts "bug_title" or "title").',
+              },
+              verdict: {
+                description:
+                  'Bugfix verdict: "fixed" (1), "false_positive" (2), or "could_not_fix" (3). String or integer accepted.',
+                oneOf: [
+                  {
+                    type: "string",
+                    enum: [
+                      "fixed",
+                      "false_positive",
+                      "could_not_fix",
+                      "not_fixed",
+                      "failed",
+                    ],
+                  },
+                  { type: "integer", minimum: 1, maximum: 3 },
+                ],
+              },
+              explanation: {
+                type: "string",
+                description:
+                  'Reason / details supporting the verdict (also accepts "reason" or "details").',
+              },
+            },
+            required: ["bugId", "bugTitle", "verdict", "explanation"],
+          },
+          minItems: 1,
         },
       },
-      required: [],
+      required: ["results"],
     },
   },
 
@@ -1011,19 +1053,39 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_MCP_AUTH: {
     name: "mcp_auth",
     description:
-      "Authenticate with an MCP server to enable access to its tools and resources",
+      "Authenticate with an MCP server to unlock access to its tools and " +
+      "resources. Call this ONLY in response to an upstream auth requirement: " +
+      "either a previous mcp_tool / list_mcp_resources / read_mcp_resource " +
+      "result that returned an authentication-required error carrying a " +
+      "toolCallId, or an explicit instruction from the user to (re-)auth a " +
+      "specific server. Do not invent a toolCallId; copy it verbatim from " +
+      "the prior tool error envelope so the IDE can correlate the auth " +
+      "exchange back to that pending tool call.",
     input_schema: {
       type: "object",
       properties: {
         server_identifier: {
           type: "string",
-          description: "Identifier of the MCP server to authenticate with",
+          description:
+            "Stable identifier of the MCP server to authenticate. Use the " +
+            "exact `server` / `providerIdentifier` value reported by " +
+            "get_mcp_tools or by the failing mcp_* tool's error payload " +
+            "(NOT a human-readable display name).",
         },
         tool_call_id: {
           type: "string",
-          description: "ID of the tool call that triggered the auth request",
+          description:
+            "REQUIRED in practice: the toolCallId of the previous mcp_* " +
+            "call whose error indicated that authentication is required. " +
+            "If you are running mcp_auth proactively (no upstream error " +
+            "exists), set this to a stable identifier the IDE can echo " +
+            "back, but never omit the field.",
         },
       },
+      // server_identifier is the only proto-level required field; we keep
+      // tool_call_id optional in the schema to stay compatible with the
+      // proto, but the description above makes its practical necessity
+      // explicit so the model does not silently drop it.
       required: ["server_identifier"],
     },
   },
@@ -1096,7 +1158,12 @@ const PREFERRED_CURSOR_KEY_BY_TOOL_NAME: Record<string, string> = {
   web_fetch: "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
   exa_search: "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
   exa_fetch: "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-  setup_vm_environment: "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT",
+  // setup_vm_environment intentionally omitted from preferred surface keys —
+  // the proxy runtime does not implement a VM environment broker, so we do
+  // not advertise it on the user-facing surface. Server-originated tool
+  // definitions for SETUP_VM_ENVIRONMENT are still recognized via the
+  // CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT definition for backward
+  // compatibility, but we never invite the model to call it.
   read_lints: "CLIENT_SIDE_TOOL_V2_READ_LINTS",
   list_mcp_resources: "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
   read_mcp_resource: "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
@@ -1181,7 +1248,8 @@ const TOOL_KEY_ALIASES: Record<string, string> = {
   switch_mode: "CLIENT_SIDE_TOOL_V2_SWITCH_MODE",
   exa_search: "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
   exa_fetch: "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-  setup_vm_environment: "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT",
+  // setup_vm_environment alias intentionally omitted from snake-case alias
+  // table for the same reason as above (no proxy backend).
   list_mcp_resources: "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
   read_mcp_resource: "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
   client_side_tool_v2_get_mcp_tools: "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",

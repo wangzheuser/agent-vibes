@@ -300,6 +300,18 @@ import {
   StepStartedUpdateSchema,
   StepTimingSchema,
   SubagentArgsSchema,
+  SubagentTypeBashSchema,
+  SubagentTypeBrowserUseSchema,
+  SubagentTypeComputerUseSchema,
+  SubagentTypeCursorGuideSchema,
+  SubagentTypeCustomSchema,
+  SubagentTypeDebugSchema,
+  SubagentTypeExploreSchema,
+  SubagentTypeMediaReviewSchema,
+  SubagentTypeSchema,
+  SubagentTypeShellSchema,
+  SubagentTypeUnspecifiedSchema,
+  SubagentTypeVmSetupHelperSchema,
   SummaryCompletedUpdateSchema,
   SummaryStartedUpdateSchema,
   SummaryUpdateSchema,
@@ -3685,6 +3697,124 @@ export class CursorGrpcService {
       .filter((item): item is Exclude<typeof item, undefined> => !!item)
   }
 
+  /**
+   * 解析 task / subagent 工具调用里的 subagent_type 字符串，
+   * 映射到 agent.v1.SubagentType oneof。
+   *
+   * 协议要求 TaskArgs.subagent_type / SubagentArgs.subagent_type 必须是合法
+   * 的 SubagentType message。模型/IDE 里通常用字符串描述子代理类型
+   * (e.g. "explore", "bash", "shell", "browser_use", 自定义名字)。
+   * 这里负责把字符串归一化到 proto oneof。
+   *
+   * 未识别的非空字符串走 `custom`，空 / 缺省走 `unspecified`，避免出现
+   * `subagent_type: undefined` 让 IDE 端校验拒绝整条 ToolCall。
+   */
+  private buildSubagentTypeMessage(rawSubagentType: string) {
+    const normalized = rawSubagentType.trim().toLowerCase()
+    switch (normalized) {
+      case "":
+      case "unspecified":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "unspecified" as const,
+            value: create(SubagentTypeUnspecifiedSchema, {}),
+          },
+        })
+      case "computer_use":
+      case "computeruse":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "computerUse" as const,
+            value: create(SubagentTypeComputerUseSchema, {}),
+          },
+        })
+      case "explore":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "explore" as const,
+            value: create(SubagentTypeExploreSchema, {}),
+          },
+        })
+      case "media_review":
+      case "mediareview":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "mediaReview" as const,
+            value: create(SubagentTypeMediaReviewSchema, {}),
+          },
+        })
+      case "bash":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "bash" as const,
+            value: create(SubagentTypeBashSchema, {}),
+          },
+        })
+      case "browser_use":
+      case "browseruse":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "browserUse" as const,
+            value: create(SubagentTypeBrowserUseSchema, {}),
+          },
+        })
+      case "shell":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "shell" as const,
+            value: create(SubagentTypeShellSchema, {}),
+          },
+        })
+      case "vm_setup_helper":
+      case "vmsetuphelper":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "vmSetupHelper" as const,
+            value: create(SubagentTypeVmSetupHelperSchema, {}),
+          },
+        })
+      case "debug":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "debug" as const,
+            value: create(SubagentTypeDebugSchema, {}),
+          },
+        })
+      case "cursor_guide":
+      case "cursorguide":
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "cursorGuide" as const,
+            value: create(SubagentTypeCursorGuideSchema, {}),
+          },
+        })
+      default:
+        return create(SubagentTypeSchema, {
+          type: {
+            case: "custom" as const,
+            value: create(SubagentTypeCustomSchema, {
+              name: rawSubagentType.trim(),
+            }),
+          },
+        })
+    }
+  }
+
+  /**
+   * 从 task / subagent / spawn_agent 工具调用 args 中提取 subagent_type 字段。
+   * 兼容 camelCase / snake_case / 别名 (subagent_type / subagentType /
+   * agent_type / type)。
+   */
+  private extractSubagentTypeName(args: Record<string, unknown>): string {
+    return safeString(
+      args.subagent_type ??
+        args.subagentType ??
+        args.agent_type ??
+        args.agentType ??
+        args.type
+    )
+  }
+
   private buildTaskArgs(args: Record<string, unknown>) {
     const items = Array.isArray(args.items) ? args.items : []
     const itemPrompt = items
@@ -3724,6 +3854,7 @@ export class CursorGrpcService {
     )
     const model = safeString(args.model).trim()
     const attachments = this.extractTaskAttachments(args)
+    const subagentTypeName = this.extractSubagentTypeName(args)
     return create(TaskArgsSchema, {
       description,
       prompt,
@@ -3732,6 +3863,7 @@ export class CursorGrpcService {
       agentId: agentId || undefined,
       attachments,
       mode: TaskMode.AGENT,
+      subagentType: this.buildSubagentTypeMessage(subagentTypeName),
     })
   }
 
@@ -3911,12 +4043,45 @@ export class CursorGrpcService {
         }
       }
       case "shell": {
+        // Route between the two oneof cases that share the ShellArgs payload.
+        //
+        //   - shellStreamArgs (default): Cursor IDE streams interleaved
+        //     stdout/stderr back via shellStream chunks; we settle on
+        //     shellResult only when the stream closes. This is the right
+        //     channel for long-running / interactive commands and is what
+        //     run_terminal_command historically routed to.
+        //
+        //   - shellArgs: synchronous, single-shot. The IDE runs the
+        //     command, then sends a single shellResult envelope. Use this
+        //     for short, deterministic commands where streaming has no
+        //     value and where the model expects an atomic completion (e.g.
+        //     a pwd / whoami probe, a one-liner returning a path).
+        //
+        // Without an explicit hint we keep the streaming default — that
+        // matches the prior behaviour and is what the smoke regression
+        // observed. The model can opt into the synchronous path by
+        // passing { streaming: false } / { synchronous: true } /
+        // { background: false, oneShot: true } in tool args.
+        const argRecord = args as Record<string, unknown>
+        const explicitlySync = (() => {
+          const synchronousFlag = argRecord["synchronous"] ?? argRecord["sync"]
+          if (synchronousFlag === true) return true
+          const streamingFlag = argRecord["streaming"]
+          if (streamingFlag === false) return true
+          const oneShotFlag = argRecord["oneShot"] ?? argRecord["one_shot"]
+          if (oneShotFlag === true) return true
+          return false
+        })()
+        const shellPayload = this.buildShellArgsMessage(toolCallId, argRecord)
+        if (explicitlySync) {
+          return {
+            case: "shellArgs" as const,
+            value: shellPayload,
+          }
+        }
         return {
           case: "shellStreamArgs" as const,
-          value: this.buildShellArgsMessage(
-            toolCallId,
-            args as Record<string, unknown>
-          ),
+          value: shellPayload,
         }
       }
       case "ls": {
@@ -4124,6 +4289,70 @@ export class CursorGrpcService {
   // ─── ToolCall V2 构建 ──────────────────────────────────────
 
   /**
+   * Maximum serialized JSON size of a single ToolCall.args payload before we
+   * proactively project it to a `truncatedToolCall` envelope. Cursor's
+   * proto reserves the truncatedToolCall oneof case specifically for this
+   * scenario (the IDE/client cannot meaningfully render a multi-megabyte
+   * tool-use payload), but earlier versions of the bridge never enforced
+   * an upper bound. We pick 256 KiB to comfortably cover the largest
+   * legitimate edit/diff payloads while still cutting off pathological
+   * model outputs (huge prompt-replay loops, base64 blobs, etc.).
+   */
+  private static readonly TOOL_CALL_ARGS_SIZE_GUARD_BYTES = 256 * 1024
+
+  /**
+   * Best-effort byte-size estimate for a ToolCall.args payload. Uses a
+   * try/catch around JSON.stringify because the model occasionally emits
+   * cyclic structures via inline-tool-result projection; in that case we
+   * conservatively return Infinity so the size guard still fires.
+   */
+  private estimateToolCallArgsBytes(args: Record<string, unknown>): number {
+    try {
+      return Buffer.byteLength(JSON.stringify(args ?? {}), "utf8")
+    } catch {
+      return Number.POSITIVE_INFINITY
+    }
+  }
+
+  /**
+   * Build the truncated-projection ToolCall envelope. Used both as the
+   * "no dedicated oneof case" fallback and as the explicit size-guard
+   * fallback when the args payload is too large to stream safely.
+   */
+  private buildSizeGuardTruncatedToolCall(
+    toolName: string,
+    bytesEstimate: number,
+    reason: string
+  ): ToolCall {
+    this.warnTruncatedToolProjection(
+      "size_guard",
+      toolName,
+      "truncated",
+      `${reason} (bytes≈${bytesEstimate})`
+    )
+    return create(ToolCallSchema, {
+      tool: {
+        case: "truncatedToolCall" as const,
+        value: create(TruncatedToolCallSchema, {
+          args: create(TruncatedToolCallArgsSchema, {}),
+          result: create(TruncatedToolCallResultSchema, {
+            result: {
+              case: "error" as const,
+              value: create(TruncatedToolCallErrorSchema, {
+                error:
+                  `Tool "${toolName}" args exceeded ` +
+                  `${CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES} bytes ` +
+                  `(${bytesEstimate} bytes); payload was dropped to ` +
+                  `protect the protocol stream.`,
+              }),
+            },
+          }),
+        }),
+      } as ToolCallOneOf,
+    })
+  }
+
+  /**
    * 构建 ToolCall V2 消息
    */
   private buildToolCallV2(
@@ -4132,6 +4361,14 @@ export class CursorGrpcService {
     args: Record<string, unknown>,
     toolFamilyHint?: ToolFamily
   ) {
+    const bytes = this.estimateToolCallArgsBytes(args)
+    if (bytes > CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES) {
+      return this.buildSizeGuardTruncatedToolCall(
+        toolName,
+        bytes,
+        "tool_use args payload exceeds size guard"
+      )
+    }
     const toolOneOf = this.buildToolCallOneOf(
       toolName,
       args,
@@ -5005,6 +5242,14 @@ export class CursorGrpcService {
     extraData?: ToolCompletionExtraData,
     toolFamilyHint?: ToolFamily
   ) {
+    const bytes = this.estimateToolCallArgsBytes(args)
+    if (bytes > CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES) {
+      return this.buildSizeGuardTruncatedToolCall(
+        toolName,
+        bytes,
+        "tool_use args payload exceeds size guard (with result)"
+      )
+    }
     const toolOneOf = this.buildToolCallWithResult(
       toolName,
       callId,
