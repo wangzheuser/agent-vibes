@@ -86,6 +86,7 @@ import {
   SessionTopLevelAgentTurnState,
   SubAgentContext,
 } from "./session/chat-session.service"
+import { type CursorSkillMetadata, CursorSkillsManager } from "./skills"
 import { generateTraceId } from "./tools/agent-helpers"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
@@ -95,13 +96,6 @@ import {
   ParsedCursorRequest,
   ParsedToolResult,
 } from "./tools/cursor-request-parser"
-import {
-  type CursorSkillMetadata,
-  findCursorSkillByName,
-  findCursorSkillForInternalPath,
-  normalizeSkillName,
-  resolveCursorSkillPolicy,
-} from "./tools/cursor-skill-policy"
 import {
   buildToolsForApi,
   getDefaultCodexImplicitAgentToolNames,
@@ -422,6 +416,14 @@ type AssistantTurnCompletionMode = "initial" | "continuation"
 interface HandleToolResultOptions {
   continueGeneration?: boolean
   streamId?: string
+  /**
+   * Whether to dispatch the next queued edit on the same path after the
+   * current edit_file_v2 invocation is consumed. Defaults to true. Aborted /
+   * synthetic tool result paths (execThrow, recovery, missing-output) set
+   * this to false so the proxy stops feeding fresh readArgs into a stream
+   * that the client has already torn down.
+   */
+  dispatchNextQueuedEditOnConsume?: boolean
 }
 
 interface BackendStreamOptions {
@@ -812,7 +814,8 @@ export class CursorConnectStreamService {
     private readonly tokenCounter: TokenCounterService,
     private readonly toolIntegrity: ToolIntegrityService,
     private readonly knowledgeBaseService: KnowledgeBaseService,
-    private readonly kiroService: KiroService
+    private readonly kiroService: KiroService,
+    private readonly cursorSkillsManager: CursorSkillsManager
   ) {
     // Register provider adapter cleanup on session expiry/deletion.
     // This ensures provider resources (Codex WS connections, warmup caches) are released.
@@ -1149,6 +1152,11 @@ export class CursorConnectStreamService {
 
       yield* this.handleToolResult(conversationId, syntheticParsed, {
         continueGeneration: false,
+        // The outer loop will feed an aborted result for every remaining
+        // pending tool (including any queued edits on the same path), so
+        // the per-consume picker must not dispatch a fresh readArgs onto
+        // a stream the client has already torn down.
+        dispatchNextQueuedEditOnConsume: false,
       })
       abortedCount++
     }
@@ -1319,6 +1327,12 @@ export class CursorConnectStreamService {
       ),
       {
         continueGeneration: false,
+        // execThrow drains every pending tool call on the stream via
+        // abortPendingToolCallsOnStream; queued edits on the same path will
+        // be aborted by that loop too. Suppress the per-consume picker so
+        // we don't re-dispatch readArgs onto a stream the client already
+        // tore down.
+        dispatchNextQueuedEditOnConsume: false,
       }
     )
 
@@ -3487,70 +3501,6 @@ ${raw}
       compact === "creatediagram" ||
       compact === "clientsidetoolv2generateimage" ||
       compact === "clientsidetoolv2creatediagram"
-    )
-  }
-
-  private buildInactiveCursorSkillToolError(
-    session: ChatSession,
-    toolName: string,
-    input: Record<string, unknown>
-  ): string | null {
-    const targetPath = this.pickCursorSkillTargetPath(toolName, input)
-    if (!targetPath) {
-      return null
-    }
-    const skill = findCursorSkillForInternalPath(
-      session.cursorRules,
-      targetPath
-    )
-    if (!skill) {
-      return null
-    }
-    if (this.isCursorSkillActive(session, skill.name)) {
-      return null
-    }
-
-    const message =
-      `Cursor skill access blocked: skill "${skill.name}" is available but not active. ` +
-      `Load it with fetch_rules({ skill_name: "${skill.name}" }) before using its internal files or generated workspace.`
-    this.logger.warn(
-      `${message}; tool=${toolName}; path=${targetPath || "(none)"}`
-    )
-    return message
-  }
-
-  private pickCursorSkillTargetPath(
-    toolName: string,
-    input: Record<string, unknown>
-  ): string {
-    const normalizedTool = toolName.trim().toLowerCase()
-    if (!normalizedTool) {
-      return ""
-    }
-
-    const mayTouchPath =
-      normalizedTool.includes("read") ||
-      normalizedTool.includes("list") ||
-      normalizedTool.includes("ls") ||
-      normalizedTool.includes("edit") ||
-      normalizedTool.includes("write") ||
-      normalizedTool.includes("delete") ||
-      normalizedTool.includes("file") ||
-      normalizedTool.includes("dir")
-    if (!mayTouchPath) {
-      return ""
-    }
-
-    return (
-      this.pickFirstString(input, [
-        "path",
-        "filePath",
-        "file_path",
-        "targetPath",
-        "target_path",
-        "directory",
-        "dir",
-      ]) || ""
     )
   }
 
@@ -12109,7 +12059,7 @@ ${raw}
       "name",
     ])
     if (requestedSkillName) {
-      const skill = findCursorSkillByName(
+      const skill = this.cursorSkillsManager.findByName(
         session?.cursorRules,
         requestedSkillName
       )
@@ -12121,7 +12071,7 @@ ${raw}
         }
       }
 
-      this.activateCursorSkillForSession(session, skill.name, "fetch_rules")
+      this.cursorSkillsManager.activate(session, skill.name, "fetch_rules")
       input.skill_name = skill.name
       input.path = skill.fullPath
       input.content = skill.content
@@ -12160,7 +12110,7 @@ ${raw}
     input.totalCount = rules.length
     input.path = rules[0]?.path || ""
 
-    const skillPolicy = resolveCursorSkillPolicy({
+    const skillPolicy = this.cursorSkillsManager.resolvePolicy({
       rules: session?.cursorRules,
       selectedRulePaths: session?.selectedCursorRulePaths,
       selectedRuleNames: session?.selectedCursorRuleNames,
@@ -12168,7 +12118,25 @@ ${raw}
       projectRoot: session?.projectContext?.rootPath,
       contextPaths: (session?.codeChunks || []).map((chunk) => chunk.path),
     })
-    input.available_skills = skillPolicy.availableSkills.map((skill) => ({
+
+    // 当 LLM 提供 query/description 时，用 minisearch 给 Skill 列表打分排序，
+    // 把最相关的 Skill 排在最前面，缓解「不知道自己不知道」的问题。
+    const searchQuery = this.pickFirstString(input, [
+      "query",
+      "description",
+      "task",
+    ])
+    const searchHits = searchQuery
+      ? this.cursorSkillsManager.search(
+          skillPolicy.availableSkills,
+          searchQuery
+        )
+      : []
+    const orderedSkills = searchHits.length
+      ? this.reorderBySearchHits(skillPolicy.availableSkills, searchHits)
+      : skillPolicy.availableSkills
+
+    input.available_skills = orderedSkills.map((skill) => ({
       name: skill.name,
       active: skill.active,
       activation_reason: skill.activationReason,
@@ -12177,6 +12145,13 @@ ${raw}
       paths: skill.paths,
       path: skill.fullPath,
     }))
+    if (searchHits.length > 0) {
+      input.search_hits = searchHits.map((hit) => ({
+        name: hit.skill.name,
+        score: hit.score,
+        matched_fields: hit.matchedFields,
+      }))
+    }
 
     const preview =
       rules.length > 0
@@ -12185,23 +12160,37 @@ ${raw}
             .join("\n\n---\n\n")
         : "- (no rules found)"
     const skillPreview =
-      skillPolicy.availableSkills.length > 0
-        ? "\n\nAvailable Cursor Skills:\n" +
-          skillPolicy.availableSkills
-            .map(
-              (skill) =>
-                `- ${skill.name} [${skill.active ? "active" : "inactive"}]` +
-                (skill.description
-                  ? `: ${this.truncateText(skill.description, 180)}`
-                  : "")
-            )
-            .join("\n") +
-          "\nUse fetch_rules({ skill_name }) to load an inactive skill."
-        : ""
+      this.cursorSkillsManager.buildCatalogSection(orderedSkills)
+    const searchPreview = searchHits.length
+      ? "\n\nTop matches for query:\n" +
+        searchHits
+          .map(
+            (hit, index) =>
+              `${index + 1}. ${hit.skill.name} (score: ${hit.score.toFixed(2)}, matched: ${hit.matchedFields.join(",") || "n/a"})`
+          )
+          .join("\n")
+      : ""
+
     return {
-      content: `[fetch_rules success] total=${rules.length}\n${preview}${skillPreview}`,
+      content:
+        `[fetch_rules success] total=${rules.length}\n${preview}` +
+        (skillPreview ? `\n\n${skillPreview}` : "") +
+        searchPreview +
+        (skillPolicy.availableSkills.length > 0
+          ? "\nUse fetch_rules({ skill_name }) to load an inactive skill."
+          : ""),
       state: { status: "success" },
     }
+  }
+
+  private reorderBySearchHits(
+    skills: CursorSkillMetadata[],
+    hits: ReadonlyArray<{ skill: CursorSkillMetadata }>
+  ): CursorSkillMetadata[] {
+    const hitNames = new Set(hits.map((hit) => hit.skill.name))
+    const ranked = hits.map((hit) => hit.skill)
+    const remaining = skills.filter((skill) => !hitNames.has(skill.name))
+    return [...ranked, ...remaining]
   }
 
   private async executeInlineSearchSymbols(
@@ -14089,12 +14078,12 @@ ${raw}
     const execDispatchResolution = validationErrorMessage
       ? { target: null, errorMessage: validationErrorMessage }
       : this.resolveExecDispatchTarget(session, canonicalToolName, input)
-    const pathForSkillActivation = this.pickCursorSkillTargetPath(
+    const pathForSkillActivation = this.cursorSkillsManager.pickToolTargetPath(
       execDispatchResolution.target?.toolName || canonicalToolName,
       execDispatchResolution.target?.input || input
     )
     if (pathForSkillActivation) {
-      this.activateCursorSkillsForPath(
+      this.cursorSkillsManager.activateForPath(
         session,
         pathForSkillActivation,
         `tool_path:${canonicalToolName}`
@@ -14102,7 +14091,7 @@ ${raw}
     }
     const unrequestedCanvasError = validationErrorMessage
       ? null
-      : this.buildInactiveCursorSkillToolError(
+      : this.cursorSkillsManager.guardToolAccess(
           session,
           execDispatchResolution.target?.toolName || canonicalToolName,
           execDispatchResolution.target?.input || input
@@ -15015,88 +15004,60 @@ ${raw}
   }
 
   /**
-   * Path-level edit mutex.
+   * Path-level edit serialization.
    *
-   * 防止同一文件被并发 edit_file_v2 抢占覆盖：
-   * 同 path 的下一个 edit 必须等前一个 edit 的 write_result 到达
-   * （即 detachPendingToolCall 触发 release）才能发 readArgs。
+   * 防止同一文件被并发 edit_file_v2 抢占覆盖：同 path 的下一个 edit 必须
+   * 等前一个 edit 完成（read_result 或 write_result 走完 consume 出口、
+   * ChatSessionManager.clearEditPathSlot 释放 holder）才能派发 readArgs。
    *
    * 设计参考：
    *  - claude-code 的 readFileState 时间戳防并发（写时验证 mtime）
    *  - codex 的 apply_patch 串行落盘（一次性原子写）
    *
    * Cursor 协议本身只对单 toolCallId 内的
-   *   readArgs(id=1) -> writeArgs(id=2)
+   *   readArgs(id=N) -> read_result(id=N) -> writeArgs(id=N+1) -> write_result(id=N+1)
    * 有序，跨 toolCallId **无任何串行约束**。模型一次产生 N 个
-   * edit_file_v2 时，N 个 readArgs 会并行到达 client，read_result
-   * 都返回原始文件，N 个 writeArgs 用各自基于原文件的 fileText
-   * 全量覆盖磁盘 —— 最后一个 write 抹掉所有前序修改。
-   * 这里加 path-level mutex 修这个竞态。
+   * edit_file_v2 时，N 个 readArgs 会并行到达 client，read_result 都返回
+   * 原始文件，N 个 writeArgs 用各自基于原文件的 fileText 全量覆盖磁盘 ——
+   * 最后一个 write 抹掉所有前序修改。
+   *
+   * 实现关键：串行化全部走 ChatSessionManager 的同步 API
+   * （acquireOrQueueEdit / pickNextEditForPath），dispatch 路径上不允许
+   * await 任何下游事件，否则会阻塞 BiDi 主 generator 的 input 消费栈，
+   * 导致 read_result/write_result 永远到不了 detach 出口、形成死锁。
    */
-  private readonly editingPathLocks = new Map<string, Promise<void>>()
 
-  private async acquireEditPathLock(path: string): Promise<() => void> {
-    const normalizedPath = (path || "").trim()
-    if (!normalizedPath) {
-      // 没有 path 不上锁，但仍然返回 noop release 让调用方逻辑统一
-      return () => {}
-    }
-
-    const previous =
-      this.editingPathLocks.get(normalizedPath) ?? Promise.resolve()
-    let release!: () => void
-    const next = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const ownTail = previous.then(() => next)
-    this.editingPathLocks.set(normalizedPath, ownTail)
-
-    await previous
-
-    return () => {
-      release()
-      // 自己是当前尾巴时清理映射，避免 Map 无界增长
-      if (this.editingPathLocks.get(normalizedPath) === ownTail) {
-        this.editingPathLocks.delete(normalizedPath)
-      }
-    }
-  }
-
-  private async *dispatchExecMessagesForTool(
+  private *dispatchExecMessagesForTool(
     conversationId: string,
     session: ChatSession,
     toolCall: ActiveToolCall,
     input: Record<string, unknown>,
     dispatchTarget: ExecDispatchTarget
-  ): AsyncGenerator<Buffer> {
+  ): Generator<Buffer> {
     if (this.isEditToolInvocation(dispatchTarget.toolName)) {
       const typedInput = dispatchTarget.input as ToolInputWithPath
       const editPath = String(typedInput.path || "")
 
-      // 同 path 串行化：等前一个 edit 的 write_result 释放锁后再发 readArgs。
-      // 这样新 read 拿到的 beforeContent 已经反映前一个 edit 的写入，
-      // applyEditInputToFileText 不会基于过期快照计算覆盖前序修改。
-      // release 由 detachPendingToolCall 在 consume / clear / 异常路径
-      // 统一执行（见 chat-session.service.ts attachEditPathLockRelease）。
-      const releaseEditPathLock = await this.acquireEditPathLock(editPath)
-      this.sessionManager.attachEditPathLockRelease(
+      // 同 path 串行化：尝试同步获取 path 槽。若已有持有者则把当前 edit
+      // 入队，等持有者完成后由 handleToolResult 出口的 picker 派发。
+      // 不在这里 await —— 保持 generator 推进，input 端才能持续消费
+      // read_result/write_result 推动持有者前进。
+      const acquireResult = this.sessionManager.acquireOrQueueEdit(
         conversationId,
         toolCall.id,
-        releaseEditPathLock
+        editPath
       )
 
-      const readExecId = this.sessionManager.nextExecId(conversationId)
-      const readExecMsg = this.grpcService.createReadExecMessage(
-        toolCall.id,
-        editPath,
-        readExecId
-      )
-      this.sessionManager.registerPendingToolExecId(
-        conversationId,
-        toolCall.id,
-        readExecId
-      )
-      yield readExecMsg
+      if (!acquireResult.acquired) {
+        this.logger.log(
+          `Queued edit ${toolCall.id} on path "${editPath || "(empty)"}": ` +
+            `another edit currently holds the path slot`
+        )
+        // pending 已登记；execId 推迟到出队派发时再注册。
+        return
+      }
+
+      yield* this.dispatchEditReadArgs(conversationId, toolCall.id, editPath)
       return
     }
 
@@ -15113,6 +15074,67 @@ ${raw}
       execIdNumber
     )
     yield toolCallBuffer
+  }
+
+  /**
+   * 派发 edit_file_v2 串行协议第一步（readArgs），并注册 execId。
+   *
+   * 适用场景：
+   *  1. dispatch 阶段刚 acquire 成功的 edit。
+   *  2. 一个 edit 完成（detach 释放槽）后，由 picker 出队的下一个 edit。
+   */
+  private *dispatchEditReadArgs(
+    conversationId: string,
+    toolCallId: string,
+    editPath: string
+  ): Generator<Buffer> {
+    const readExecId = this.sessionManager.nextExecId(conversationId)
+    const readExecMsg = this.grpcService.createReadExecMessage(
+      toolCallId,
+      editPath,
+      readExecId
+    )
+    this.sessionManager.registerPendingToolExecId(
+      conversationId,
+      toolCallId,
+      readExecId
+    )
+    this.logger.log(
+      `Sending readArgs for edit tool ${toolCallId} on path "${editPath}" (串行协议第一步, execId=${readExecId})`
+    )
+    yield readExecMsg
+  }
+
+  /**
+   * 一个 edit 完成（read_result 失败、write_result 成功 / 任意 detach 出口）
+   * 后调用：从队列里弹出该 path 的下一个 edit，派发 readArgs。
+   *
+   * 设计上保证此调用是幂等且无副作用安全的：若没有队头，pick 返回 undefined，
+   * 不 yield 任何消息。
+   */
+  private *dispatchNextQueuedEditForPath(
+    conversationId: string,
+    path: string
+  ): Generator<Buffer> {
+    const next = this.sessionManager.pickNextEditForPath(conversationId, path)
+    if (!next) return
+
+    const stillPending = this.sessionManager
+      .getPendingToolCallIds(conversationId)
+      .includes(next.toolCallId)
+    if (!stillPending) {
+      // 极端竞态：被清理掉了；让队列中下一个继续轮询。
+      this.logger.warn(
+        `Picked queued edit ${next.toolCallId} for path "${path}" but pending entry is gone; trying next`
+      )
+      yield* this.dispatchNextQueuedEditForPath(conversationId, path)
+      return
+    }
+
+    this.logger.log(
+      `Dequeued edit ${next.toolCallId} on path "${path}" for dispatch`
+    )
+    yield* this.dispatchEditReadArgs(conversationId, next.toolCallId, path)
   }
 
   private async *executePreparedToolInvocation(
@@ -17461,6 +17483,31 @@ ${raw}
       return
     }
 
+    // Edit serialization handoff: as soon as the holder is consumed (regardless
+    // of read_result vs write_result termination, success vs warning), the
+    // detach出口 (chat-session.service.detachPendingToolCall →
+    // clearEditPathSlot) has already released the path slot. Now dispatch
+    // the next queued edit on that path so the read→write pipeline keeps
+    // moving without waiting for any tool_result UI/lifecycle work.
+    //
+    // Aborted / synthetic consumption paths (execThrow, recovery, missing
+    // tool output) explicitly opt out via dispatchNextQueuedEditOnConsume:
+    // false, because the client stream is already torn down and the queued
+    // edits will be drained by the same abort caller (which feeds aborted
+    // tool results for every pending tool, including the queued ones).
+    const allowDispatchNextEdit =
+      options.dispatchNextQueuedEditOnConsume !== false
+    if (
+      allowDispatchNextEdit &&
+      this.isEditToolInvocation(pendingToolCall.toolName) &&
+      pendingToolCall.editPath
+    ) {
+      yield* this.dispatchNextQueuedEditForPath(
+        conversationId,
+        pendingToolCall.editPath
+      )
+    }
+
     // Update toolResult with the correct toolCallId
     toolResult.toolCallId = toolCallId
 
@@ -19726,14 +19773,15 @@ ${raw}
 
     parts.push(this.buildCursorToolUsageSection())
 
-    const cursorSkillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+    const cursorSkillPolicy =
+      this.cursorSkillsManager.resolvePolicyForPrompt(context)
     const cursorRulesSection = this.buildCursorRulesSection(
       this.resolveEffectiveRulesForPrompt(context, cursorSkillPolicy)
     )
     if (cursorRulesSection) {
       parts.push(cursorRulesSection)
     }
-    const cursorSkillsSection = this.buildCursorSkillsCatalogSection(
+    const cursorSkillsSection = this.cursorSkillsManager.buildCatalogSection(
       cursorSkillPolicy.availableSkills
     )
     if (cursorSkillsSection) {
@@ -19787,14 +19835,15 @@ ${raw}
 
     parts.push(this.buildCodexToolUsageSection())
 
-    const cursorSkillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+    const cursorSkillPolicy =
+      this.cursorSkillsManager.resolvePolicyForPrompt(context)
     const cursorRulesSection = this.buildCursorRulesSection(
       this.resolveEffectiveRulesForPrompt(context, cursorSkillPolicy)
     )
     if (cursorRulesSection) {
       parts.push(cursorRulesSection)
     }
-    const cursorSkillsSection = this.buildCursorSkillsCatalogSection(
+    const cursorSkillsSection = this.cursorSkillsManager.buildCatalogSection(
       cursorSkillPolicy.availableSkills
     )
     if (cursorSkillsSection) {
@@ -19979,7 +20028,8 @@ ${raw}
       })
     }
 
-    const cursorSkillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+    const cursorSkillPolicy =
+      this.cursorSkillsManager.resolvePolicyForPrompt(context)
     const ruleContents = this.resolveEffectiveRuleContentsForPrompt(
       context,
       cursorSkillPolicy
@@ -19996,7 +20046,7 @@ ${raw}
           "<user_rules>\nThe user has not defined any custom rules.\n</user_rules>",
       })
     }
-    const cursorSkillsSection = this.buildCursorSkillsCatalogSection(
+    const cursorSkillsSection = this.cursorSkillsManager.buildCatalogSection(
       cursorSkillPolicy.availableSkills
     )
     if (cursorSkillsSection) {
@@ -20100,67 +20150,6 @@ ${raw}
     return contextMessages
   }
 
-  private resolveCursorSkillPolicyForPrompt(context: PromptContext) {
-    const policy = resolveCursorSkillPolicy({
-      rules: context.cursorRules,
-      selectedRulePaths: context.selectedCursorRulePaths,
-      selectedRuleNames: context.selectedCursorRuleNames,
-      activeSkillNames: context.activeCursorSkillNames,
-      projectRoot: context.projectContext?.rootPath,
-      contextPaths: (context.codeChunks || []).map((chunk) => chunk.path),
-    })
-
-    if (policy.suppressedSkills.length > 0) {
-      this.logger.warn(
-        `Suppressed ${policy.suppressedSkills.length} inactive Cursor skill rule(s) for prompt: ` +
-          policy.suppressedSkills.map((skill) => skill.name).join(", ") +
-          "; use fetch_rules({ skill_name }) to load a skill before applying its workflow"
-      )
-    }
-
-    return policy
-  }
-
-  private buildCursorSkillsCatalogSection(
-    skills: CursorSkillMetadata[]
-  ): string | null {
-    if (skills.length === 0) {
-      return null
-    }
-
-    const lines = [
-      "Available Cursor Skills:",
-      "These are discoverable skill workflows. Inactive skills are listed by metadata only; their full instructions are not active prompt rules.",
-      "To activate a skill, call fetch_rules with skill_name, then follow the returned skill instructions.",
-      "Do not read skill files or skill-owned internal workspace paths directly before the skill is active.",
-      "",
-    ]
-
-    for (const skill of skills.slice(0, 24)) {
-      const state = skill.active
-        ? `active:${skill.activationReason || "unknown"}`
-        : "inactive"
-      const details = [
-        skill.description
-          ? `description=${this.truncateText(skill.description, 220)}`
-          : "",
-        skill.whenToUse
-          ? `when_to_use=${this.truncateText(skill.whenToUse, 220)}`
-          : "",
-        skill.paths.length > 0 ? `paths=${skill.paths.join(", ")}` : "",
-      ].filter(Boolean)
-      lines.push(
-        `- ${skill.name} [${state}]${details.length > 0 ? `: ${details.join("; ")}` : ""}`
-      )
-    }
-
-    if (skills.length > 24) {
-      lines.push(`- ... ${skills.length - 24} more skill(s) omitted`)
-    }
-
-    return lines.join("\n")
-  }
-
   private truncateText(text: string, maxChars: number): string {
     const normalized = text.replace(/\s+/g, " ").trim()
     if (normalized.length <= maxChars) {
@@ -20169,78 +20158,9 @@ ${raw}
     return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`
   }
 
-  private isCursorSkillActive(
-    session: ChatSession,
-    skillName: string
-  ): boolean {
-    const normalized = normalizeSkillName(skillName)
-    if (!normalized) return false
-    if (
-      (session.activeCursorSkillNames || []).some(
-        (name) => normalizeSkillName(name) === normalized
-      )
-    ) {
-      return true
-    }
-    return resolveCursorSkillPolicy({
-      rules: session.cursorRules,
-      selectedRulePaths: session.selectedCursorRulePaths,
-      selectedRuleNames: session.selectedCursorRuleNames,
-      activeSkillNames: session.activeCursorSkillNames,
-      projectRoot: session.projectContext?.rootPath,
-      contextPaths: (session.codeChunks || []).map((chunk) => chunk.path),
-    }).activeSkills.some((skill) => skill.name === normalized)
-  }
-
-  private activateCursorSkillForSession(
-    session: ChatSession,
-    skillName: string,
-    reason: string
-  ): void {
-    const normalized = normalizeSkillName(skillName)
-    if (!normalized) return
-    const activeNames = new Set(
-      (session.activeCursorSkillNames || []).map((name) =>
-        normalizeSkillName(name)
-      )
-    )
-    if (activeNames.has(normalized)) {
-      return
-    }
-    session.activeCursorSkillNames = [
-      ...(session.activeCursorSkillNames || []),
-      normalized,
-    ]
-    this.sessionManager.markSessionDirty(session.conversationId)
-    this.logger.log(
-      `Activated Cursor skill "${normalized}" for session ${session.conversationId}; reason=${reason}`
-    )
-  }
-
-  private activateCursorSkillsForPath(
-    session: ChatSession,
-    rawPath: string,
-    reason: string
-  ): void {
-    if (!rawPath) return
-    const policy = resolveCursorSkillPolicy({
-      rules: session.cursorRules,
-      selectedRulePaths: session.selectedCursorRulePaths,
-      selectedRuleNames: session.selectedCursorRuleNames,
-      activeSkillNames: session.activeCursorSkillNames,
-      projectRoot: session.projectContext?.rootPath,
-      contextPaths: [rawPath],
-    })
-    for (const skill of policy.activeSkills) {
-      if (skill.activationReason === "path_match") {
-        this.activateCursorSkillForSession(session, skill.name, reason)
-      }
-    }
-  }
-
   private resolveEffectiveRulesForPrompt(
     context: PromptContext,
-    skillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+    skillPolicy = this.cursorSkillsManager.resolvePolicyForPrompt(context)
   ): Array<CursorRule | string> {
     const cursorRules = skillPolicy.promptRules
     const kbRules = this.knowledgeBaseService
@@ -20266,7 +20186,7 @@ ${raw}
 
   private resolveEffectiveRuleContentsForPrompt(
     context: PromptContext,
-    skillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
+    skillPolicy = this.cursorSkillsManager.resolvePolicyForPrompt(context)
   ): string[] {
     return this.resolveEffectiveRulesForPrompt(context, skillPolicy)
       .map((rule) => this.getCursorRuleContent(rule).trim())

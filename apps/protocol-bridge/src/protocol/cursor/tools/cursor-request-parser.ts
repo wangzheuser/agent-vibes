@@ -26,7 +26,7 @@ import {
   getCursorSkillMetadata,
   normalizeSkillName,
   normalizePathForMatch,
-} from "./cursor-skill-policy"
+} from "../skills"
 import { KvStorageService } from "../kv-storage.service"
 import { CursorProtocolTraceService } from "../cursor-protocol-trace.service"
 

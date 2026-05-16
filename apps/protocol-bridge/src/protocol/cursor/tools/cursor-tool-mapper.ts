@@ -428,6 +428,11 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
           description:
             "Optional Cursor skill name to activate and load, such as canvas",
         },
+        query: {
+          type: "string",
+          description:
+            "Optional natural-language task description; when provided, the proxy ranks available skills by relevance using a lightweight TF-IDF index and returns the top hits in `search_hits` for discovery purposes",
+        },
       },
       required: [],
     },

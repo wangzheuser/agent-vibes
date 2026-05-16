@@ -260,6 +260,18 @@ export interface SessionReadSnapshot {
   sourceToolName: string
 }
 
+/**
+ * 排队中的 edit_file_v2 调度记录。
+ *
+ * 当同一 path 上已有 holder（正在 read→write 进程中）时，后续 edit
+ * 不直接派发 readArgs，而是入队等待 holder 释放槽。
+ */
+export interface QueuedEditDispatch {
+  toolCallId: string
+  path: string
+  enqueuedAt: number
+}
+
 export interface EditFailureContext extends EditFailureSelection {
   filePath: string
   reason:
@@ -327,6 +339,23 @@ export interface ChatSession {
   pendingToolCallByExecId: Map<number, string>
   // Identifies the current BiDi stream; used to detect orphaned tool calls from closed streams
   currentStreamId: string
+
+  /**
+   * Path-level edit serialization state (协议侧不保证跨 toolCallId 的
+   * readArgs/writeArgs 串行；模型一次产生 N 个 same-path edit_file_v2 时
+   * 必须由代理在调度层强制串行，否则 N 个 read_result 会基于同一原文件
+   * 返回内容，N 个 writeArgs 各自全量覆盖磁盘，最后一个 write 抹掉所有
+   * 前序修改）。
+   *
+   * editPathHolderByPath: 当前正在 read→write 进程中的 toolCallId（每条 path 至多一个）
+   * editPathQueueByPath:  排队中等待派发 readArgs 的 edit 调用（FIFO，按到达顺序）
+   *
+   * 持有者完成后（无论 consume 成功还是 clear 异常），detach 出口统一调
+   * clearEditPathSlot 释放 holder 与 queue 中的归属信息；consume 成功路径
+   * 还会调 pickNextEditForPath 派发下一个 readArgs。
+   */
+  editPathHolderByPath: Map<string, string>
+  editPathQueueByPath: Map<string, QueuedEditDispatch[]>
 
   // Context from initial request
   projectContext?: ParsedCursorRequest["projectContext"]
@@ -413,12 +442,13 @@ export interface PendingToolCall {
   beforeContent?: string // File content before edit (for edit tools)
   afterContent?: string // File content after edit (computed from applyEditInputToFileText)
   /**
-   * 释放 path-level edit mutex 的回调（仅 edit_file_v2 类工具持有）。
-   * 在 detachPendingToolCall 中统一调用，保证 consume / clear / 异常路径
-   * 都能释放锁，避免死锁。设计动机见 cursor-connect-stream.service.ts
-   * `acquireEditPathLock` 的注释。
+   * For edit_file_v2 invocations: the resolved target file path used to
+   * coordinate path-level serialization (see ChatSession.editPathHolderByPath
+   * and ChatSession.editPathQueueByPath). Stored at registration time so the
+   * detach path can release the path slot regardless of which exec id triggers
+   * cleanup.
    */
-  editPathLockRelease?: () => void
+  editPath?: string
   // Which BiDi stream this tool call was dispatched on
   streamId: string
   // Shell stream accumulation (for streaming shell output)
@@ -2123,6 +2153,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       ),
       pendingToolCallByExecId: new Map(),
       currentStreamId: crypto.randomUUID(),
+      editPathHolderByPath: new Map(),
+      editPathQueueByPath: new Map(),
       projectContext: persisted.projectContext,
       codeChunks: persisted.codeChunks,
       // Cursor rules are request-scoped and re-sent by Cursor on each
@@ -2262,6 +2294,8 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       backgroundCommands: new Map(),
       pendingToolCallByExecId: new Map(),
       currentStreamId: crypto.randomUUID(),
+      editPathHolderByPath: new Map(),
+      editPathQueueByPath: new Map(),
       projectContext: initialRequest?.projectContext,
       codeChunks: initialRequest?.codeChunks,
       cursorRules: initialRequest?.cursorRules,
@@ -3261,47 +3295,165 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     session.pendingToolCalls.delete(toolCallId)
     session.lastActivityAt = new Date()
 
-    // 释放 path-level edit mutex（若该工具持有）。统一在 detach 出口做，
-    // 保证 consume / clear / 异常路径都能 release，避免后续 edit 永久阻塞。
-    const release = toolCall.editPathLockRelease
-    if (release) {
-      toolCall.editPathLockRelease = undefined
-      try {
-        release()
-      } catch (err) {
-        this.logger.warn(
-          `Edit path lock release threw for ${toolCallId}: ${(err as Error).message}`
-        )
-      }
-    }
+    // 释放 path-level edit serialization slot（若该工具是 edit_file_v2）。
+    // detach 出口统一处理，覆盖 consume / clear / 异常路径，避免后续同 path
+    // edit 永久阻塞。注意：detach 自身不会派发下一个 readArgs —— 该动作只
+    // 应在"成功 consume"路径触发，避免在死流上把 queue 里的 edit 也带飞。
+    this.clearEditPathSlot(session, toolCall)
 
     return toolCall
   }
 
   /**
-   * 把 path-level edit mutex 的 release 回调挂到 pending tool call 上。
-   * 调用方（cursor-connect-stream.service）在 acquire lock 后立刻 attach；
-   * release 由 detachPendingToolCall 在 consume / clear / 异常路径统一执行。
+   * 同步尝试为 edit_file_v2 占用 path 串行槽。
    *
-   * 如果 pending 已经不存在（极端竞态：tool 被提前清理），立即 release
-   * 防止 lock 泄漏。
+   * - path 为空：不参与串行化，按 acquired 处理（调用方自行决定如何派发）。
+   * - 无 holder：当前 toolCallId 升为 holder，返回 acquired。
+   * - 已有 holder：把调度信息追加到队列尾部，返回 queued。
+   *
+   * 该方法纯同步，不做任何 await，避免阻塞 BiDi generator。
    */
-  attachEditPathLockRelease(
+  acquireOrQueueEdit(
     conversationId: string,
     toolCallId: string,
-    release: () => void
-  ): void {
+    path: string
+  ): { acquired: boolean } {
     const session = this.getSession(conversationId)
-    const pending = session?.pendingToolCalls.get(toolCallId)
-    if (!pending) {
-      try {
-        release()
-      } catch {
-        // ignore — release 是同步且应当幂等
-      }
+    if (!session) {
+      return { acquired: true }
+    }
+    const pending = session.pendingToolCalls.get(toolCallId)
+    if (pending) {
+      pending.editPath = path
+    }
+
+    const normalizedPath = (path || "").trim()
+    if (!normalizedPath) {
+      return { acquired: true }
+    }
+
+    const holder = session.editPathHolderByPath.get(normalizedPath)
+    if (!holder) {
+      session.editPathHolderByPath.set(normalizedPath, toolCallId)
+      return { acquired: true }
+    }
+
+    if (holder === toolCallId) {
+      // Idempotent: same tool call already holds the slot.
+      return { acquired: true }
+    }
+
+    let queue = session.editPathQueueByPath.get(normalizedPath)
+    if (!queue) {
+      queue = []
+      session.editPathQueueByPath.set(normalizedPath, queue)
+    }
+    if (!queue.some((item) => item.toolCallId === toolCallId)) {
+      queue.push({
+        toolCallId,
+        path: normalizedPath,
+        enqueuedAt: Date.now(),
+      })
+    }
+    return { acquired: false }
+  }
+
+  /**
+   * 同步弹出 path 队头并升为新 holder。
+   *
+   * 仅当 path 当前无 holder 时才会出队（被 detach 后的 clearEditPathSlot
+   * 才会进入此状态）。返回出队的调度记录；若无队头返回 undefined。
+   */
+  pickNextEditForPath(
+    conversationId: string,
+    path: string
+  ): QueuedEditDispatch | undefined {
+    const session = this.getSession(conversationId)
+    if (!session) return undefined
+
+    const normalizedPath = (path || "").trim()
+    if (!normalizedPath) return undefined
+
+    if (session.editPathHolderByPath.has(normalizedPath)) {
+      // 上一持有者尚未释放，调用方应等待。
+      return undefined
+    }
+
+    const queue = session.editPathQueueByPath.get(normalizedPath)
+    if (!queue || queue.length === 0) {
+      session.editPathQueueByPath.delete(normalizedPath)
+      return undefined
+    }
+
+    const next = queue.shift()!
+    if (queue.length === 0) {
+      session.editPathQueueByPath.delete(normalizedPath)
+    }
+    session.editPathHolderByPath.set(normalizedPath, next.toolCallId)
+    return next
+  }
+
+  /**
+   * 释放某个 toolCallId 对 path 串行槽的占用，并把它从所有等待队列中剥离。
+   *
+   * 由 detachPendingToolCall 在出口调用，覆盖 consume / clear / 异常 三类路径。
+   */
+  private clearEditPathSlot(
+    session: ChatSession,
+    toolCall: PendingToolCall
+  ): void {
+    const path = toolCall.editPath?.trim()
+    if (!path) {
+      // 即使没有 editPath，也把 toolCallId 从所有 queue 中扫一遍以防遗漏。
+      // edit_file_v2 一定有 path，这里只是兜底。
+      this.removeToolCallFromAllEditQueues(session, toolCall.toolCallId)
       return
     }
-    pending.editPathLockRelease = release
+
+    const holder = session.editPathHolderByPath.get(path)
+    if (holder === toolCall.toolCallId) {
+      session.editPathHolderByPath.delete(path)
+    }
+
+    const queue = session.editPathQueueByPath.get(path)
+    if (queue) {
+      const filtered = queue.filter(
+        (item) => item.toolCallId !== toolCall.toolCallId
+      )
+      if (filtered.length === 0) {
+        session.editPathQueueByPath.delete(path)
+      } else if (filtered.length !== queue.length) {
+        session.editPathQueueByPath.set(path, filtered)
+      }
+    }
+  }
+
+  private removeToolCallFromAllEditQueues(
+    session: ChatSession,
+    toolCallId: string
+  ): void {
+    for (const [path, queue] of session.editPathQueueByPath) {
+      const filtered = queue.filter((item) => item.toolCallId !== toolCallId)
+      if (filtered.length === 0) {
+        session.editPathQueueByPath.delete(path)
+      } else if (filtered.length !== queue.length) {
+        session.editPathQueueByPath.set(path, filtered)
+      }
+    }
+    for (const [path, holderId] of session.editPathHolderByPath) {
+      if (holderId === toolCallId) {
+        session.editPathHolderByPath.delete(path)
+      }
+    }
+  }
+
+  /**
+   * 批量清空所有 path 串行状态。仅用于 stale pending 整批回收场景
+   * （旧 BiDi 流已关闭，pending 全部作废，holder 与 queue 都不再有意义）。
+   */
+  private clearAllEditPathSlots(session: ChatSession): void {
+    session.editPathHolderByPath.clear()
+    session.editPathQueueByPath.clear()
   }
 
   consumePendingToolCall(
@@ -3424,6 +3576,10 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     session.pendingToolCallByExecId.clear()
     // Also clear the batch barrier — all pending tools are being discarded.
     session.activeAssistantToolBatch = undefined
+    // Drop every path-level edit serialization slot. The pending tool calls
+    // tied to the old BiDi stream are gone, so the holders/queues that
+    // referenced them must not survive into the next turn.
+    this.clearAllEditPathSlots(session)
     session.lastActivityAt = new Date()
 
     this.logger.warn(

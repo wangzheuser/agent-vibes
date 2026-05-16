@@ -17,6 +17,7 @@ import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import { ChatSessionManager } from "./session/chat-session.service"
+import { CursorSkillsManager } from "./skills"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
 
 @Module({
@@ -41,6 +42,7 @@ import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-exe
     CursorAuthService,
     CursorConnectStreamService,
     CursorGrpcService,
+    CursorSkillsManager,
     KvStorageService,
     SemanticSearchProviderService,
     KnowledgeBaseService,
