@@ -124,6 +124,8 @@ export class DashboardPanel {
         key?: string
         value?: unknown
         testId?: string
+        apiKey?: string
+        label?: string
       }) => this.handleMessage(msg),
       null,
       this.disposables
@@ -213,6 +215,8 @@ export class DashboardPanel {
     key?: string
     value?: unknown
     testId?: string
+    apiKey?: string
+    label?: string
   }): Promise<void> {
     switch (msg.type) {
       case "getAll":
@@ -369,6 +373,12 @@ export class DashboardPanel {
       case "importKiroToken":
         if (msg.raw) {
           this.handleImportKiroToken(msg.raw)
+        }
+        break
+
+      case "importKiroApiKey":
+        if (msg.apiKey) {
+          this.handleImportKiroApiKey(msg.apiKey, msg.label)
         }
         break
     }
@@ -2067,6 +2077,52 @@ export class DashboardPanel {
       .catch((err) => {
         const msg = err instanceof Error ? err.message : String(err)
         vscode.window.showErrorMessage(`Kiro import failed: ${msg}`)
+      })
+  }
+
+  /**
+   * Kiro API-key paste — wraps the user's key in the
+   * `kiro-accounts.json` schema (authMethod=api_key) and pipes it
+   * through the same /api/kiro/import endpoint as the JSON paste flow.
+   */
+  private handleImportKiroApiKey(apiKey: string, label?: string): void {
+    const trimmedKey = apiKey.trim()
+    if (!trimmedKey) {
+      vscode.window.showWarningMessage("Kiro: API key is empty")
+      return
+    }
+    const trimmedLabel = (label || "").trim()
+    const payload = {
+      accounts: [
+        {
+          label: trimmedLabel || "Kiro API Key",
+          authMethod: "api_key" as const,
+          kiroApiKey: trimmedKey,
+        },
+      ],
+    }
+    this.callBridgeApi<{
+      imported: number
+      accountCount: number
+      error?: string
+    }>("/api/kiro/import", "POST", { raw: JSON.stringify(payload) })
+      .then((result) => {
+        if (result?.error) {
+          vscode.window.showErrorMessage(`Kiro import: ${result.error}`)
+        } else if (result && result.imported > 0) {
+          vscode.window.showInformationMessage(
+            `Kiro: imported ${result.imported} API key account(s)`
+          )
+        } else {
+          vscode.window.showWarningMessage(
+            "Kiro: API key was not saved (already exists?)"
+          )
+        }
+        this.sendAllData()
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        vscode.window.showErrorMessage(`Kiro API key import failed: ${msg}`)
       })
   }
 

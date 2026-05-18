@@ -40,6 +40,8 @@ export async function parseKiroEventStream(
   let inputTokens = 0
   let outputTokens = 0
   let totalCredits = 0
+  let cacheReadTokens = 0
+  let cacheWriteTokens = 0
   let currentToolUse: ToolUseState | null = null
 
   const append = (chunk: Uint8Array): void => {
@@ -119,11 +121,14 @@ export async function parseKiroEventStream(
           continue
         }
 
-        ;[inputTokens, outputTokens] = updateTokensFromEvent(
-          event,
-          inputTokens,
-          outputTokens
-        )
+        ;[inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens] =
+          updateTokensFromEvent(
+            event,
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+            cacheWriteTokens
+          )
 
         switch (eventType) {
           case "assistantResponseEvent": {
@@ -208,6 +213,12 @@ export async function parseKiroEventStream(
 
     if (callback.onCredits && totalCredits > 0) {
       callback.onCredits(totalCredits)
+    }
+    if (
+      callback.onCacheUsage &&
+      (cacheReadTokens > 0 || cacheWriteTokens > 0)
+    ) {
+      callback.onCacheUsage(cacheReadTokens, cacheWriteTokens)
     }
     if (callback.onComplete) {
       callback.onComplete(inputTokens, outputTokens)
@@ -299,13 +310,17 @@ function collectUsageMaps(
 function updateTokensFromEvent(
   event: Record<string, unknown>,
   currentInputTokens: number,
-  currentOutputTokens: number
-): [number, number] {
+  currentOutputTokens: number,
+  currentCacheReadTokens: number = 0,
+  currentCacheWriteTokens: number = 0
+): [number, number, number, number] {
   const candidates: Array<Record<string, unknown>> = [event]
   collectUsageMaps(event, candidates)
 
   let inputTokens = currentInputTokens
   let outputTokens = currentOutputTokens
+  let cacheReadTokens = currentCacheReadTokens
+  let cacheWriteTokens = currentCacheWriteTokens
 
   for (const usage of candidates) {
     if (!usage) continue
@@ -334,6 +349,28 @@ function updateTokensFromEvent(
     )
     if (inp != null) {
       inputTokens = inp
+      // Even when total inputTokens is reported directly, the upstream
+      // may still attach cache counters in the same usage map; track
+      // them so the proxy can surface real cache hits separately from
+      // the client-side simulation.
+      const cr = readTokenNumber(
+        usage,
+        "cacheReadInputTokens",
+        "cache_read_input_tokens"
+      )
+      if (cr != null && cr > cacheReadTokens) {
+        cacheReadTokens = cr
+      }
+      const cw = readTokenNumber(
+        usage,
+        "cacheWriteInputTokens",
+        "cache_write_input_tokens",
+        "cacheCreationInputTokens",
+        "cache_creation_input_tokens"
+      )
+      if (cw != null && cw > cacheWriteTokens) {
+        cacheWriteTokens = cw
+      }
       continue
     }
 
@@ -357,6 +394,12 @@ function updateTokensFromEvent(
     const sum = (uncached ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0)
     if (sum > 0) {
       inputTokens = sum
+      if (cacheRead != null && cacheRead > cacheReadTokens) {
+        cacheReadTokens = cacheRead
+      }
+      if (cacheWrite != null && cacheWrite > cacheWriteTokens) {
+        cacheWriteTokens = cacheWrite
+      }
       continue
     }
 
@@ -381,7 +424,7 @@ function updateTokensFromEvent(
     }
   }
 
-  return [inputTokens, outputTokens]
+  return [inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens]
 }
 
 /**

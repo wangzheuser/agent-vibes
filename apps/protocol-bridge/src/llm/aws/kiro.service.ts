@@ -1604,6 +1604,11 @@ export class KiroService implements OnModuleInit {
         collected.inputTokens = input
         collected.outputTokens = output
       },
+      onCacheUsage: (cacheRead, cacheWrite) => {
+        this.logger.log(
+          `[Kiro] cache hit (non-stream): cacheRead=${cacheRead}, cacheWrite=${cacheWrite}`
+        )
+      },
     }
 
     await this.callKiro(dto, account, callback).then((result) => {
@@ -1863,6 +1868,11 @@ export class KiroService implements OnModuleInit {
       onComplete: (input, output) => {
         collectedInput = input
         collectedOutput = output
+      },
+      onCacheUsage: (cacheRead, cacheWrite) => {
+        this.logger.log(
+          `[Kiro] cache hit (stream): cacheRead=${cacheRead}, cacheWrite=${cacheWrite}`
+        )
       },
     }
 
@@ -2204,21 +2214,33 @@ export class KiroService implements OnModuleInit {
       refreshToken?: string
       accessToken?: string
       clientId?: string
+      kiroApiKey?: string
     }
   ): number {
     const normalize = (value: unknown) =>
       typeof value === "string" ? value.trim() : ""
     const wantRefresh = normalize(candidate.refreshToken)
     const wantAccess = normalize(candidate.accessToken)
+    const wantApiKey = normalize(candidate.kiroApiKey)
 
     return entries.findIndex((entry) => {
-      const entryAuth = entry.authMethod === "social" ? "social" : "idc"
+      const entryAuth: KiroAuthMethod =
+        entry.authMethod === "api_key" || entry.authMethod === "apikey"
+          ? "api_key"
+          : entry.authMethod === "social"
+            ? "social"
+            : "idc"
       if (entryAuth !== candidate.authMethod) return false
       if (
         normalize(entry.region || "us-east-1") !==
         normalize(candidate.region || "us-east-1")
       ) {
         return false
+      }
+      // API key accounts are identified solely by the kiroApiKey value.
+      if (candidate.authMethod === "api_key") {
+        const entryApiKey = normalize(entry.kiroApiKey)
+        return wantApiKey !== "" && wantApiKey === entryApiKey
       }
       const entryRefresh = normalize(entry.refreshToken)
       const entryAccess = normalize(entry.accessToken)
@@ -2376,14 +2398,21 @@ export class KiroService implements OnModuleInit {
       const access = typeof obj.accessToken === "string" ? obj.accessToken : ""
       const refresh =
         typeof obj.refreshToken === "string" ? obj.refreshToken : ""
-      if (!access && !refresh) return
+      const apiKey = typeof obj.kiroApiKey === "string" ? obj.kiroApiKey : ""
+      const authMethodRaw =
+        typeof obj.authMethod === "string" ? obj.authMethod : undefined
+      const isApiKey =
+        authMethodRaw === "api_key" ||
+        authMethodRaw === "apikey" ||
+        (apiKey && !access && !refresh)
+      if (!isApiKey && !access && !refresh) return
       candidates.push({
         label: typeof obj.label === "string" ? obj.label : undefined,
-        authMethod:
-          typeof obj.authMethod === "string" ? obj.authMethod : undefined,
+        authMethod: isApiKey ? "api_key" : authMethodRaw,
         region: typeof obj.region === "string" ? obj.region : undefined,
         accessToken: access,
         refreshToken: refresh,
+        kiroApiKey: apiKey || undefined,
         expiresAt:
           typeof obj.expiresAt === "number" ? obj.expiresAt : undefined,
         clientId: typeof obj.clientId === "string" ? obj.clientId : undefined,
@@ -2413,12 +2442,24 @@ export class KiroService implements OnModuleInit {
     candidate: KiroAccountFileEntry
   ): boolean {
     const entries = this.readAccountsFile()
-    const authMethod: KiroAuthMethod =
-      candidate.authMethod === "social" ? "social" : "idc"
-    const region = (candidate.region || "us-east-1").trim() || "us-east-1"
+    const apiKey = (candidate.kiroApiKey || "").trim()
     const refresh = (candidate.refreshToken || "").trim()
     const access = (candidate.accessToken || "").trim()
-    if (!refresh && !access) return false
+    const isApiKey =
+      candidate.authMethod === "api_key" ||
+      candidate.authMethod === "apikey" ||
+      (apiKey && !refresh && !access)
+    const authMethod: KiroAuthMethod = isApiKey
+      ? "api_key"
+      : candidate.authMethod === "social"
+        ? "social"
+        : "idc"
+    const region = (candidate.region || "us-east-1").trim() || "us-east-1"
+    if (isApiKey) {
+      if (!apiKey) return false
+    } else if (!refresh && !access) {
+      return false
+    }
 
     const idx = this.findMatchingEntryIndex(entries, {
       authMethod,
@@ -2426,26 +2467,45 @@ export class KiroService implements OnModuleInit {
       refreshToken: refresh,
       accessToken: access,
       clientId: candidate.clientId,
+      kiroApiKey: apiKey,
     })
+
+    const fallbackLabel = isApiKey
+      ? "Kiro API Key"
+      : authMethod === "idc"
+        ? "Kiro Builder ID"
+        : "Kiro Social"
 
     const merged: KiroAccountFileEntry = {
       ...(idx >= 0 ? entries[idx] : {}),
       label:
         candidate.label ||
         (idx >= 0 ? entries[idx]!.label : undefined) ||
-        (authMethod === "idc" ? "Kiro Builder ID" : "Kiro Social"),
+        fallbackLabel,
       authMethod,
       region,
-      accessToken: access || (idx >= 0 ? entries[idx]!.accessToken : undefined),
-      refreshToken:
-        refresh || (idx >= 0 ? entries[idx]!.refreshToken : undefined),
-      expiresAt:
-        candidate.expiresAt || (idx >= 0 ? entries[idx]!.expiresAt : undefined),
-      clientId:
-        candidate.clientId || (idx >= 0 ? entries[idx]!.clientId : undefined),
-      clientSecret:
-        candidate.clientSecret ||
-        (idx >= 0 ? entries[idx]!.clientSecret : undefined),
+      accessToken: isApiKey
+        ? undefined
+        : access || (idx >= 0 ? entries[idx]!.accessToken : undefined),
+      refreshToken: isApiKey
+        ? undefined
+        : refresh || (idx >= 0 ? entries[idx]!.refreshToken : undefined),
+      kiroApiKey: isApiKey
+        ? apiKey
+        : idx >= 0
+          ? entries[idx]!.kiroApiKey
+          : undefined,
+      expiresAt: isApiKey
+        ? undefined
+        : candidate.expiresAt ||
+          (idx >= 0 ? entries[idx]!.expiresAt : undefined),
+      clientId: isApiKey
+        ? undefined
+        : candidate.clientId || (idx >= 0 ? entries[idx]!.clientId : undefined),
+      clientSecret: isApiKey
+        ? undefined
+        : candidate.clientSecret ||
+          (idx >= 0 ? entries[idx]!.clientSecret : undefined),
       proxyUrl:
         candidate.proxyUrl || (idx >= 0 ? entries[idx]!.proxyUrl : undefined),
     }

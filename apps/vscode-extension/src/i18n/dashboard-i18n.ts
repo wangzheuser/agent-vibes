@@ -115,6 +115,10 @@ const UI_EN: Record<string, string> = {
   "field.tokenHintGoogle": "Format: 1//xxx (Google). Batch supported.",
   "field.tokenPlaceholder":
     "Paste token(s)...\nSupports: single, JSON array, or multi-line",
+  "field.kiroApiKey": "Kiro API Key",
+  "field.kiroApiKeyPlaceholder": "Paste your Kiro API key (e.g. aws-...)",
+  "field.kiroApiKeyHint":
+    "Personal API key issued by Kiro. Stored locally as authMethod=api_key.",
   "acct.synced": "Synced account",
   "acct.noToken": "No token",
   "acct.unknown": "Unknown",
@@ -123,6 +127,10 @@ const UI_EN: Record<string, string> = {
   "oauth.tokenTab": "Refresh Token",
   "oauth.openaiTab": "OpenAI OAuth",
   "oauth.manualTab": "Manual Sync",
+  "oauth.kiroBuilderIdTab": "Builder ID",
+  "oauth.kiroApiKeyTab": "API Key",
+  "oauth.kiroApiKeyHelp":
+    "Paste a Kiro API key. The bridge stores it locally with authMethod=api_key and uses it directly without OAuth refresh.",
   "oauth.googleHelp":
     "Click the button below to open Google authorization in your browser. After you sign in, the account will be saved automatically.",
   "oauth.openaiHelp":
@@ -431,6 +439,10 @@ const UI_ZH: Record<string, string> = {
   "field.tokenHint": "格式：1//xxx（Google）或 rt_xxx（OpenAI）。支持批量。",
   "field.tokenHintGoogle": "格式：1//xxx（Google）。支持批量。",
   "field.tokenPlaceholder": "粘贴 Token…\n支持：单个、JSON 数组或多行",
+  "field.kiroApiKey": "Kiro API Key",
+  "field.kiroApiKeyPlaceholder": "粘贴 Kiro API Key（如 aws-...）",
+  "field.kiroApiKeyHint":
+    "Kiro 颁发的个人 API Key，将以 authMethod=api_key 形式保存到本地。",
   "acct.synced": "已同步账号",
   "acct.noToken": "无 Token",
   "acct.unknown": "未知",
@@ -439,6 +451,10 @@ const UI_ZH: Record<string, string> = {
   "oauth.tokenTab": "Refresh Token",
   "oauth.openaiTab": "OpenAI OAuth",
   "oauth.manualTab": "手动同步",
+  "oauth.kiroBuilderIdTab": "Builder ID",
+  "oauth.kiroApiKeyTab": "API Key",
+  "oauth.kiroApiKeyHelp":
+    "粘贴 Kiro API Key。桥接会以 authMethod=api_key 形式保存到本地，直接使用，无需 OAuth 续签。",
   "oauth.googleHelp":
     "点击下方按钮在浏览器中打开 Google 授权。登录后账号会自动保存。",
   "oauth.openaiHelp": "点击下方按钮在浏览器中打开 OpenAI 授权。",

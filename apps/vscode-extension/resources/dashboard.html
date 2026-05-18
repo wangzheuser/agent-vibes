@@ -4224,6 +4224,9 @@
       }
 
       // ── Kiro OAuth Dialog ──
+      // Tab values: "oauth" = AWS Builder ID device flow,
+      //             "apikey" = paste a personal Kiro API key
+      //             (saved as authMethod=api_key in kiro-accounts.json).
       var kiroOAuthTab = "oauth"
 
       function renderKiroDlg() {
@@ -4238,13 +4241,13 @@
           '<button type="button" class="oauth-tab' +
           (isOAuth ? " active" : "") +
           '" onclick="switchKiroOAuthTab(\'oauth\')">' +
-          "Builder ID" +
+          esc(L("oauth.kiroBuilderIdTab")) +
           "</button>"
         h +=
           '<button type="button" class="oauth-tab' +
           (!isOAuth ? " active" : "") +
-          '" onclick="switchKiroOAuthTab(\'token\')">' +
-          esc(L("oauth.tokenTab")) +
+          '" onclick="switchKiroOAuthTab(\'apikey\')">' +
+          esc(L("oauth.kiroApiKeyTab")) +
           "</button>"
         h += "</div>"
 
@@ -4265,23 +4268,33 @@
           okBtn.disabled = false
           okBtn.onclick = startKiroOAuth
         } else {
-          // Token paste tab
+          // API Key paste tab
+          h += '<div style="padding:var(--sp-2) 0 var(--sp-3) 0">'
+          h +=
+            '<div style="font-size:var(--text-sm);color:var(--fg-2);line-height:1.6">' +
+            esc(L("oauth.kiroApiKeyHelp")) +
+            "</div>"
+          h += "</div>"
           h +=
             '<div class="field"><label>' +
-            "Kiro Token JSON" +
+            esc(L("field.label")) +
             "</label>" +
-            '<textarea id="f-token" placeholder="' +
-            esc(
-              'Paste kiro-auth-token.json content or { "accessToken": "...", "refreshToken": "..." }'
-            ) +
-            '" style="min-height:100px;font-size:12px"></textarea>' +
+            '<input type="text" id="f-kiro-label" placeholder="Kiro API Key" />' +
+            "</div>"
+          h +=
+            '<div class="field"><label>' +
+            esc(L("field.kiroApiKey")) +
+            "</label>" +
+            '<input type="password" id="f-kiro-apikey" autocomplete="off" spellcheck="false" placeholder="' +
+            esc(L("field.kiroApiKeyPlaceholder")) +
+            '" />' +
             '<div class="field-hint">' +
-            "Paste the content of ~/.aws/sso/cache/*.json or Kiro IDE token file." +
+            esc(L("field.kiroApiKeyHint")) +
             "</div></div>"
 
           okBtn.textContent = L("dlg.add")
           okBtn.disabled = false
-          okBtn.onclick = submitKiroToken
+          okBtn.onclick = submitKiroApiKey
         }
 
         h += "</div>"
@@ -4291,6 +4304,12 @@
       function switchKiroOAuthTab(tab) {
         kiroOAuthTab = tab
         renderKiroDlg()
+        if (tab === "apikey") {
+          setTimeout(function () {
+            var el = document.getElementById("f-kiro-apikey")
+            if (el) el.focus()
+          }, 80)
+        }
       }
 
       function startKiroOAuth() {
@@ -4302,11 +4321,17 @@
         vscode.postMessage({ type: "startKiroOAuth" })
       }
 
-      function submitKiroToken() {
-        var ta = document.getElementById("f-token")
-        var raw = (ta ? ta.value : "").trim()
-        if (!raw) return
-        vscode.postMessage({ type: "importKiroToken", raw: raw })
+      function submitKiroApiKey() {
+        var keyEl = document.getElementById("f-kiro-apikey")
+        var labelEl = document.getElementById("f-kiro-label")
+        var apiKey = (keyEl ? keyEl.value : "").trim()
+        if (!apiKey) return
+        var label = (labelEl ? labelEl.value : "").trim()
+        vscode.postMessage({
+          type: "importKiroApiKey",
+          apiKey: apiKey,
+          label: label || undefined,
+        })
         closeDlg()
       }
 
