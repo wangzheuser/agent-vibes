@@ -19,6 +19,7 @@ import type {
 import type { BackendType } from "../../../llm/shared/model-router.service"
 import { PersistenceService } from "../../../persistence"
 import { ParsedCursorRequest } from "../tools/cursor-request-parser"
+import type { DeferredToolDescriptor } from "../tools/cursor-tool-mapper"
 import type { EditFailureSelection } from "../tools/tool-protocol-helpers"
 
 /**
@@ -321,6 +322,37 @@ export interface ChatSession {
   thinkingDetailsRequested: boolean
   isAgentic: boolean
   supportedTools: string[]
+  /**
+   * Tools that the model has pulled into the core surface via the
+   * bridge-internal `discover_tool` mechanism earlier in this session.
+   *
+   * Background: when defer-loading is enabled (see
+   * `tools/tool-defer-policy.ts`), low-frequency / MCP tools are
+   * trimmed out of the upstream `tools` payload and instead summarised
+   * in the system prompt's `<deferred_tools>` catalog.  When the model
+   * needs one of them it calls `discover_tool({ tool_name })`; the
+   * bridge serves the call inline (no upstream round-trip) and records
+   * the tool name here.  Subsequent turns of the same session restore
+   * full schema for any name in this set so the model never needs to
+   * discover the same tool twice.
+   *
+   * Cleared when the session is evicted by `ChatSessionManager`. Naturally
+   * bounded by the number of installed tools per workspace (≤ ~80).
+   */
+  discoveredTools: Set<string>
+  /**
+   * Snapshot of the most recent deferred-tool catalog handed to the
+   * upstream.  Populated by the cursor-connect-stream layer right
+   * before each turn's tools array is built, and consulted by the
+   * `discover_tool` handler when the model requests a schema.
+   *
+   * Stored on the session (rather than recomputed on every
+   * `discover_tool` call) so the catalog the model "sees" is exactly
+   * what we tell it about — even if MCP servers connect/disconnect
+   * mid-turn we won't surprise the model with names that disappear or
+   * appear from under it.  Re-snapshotted on each new agent turn.
+   */
+  deferredToolCatalog?: DeferredToolDescriptor[]
   mcpToolDefs?: ParsedCursorRequest["mcpToolDefs"]
   /** Browser MCP 页面状态，用于在没有页面上下文时拦截依赖页面的工具调用 */
   browserContext?: {
@@ -2100,6 +2132,11 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       supportedTools: Array.isArray(persisted.supportedTools)
         ? persisted.supportedTools
         : [],
+      // discoveredTools is intentionally not persisted: a tool's full
+      // schema is cheaper to re-discover (one extra inline turn) than
+      // to keep the schema set in sync across SQLite restarts and
+      // upstream-side schema changes.  Always start fresh on restore.
+      discoveredTools: new Set<string>(),
       mcpToolDefs: persisted.mcpToolDefs,
       useWeb: persisted.useWeb === true,
       requestContextEnv: persisted.requestContextEnv,
@@ -2317,6 +2354,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         initialRequest?.thinkingDetailsRequested === true,
       isAgentic: initialRequest?.isAgentic || false,
       supportedTools: initialRequest?.supportedTools || [],
+      discoveredTools: new Set<string>(),
       mcpToolDefs: initialRequest?.mcpToolDefs,
       useWeb: initialRequest?.useWeb || false,
       requestContextEnv: initialRequest?.requestContextEnv,

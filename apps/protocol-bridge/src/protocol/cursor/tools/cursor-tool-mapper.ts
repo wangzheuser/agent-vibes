@@ -4,6 +4,9 @@
  * for sending to backend API, and handles tool call responses
  */
 
+import { DISCOVER_TOOL_DEFINITION } from "./discover-tool-handler"
+import { shouldDeferTool } from "./tool-defer-policy"
+
 // Tool definition in Anthropic format
 export interface AnthropicTool {
   name: string
@@ -1940,6 +1943,75 @@ export interface BuildToolsForApiOptions {
    * filters it out when this flag is set.
    */
   forSubAgent?: boolean
+  /**
+   * Optional defer-loading policy.  When provided, low-frequency / MCP
+   * tools are split out of the returned `ToolDefinition[]` and instead
+   * surfaced via the partner `deferred` array on `BuildToolsForApiResult`.
+   * The bridge advertises deferred tools in the system prompt and serves
+   * `discover_tool({ tool_name })` calls inline so the model can pull
+   * any specific one back into the core surface mid-session.
+   *
+   * Pass `{ strategy: "off" }` (or omit) to keep the legacy contract
+   * (every requested tool with full schema, no `discover_tool` injection).
+   */
+  defer?: BuildToolsDeferOptions
+}
+
+/**
+ * Per-call defer policy.  Decoupled from `BackendType` here so callers
+ * (cursor-connect-stream / sub-agent dispatcher) can override the
+ * strategy from the default `pickStrategy(backend)` if a particular
+ * code path needs full tools (e.g. a sub-agent whose own surface is
+ * already small enough that defer is pure overhead).
+ */
+export interface BuildToolsDeferOptions {
+  /** "off" / "mcp-only" / "aggressive" — see tool-defer-policy.ts. */
+  strategy: "off" | "mcp-only" | "aggressive"
+  /**
+   * Tools the model has already pulled into core via `discover_tool`
+   * earlier in this session.  These are exempted from deferral so the
+   * tools array stays consistent across turns.
+   */
+  discoveredTools?: ReadonlySet<string>
+}
+
+/**
+ * Output of `buildToolsForApi` when `defer` is provided.  The tools
+ * field is the trimmed list to send to the upstream; `deferred` is the
+ * full descriptor of every tool that was split out and is now reachable
+ * only via `discover_tool`.
+ *
+ * For backwards compatibility with callers that haven't been updated to
+ * use defer yet, `buildToolsForApi()` keeps returning a plain
+ * `ToolDefinition[]` when `defer` is omitted; the new behaviour is
+ * accessed via `buildToolsForApiWithDefer()` (see below) which returns
+ * the structured form.
+ */
+export interface BuildToolsForApiResult {
+  /** Tools sent to the upstream with their full schema. */
+  tools: ToolDefinition[]
+  /**
+   * Tools removed from `tools` and instead summarised in the system
+   * prompt's `<deferred_tools>` catalog.  Each entry retains its full
+   * description and input_schema so `discover_tool` can return them
+   * verbatim when the model asks.
+   */
+  deferred: DeferredToolDescriptor[]
+}
+
+/**
+ * One entry in the deferred-tool catalog.  The two fields the bridge
+ * needs are (1) what to render in the system prompt as the model's
+ * one-line index, and (2) what to return as the `discover_tool` payload.
+ */
+export interface DeferredToolDescriptor {
+  name: string
+  /** One-sentence summary used in the system prompt catalog. */
+  oneLineDescription: string
+  /** Full description, returned verbatim by `discover_tool`. */
+  description: string
+  /** Full schema, returned verbatim by `discover_tool`. */
+  input_schema: Record<string, unknown>
 }
 
 export interface CursorBuiltInToolCapabilityOptions {
@@ -2818,6 +2890,11 @@ export function buildToolsForApi(
   }
 
   const tools: ToolDefinition[] = []
+  // Track tool provenance so the defer policy can distinguish built-in
+  // Cursor tools (definition came from CURSOR_TOOL_DEFINITIONS) from
+  // MCP-provided tools (definition came from mcpToolDefs).  Used by
+  // applyDeferPolicy() at the end of this function.
+  const isBuiltInByName = new Map<string, boolean>()
   const executableViaExecServerMessage = new Set<string>([
     "CLIENT_SIDE_TOOL_V2_READ_FILE",
     "CLIENT_SIDE_TOOL_V2_READ_FILE_V2",
@@ -2957,6 +3034,7 @@ export function buildToolsForApi(
           ...definition,
           description,
         })
+        isBuiltInByName.set(definition.name, true)
       }
       continue
     }
@@ -2977,9 +3055,123 @@ export function buildToolsForApi(
         `MCP tool ${mcpToolDef.toolName || mcpToolDef.name}`,
       input_schema: normalizeToolInputSchema(mcpToolDef.inputSchema),
     })
+    isBuiltInByName.set(mcpToolDef.name, false)
   }
 
+  // Defer-loading split.  When `options.defer` is set, we move
+  // low-frequency / MCP tools out of `tools` and surface them via the
+  // `<deferred_tools>` system prompt catalog instead.  Returning only
+  // the trimmed `tools` array keeps `buildToolsForApi`'s legacy
+  // signature; the structured form (which exposes the deferred
+  // descriptors) is `buildToolsForApiWithDefer()`.
+  if (options?.defer && options.defer.strategy !== "off") {
+    const split = applyDeferPolicy(tools, isBuiltInByName, options.defer)
+    return split.tools
+  }
   return tools
+}
+
+/**
+ * Variant of `buildToolsForApi` that returns the structured
+ * `BuildToolsForApiResult` (tools + deferred descriptors).  Use this
+ * when you need access to the deferred catalog — for example the
+ * cursor-connect-stream layer renders it into the system prompt and the
+ * `discover_tool` handler looks it up by name.
+ *
+ * For the codex backend, defer is currently a no-op (codex translator
+ * has its own request-builder pipeline that doesn't use this catalog).
+ */
+export function buildToolsForApiWithDefer(
+  supportedTools: string[],
+  options?: BuildToolsForApiOptions
+): BuildToolsForApiResult {
+  // For codex we don't run the defer split — its request builder owns
+  // tool serialization separately.  Return the legacy shape with an
+  // empty deferred catalog so callers can use the same code path.
+  if (options?.backend === "codex") {
+    return {
+      tools: buildCodexToolsForApi(supportedTools, options),
+      deferred: [],
+    }
+  }
+
+  // Re-run the main path but capture provenance so we can split.
+  // Inlining the logic is cleaner than threading two return shapes
+  // through `buildToolsForApi` itself.
+  const fullOptions = options ? { ...options, defer: undefined } : undefined
+  const allTools = buildToolsForApi(supportedTools, fullOptions)
+  // Re-derive provenance: built-in iff CURSOR_TOOL_DEFINITIONS contains
+  // a definition with this name.  This is O(N×M) but N <= ~80 and we
+  // only do this once per request.
+  const builtInNames = new Set<string>()
+  for (const def of Object.values(CURSOR_TOOL_DEFINITIONS)) {
+    builtInNames.add(def.name)
+  }
+  const provenance = new Map<string, boolean>()
+  for (const tool of allTools) {
+    provenance.set(tool.name, builtInNames.has(tool.name))
+  }
+
+  if (!options?.defer || options.defer.strategy === "off") {
+    return { tools: allTools, deferred: [] }
+  }
+  return applyDeferPolicy(allTools, provenance, options.defer)
+}
+
+/**
+ * Internal: split a fully-resolved tool list into core/deferred according
+ * to the policy.  Pure function — no I/O, no globals.
+ */
+function applyDeferPolicy(
+  tools: ToolDefinition[],
+  isBuiltInByName: ReadonlyMap<string, boolean>,
+  defer: BuildToolsDeferOptions
+): BuildToolsForApiResult {
+  const discovered = defer.discoveredTools ?? new Set<string>()
+  const core: ToolDefinition[] = []
+  const deferred: DeferredToolDescriptor[] = []
+  for (const tool of tools) {
+    const isBuiltIn = isBuiltInByName.get(tool.name) ?? true
+    const isCore = !shouldDeferTool(
+      { name: tool.name, isBuiltIn },
+      defer.strategy,
+      discovered
+    )
+    if (isCore) {
+      core.push(tool)
+      continue
+    }
+    deferred.push({
+      name: tool.name,
+      oneLineDescription: extractOneLineDescription(tool.description),
+      description: tool.description,
+      input_schema: tool.input_schema || { type: "object", properties: {} },
+    })
+  }
+
+  // Inject the bridge-internal `discover_tool` so the model can pull
+  // any deferred entry into core mid-session.  Only inject when there
+  // is at least one deferred tool — empty catalogs would just waste
+  // tokens on a useless tool.
+  if (deferred.length > 0) {
+    core.push(DISCOVER_TOOL_DEFINITION)
+  }
+
+  return { tools: core, deferred }
+}
+
+/**
+ * Extract a one-line summary from a tool description.  We take the
+ * first sentence (split on period, exclamation, newline) and cap at
+ * 160 chars so the catalog stays compact.  Falls back to the whole
+ * description (truncated) when no sentence boundary is found.
+ */
+function extractOneLineDescription(description: string): string {
+  const trimmed = description.trim()
+  if (!trimmed) return ""
+  const firstSentenceMatch = trimmed.match(/^[^.!\n]+[.!]?/)
+  const candidate = firstSentenceMatch ? firstSentenceMatch[0].trim() : trimmed
+  return candidate.length > 160 ? candidate.slice(0, 157) + "..." : candidate
 }
 
 /**

@@ -10,8 +10,8 @@ import {
   realpathSync,
   statSync,
 } from "fs"
-import * as path from "path"
 import * as os from "os"
+import * as path from "path"
 import {
   type ContextAttachmentSnapshot,
   type ContextCompactionResult,
@@ -29,16 +29,16 @@ import {
   UnifiedMessage,
 } from "../../context"
 import {
+  AgentConversationTurnStructureSchema,
+  AgentMode,
   type BackgroundShellSpawnResult,
+  type ConversationStep,
+  ConversationStepSchema,
+  ConversationTurnStructureSchema,
   type CursorRule,
   CursorRuleSource,
   type DeleteResult,
   type DiagnosticsResult,
-  AgentConversationTurnStructureSchema,
-  AgentMode,
-  ConversationStepSchema,
-  type ConversationStep,
-  ConversationTurnStructureSchema,
   ExecClientMessageSchema,
   type GrepResult,
   type ListMcpResourcesExecResult,
@@ -80,6 +80,7 @@ import {
   type OfficialAntigravityCanonicalToolInvocation,
 } from "../../shared/official-antigravity-tools"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
+import { BufferChannel } from "./concurrency/buffer-channel"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
@@ -100,15 +101,15 @@ import {
   SubAgentContext,
 } from "./session/chat-session.service"
 import { type CursorSkillMetadata, CursorSkillsManager } from "./skills"
+import { SubagentBackgroundWorker } from "./subagents/subagent-background-worker.service"
 import {
   SubagentExecBridgeService,
   type SubagentExecResult,
 } from "./subagents/subagent-exec-bridge.service"
 import { SubagentRegistryService } from "./subagents/subagent-registry.service"
-import { SubagentBackgroundWorker } from "./subagents/subagent-background-worker.service"
 import { SubagentTaskRegistry } from "./subagents/subagent-task-registry.service"
-import { SubagentTranscriptStore } from "./subagents/subagent-transcript-store.service"
 import { resolveSubagentToolSurface } from "./subagents/subagent-tool-resolver"
+import { SubagentTranscriptStore } from "./subagents/subagent-transcript-store.service"
 import {
   getSubagentSystemPrompt,
   type SubagentDefinition,
@@ -116,7 +117,6 @@ import {
 import { generateBlobId, generateTraceId } from "./tools/agent-helpers"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-executor.service"
-import { WebSearchAbortError, WebSearchService } from "./web-search"
 import {
   type AttachedImage,
   cursorRequestParser,
@@ -125,11 +125,18 @@ import {
 } from "./tools/cursor-request-parser"
 import {
   buildToolsForApi,
+  buildToolsForApiWithDefer,
+  type DeferredToolDescriptor,
   getDefaultCodexImplicitAgentToolNames,
   matchesImplicitDefaultAgentToolNames,
   resolveCursorToolDefinitionKey,
   type ToolDefinition,
 } from "./tools/cursor-tool-mapper"
+import {
+  type DiscoverToolCatalogEntry,
+  formatDiscoverToolResultText,
+  handleDiscoverToolCall,
+} from "./tools/discover-tool-handler"
 import {
   buildMcpDispatchInput,
   normalizeMcpToolIdentifier,
@@ -137,12 +144,17 @@ import {
   resolveMcpToolDefinition,
 } from "./tools/mcp-call-contract"
 import {
+  DISCOVER_TOOL_NAME,
+  pickStrategy as pickDeferStrategy,
+} from "./tools/tool-defer-policy"
+import {
   buildNumberedLineEntries,
   extractEditFailureSelection,
   findToolResultAppendPlan,
   formatLineNumberedSnippet,
   messageContainsToolResult,
 } from "./tools/tool-protocol-helpers"
+import { WebSearchAbortError, WebSearchService } from "./web-search"
 
 /**
  * SSE Event content block structure (content_block_start)
@@ -2443,7 +2455,10 @@ export class CursorConnectStreamService {
         : []
     const systemPrompt = useGoogleContextMessages
       ? this.buildGoogleSystemPrompt(options.promptContext)
-      : this.buildSystemPrompt(options.promptContext)
+      : this.buildSystemPrompt(
+          options.promptContext,
+          options.session?.deferredToolCatalog
+        )
     const effectiveSystemPrompt = options.additionalSystemPrompt
       ? [systemPrompt, options.additionalSystemPrompt]
           .filter((part) => typeof part === "string" && part.trim().length > 0)
@@ -12953,6 +12968,44 @@ ${raw}
 
   /**
    * Complete the sub-agent and emit result for the parent's task tool call.
+   *
+   * The `inlineContent` we hand back to the parent agent is intentionally
+   * a *full report* — finalText + a compact per-tool summary + a list
+   * of files the sub-agent touched — not just `finalText` on its own.
+   *
+   * Why: the parent agent's next LLM turn only sees what we put into the
+   * inline tool_result for `task`. `conversationSteps` is rendered by
+   * the IDE for human inspection, but it is NOT included in the message
+   * history sent back to the model. If we serialised only `finalText`
+   * and the sub-agent's actual work was carried out through tool calls
+   * (which is the common case — a research sub-agent, a build sub-agent,
+   * etc.), the parent agent loses visibility into what the sub-agent
+   * actually discovered and degenerates to acting on a one-line
+   * summary. Mirrors claude-code's AgentTool, which folds the
+   * sub-agent's per-step transcript into a `<sub-agent-results>` block
+   * in the parent's tool_result.
+   *
+   * The report shape is stable so downstream parsers (transcript
+   * scrapers, evaluators) can rely on it:
+   *
+   *   <Final answer block, verbatim from the sub-agent>
+   *
+   *   ---
+   *   Sub-agent execution summary:
+   *   - turns: N
+   *   - tool calls: N
+   *   - duration: Nms
+   *   - modified files: a, b, c    (omitted when none)
+   *
+   *   Tool calls:
+   *   1. <name> — <one-line key result>
+   *   2. ...                       (omitted when no tool calls)
+   *
+   * Background sub-agents are unchanged: the parent task tool was
+   * settled at spawn time with a `taskSuccess { isBackground: true }`
+   * envelope, and the actual work landing in
+   * ~/.cursor/subagents/<id>/result.txt is consumed by the parent
+   * later via `read_file`. We do not re-settle the task tool here.
    */
   private async *completeSubAgent(
     conversationId: string,
@@ -12968,10 +13021,15 @@ ${raw}
     )
 
     if (!subAgentCtx.isBackground) {
+      const report = this.buildSubAgentFinalReport(
+        subAgentCtx,
+        finalText,
+        durationMs
+      )
       yield* this.emitInlineToolResult(
         conversationId,
         subAgentCtx.parentToolCallId,
-        finalText || "[sub-agent completed with no output]",
+        report,
         { status: "success" },
         {
           taskSuccess: {
@@ -12997,6 +13055,255 @@ ${raw}
     }
 
     this.sessionManager.clearSubAgentContext(conversationId)
+  }
+
+  /**
+   * Compose the inline_tool_result body the parent agent's next LLM
+   * turn will receive for a foreground `task` tool call.
+   *
+   * Strategy:
+   *   1. Surface `finalText` verbatim as the primary block. If empty
+   *      (some models return only tool calls + an empty assistant
+   *      message), substitute a stable placeholder so the parent does
+   *      not see a literal empty string and treat it as failure.
+   *   2. Append a `Sub-agent execution summary` block with metadata.
+   *   3. Append a `Tool calls` enumeration extracted from
+   *      `ctx.conversationSteps`. Each line is `<index>. <name> —
+   *      <one-line summary>`; the per-tool summary is built by
+   *      `summarizeSubAgentToolStep` and clipped to keep the parent
+   *      context budget under control.
+   *
+   * The two trailing blocks are omitted when they are empty (no tool
+   * calls / no modified files), to keep the report compact.
+   */
+  private buildSubAgentFinalReport(
+    ctx: SubAgentContext,
+    finalText: string,
+    durationMs: number
+  ): string {
+    const trimmedFinal = (finalText || "").trim()
+    const finalBlock =
+      trimmedFinal.length > 0
+        ? trimmedFinal
+        : "[sub-agent completed without an explicit final answer]"
+
+    const summaryLines: string[] = ["Sub-agent execution summary:"]
+    summaryLines.push(`- turns: ${ctx.turnCount}`)
+    summaryLines.push(`- tool calls: ${ctx.toolCallCount}`)
+    summaryLines.push(`- duration: ${durationMs}ms`)
+    if (ctx.modifiedFiles.length > 0) {
+      const filesPreview = ctx.modifiedFiles.slice(0, 20).join(", ")
+      const overflow =
+        ctx.modifiedFiles.length > 20
+          ? ` (+${ctx.modifiedFiles.length - 20} more)`
+          : ""
+      summaryLines.push(`- modified files: ${filesPreview}${overflow}`)
+    }
+
+    const toolLines: string[] = []
+    let toolIndex = 0
+    for (const step of ctx.conversationSteps) {
+      const summary = this.summarizeSubAgentToolStep(step)
+      if (!summary) continue
+      toolIndex += 1
+      toolLines.push(`${toolIndex}. ${summary}`)
+      if (toolIndex >= 30) {
+        const remaining = ctx.toolCallCount - toolIndex
+        if (remaining > 0) {
+          toolLines.push(`… (${remaining} more tool calls truncated)`)
+        }
+        break
+      }
+    }
+
+    const sections: string[] = [finalBlock]
+    sections.push("---", summaryLines.join("\n"))
+    if (toolLines.length > 0) {
+      sections.push("Tool calls:\n" + toolLines.join("\n"))
+    }
+    return sections.join("\n\n")
+  }
+
+  /**
+   * Reduce a single `ConversationStep` proto blob (stored as
+   * `unknown` because cursor-grpc.service's proto types are private to
+   * that file) to a one-line summary the parent agent can use as
+   * context. Returns `undefined` for non-toolCall steps (assistant
+   * text, thinking) — those are reflected in `finalText`/the IDE
+   * accordion already and would only inflate the parent context.
+   *
+   * Defensive shape access: we treat the step as a Record<string,
+   * unknown> and walk through known fields. If any of them are missing
+   * we fall back to a "(unknown tool)" placeholder rather than throw,
+   * because step shape may evolve with the proto schema.
+   */
+  private summarizeSubAgentToolStep(step: unknown): string | undefined {
+    if (!step || typeof step !== "object") return undefined
+    const record = step as Record<string, unknown>
+    const message = record.message
+    if (!message || typeof message !== "object") return undefined
+    const messageRecord = message as Record<string, unknown>
+    if (messageRecord.case !== "toolCall") return undefined
+    const toolCall = messageRecord.value
+    if (!toolCall || typeof toolCall !== "object") return undefined
+    const tcRecord = toolCall as Record<string, unknown>
+    const tool = tcRecord.tool
+    if (!tool || typeof tool !== "object") return undefined
+    const toolRecord = tool as Record<string, unknown>
+
+    // The proto oneof case (e.g. "shellToolCall", "readToolCall") tells
+    // us which family this is; strip the trailing "ToolCall" suffix to
+    // recover the user-facing name.
+    const protoCase =
+      typeof toolRecord.case === "string" ? toolRecord.case : "unknown"
+    const userFacingName = protoCase
+      .replace(/ToolCall$/i, "")
+      .replace(/([A-Z])/g, (_match, ch: string) => `_${ch.toLowerCase()}`)
+      .replace(/^_/, "")
+      .replace(/_+/g, "_")
+    const toolName = userFacingName.length > 0 ? userFacingName : protoCase
+
+    const toolValue = toolRecord.value
+    if (!toolValue || typeof toolValue !== "object") {
+      return `${toolName} — (no payload)`
+    }
+    const valueRecord = toolValue as Record<string, unknown>
+
+    // Best-effort extraction of args + result text. We DON'T try to
+    // re-implement cursor-grpc.service's per-tool projection here —
+    // doing so would couple this method to every ToolCall.tool oneof
+    // case. Instead pluck the most useful generic fields and call it a
+    // day; per-tool prettiness is the IDE accordion's job.
+    const args =
+      valueRecord.args && typeof valueRecord.args === "object"
+        ? (valueRecord.args as Record<string, unknown>)
+        : {}
+    const argsBlurb = this.summarizeToolArgs(toolName, args)
+
+    const result =
+      valueRecord.result && typeof valueRecord.result === "object"
+        ? (valueRecord.result as Record<string, unknown>)
+        : undefined
+    const resultBlurb = result ? this.summarizeToolResult(result) : ""
+
+    const segments: string[] = []
+    if (argsBlurb) segments.push(argsBlurb)
+    if (resultBlurb) segments.push(resultBlurb)
+    return segments.length > 0
+      ? `${toolName} — ${segments.join(" → ")}`
+      : `${toolName}`
+  }
+
+  /**
+   * Generic "what did the agent ask for" string. Pulls a small set of
+   * commonly-meaningful fields (path, query, command, …) and clips
+   * each to keep the report compact.
+   */
+  private summarizeToolArgs(
+    toolName: string,
+    args: Record<string, unknown>
+  ): string {
+    const clip = (value: unknown, max = 80): string => {
+      const text = typeof value === "string" ? value : JSON.stringify(value)
+      if (typeof text !== "string") return ""
+      const single = text.replace(/\s+/g, " ").trim()
+      return single.length > max ? `${single.slice(0, max - 1)}…` : single
+    }
+
+    // Per-tool quick paths: keep the most useful identifier verbatim.
+    if (toolName === "shell" && typeof args.command === "string") {
+      return `cmd=${clip(args.command, 100)}`
+    }
+    if (
+      (toolName === "read" || toolName === "edit" || toolName === "delete") &&
+      typeof args.path === "string"
+    ) {
+      return `path=${args.path}`
+    }
+    if (toolName === "grep" && typeof args.pattern === "string") {
+      return `pattern=${clip(args.pattern, 60)}`
+    }
+    if (
+      (toolName === "web_search" ||
+        toolName === "web_fetch" ||
+        toolName === "sem_search") &&
+      typeof args.query === "string"
+    ) {
+      return `query=${clip(args.query, 80)}`
+    }
+    if (toolName === "task" && typeof args.subagent_type === "string") {
+      return `subagent_type=${args.subagent_type}`
+    }
+
+    // Generic fallback: collect the first 3 string-valued fields.
+    const parts: string[] = []
+    for (const [key, value] of Object.entries(args)) {
+      if (parts.length >= 3) break
+      if (typeof value === "string" && value.length > 0) {
+        parts.push(`${key}=${clip(value, 60)}`)
+      } else if (typeof value === "number" || typeof value === "boolean") {
+        parts.push(`${key}=${String(value)}`)
+      }
+    }
+    return parts.join(", ")
+  }
+
+  /**
+   * Generic "what came back" string. Looks at the Result oneof's case
+   * (success/error/rejected) and tries to surface a clipped success
+   * field or the error message.
+   */
+  private summarizeToolResult(result: Record<string, unknown>): string {
+    const resultOneOf = result.result
+    if (!resultOneOf || typeof resultOneOf !== "object") return ""
+    const oneOfRecord = resultOneOf as Record<string, unknown>
+    const oneOfCase = oneOfRecord.case
+    if (typeof oneOfCase !== "string") return ""
+
+    const value =
+      oneOfRecord.value && typeof oneOfRecord.value === "object"
+        ? (oneOfRecord.value as Record<string, unknown>)
+        : undefined
+
+    const clip = (text: string, max = 160): string => {
+      const single = text.replace(/\s+/g, " ").trim()
+      return single.length > max ? `${single.slice(0, max - 1)}…` : single
+    }
+
+    if (oneOfCase === "success") {
+      if (!value) return "ok"
+      // Most success messages carry one of these "summary" fields.
+      const candidate =
+        (typeof value.summary === "string" && value.summary) ||
+        (typeof value.text === "string" && value.text) ||
+        (typeof value.content === "string" && value.content) ||
+        (typeof value.markdown === "string" && value.markdown) ||
+        (typeof value.output === "string" && value.output) ||
+        ""
+      if (candidate) return `ok: ${clip(candidate)}`
+      // Numeric / structural success indicators.
+      const total =
+        typeof value.totalCount === "number" ? value.totalCount : undefined
+      if (total !== undefined) return `ok (${total} items)`
+      return "ok"
+    }
+    if (oneOfCase === "error") {
+      const errorText =
+        (value && typeof value.error === "string" && value.error) ||
+        (value && typeof value.message === "string" && value.message) ||
+        (value &&
+          typeof value.errorMessage === "string" &&
+          value.errorMessage) ||
+        "error"
+      return `error: ${clip(errorText)}`
+    }
+    if (oneOfCase === "rejected") {
+      const reason =
+        (value && typeof value.reason === "string" && value.reason) ||
+        "rejected"
+      return `rejected: ${clip(reason)}`
+    }
+    return oneOfCase
   }
 
   /**
@@ -16775,6 +17082,68 @@ ${raw}
     return UNSUPPORTED_DEFERRED_TOOL_MESSAGES[family]
   }
 
+  /**
+   * Bridge-internal handler for `discover_tool` calls.
+   *
+   * The model invokes `discover_tool({ tool_name })` to fetch the full
+   * description + input_schema of any entry in the system prompt's
+   * `<deferred_tools>` catalog.  We look the name up in the
+   * session-scoped catalog snapshot, return the schema as the
+   * tool_result, and add the name to `session.discoveredTools` so
+   * subsequent turns include the full schema in the upstream `tools`
+   * array (no further `discover_tool` calls needed for that tool).
+   *
+   * On cache miss / bad input we return a structured error pointing
+   * the model at valid catalog names; the model is expected to retry
+   * with a corrected name in the next turn.
+   *
+   * Why this lives here (not in `runDeferredToolIfNeeded`):
+   *   - `runDeferredToolIfNeeded` dispatches **Cursor-protocol**
+   *     deferred tools (web_search, exa_fetch, ...).  Those tools have
+   *     real IDE-side counterparts and InteractionQuery routing.
+   *   - `discover_tool` has no Cursor protocol presence.  It is a pure
+   *     bridge construct — the model only knows about it because we
+   *     advertise it in the `tools` array, and its result comes
+   *     entirely from in-memory catalog state.
+   */
+  private async *handleDiscoverToolInvocation(
+    conversationId: string,
+    session: ChatSession,
+    activeToolCall: ActiveToolCall,
+    input: Record<string, unknown>
+  ): AsyncGenerator<Buffer> {
+    const catalog = new Map<string, DiscoverToolCatalogEntry>()
+    for (const entry of session.deferredToolCatalog ?? []) {
+      catalog.set(entry.name, {
+        name: entry.name,
+        description: entry.description,
+        input_schema: entry.input_schema,
+      })
+    }
+
+    const result = handleDiscoverToolCall(input, catalog)
+    if (result.status === "success") {
+      session.discoveredTools.add(result.tool_name)
+      this.logger.log(
+        `[discover_tool] session=${conversationId} promoted "${result.tool_name}" to core; session set size=${session.discoveredTools.size}`
+      )
+    } else {
+      this.logger.warn(
+        `[discover_tool] session=${conversationId} rejected request "${result.tool_name}": ${result.error}`
+      )
+    }
+
+    const text = formatDiscoverToolResultText(result)
+    yield* this.emitInlineToolResult(
+      conversationId,
+      activeToolCall.id,
+      text,
+      result.status === "success"
+        ? { status: "success" }
+        : { status: "error", message: result.error }
+    )
+  }
+
   private async *runDeferredToolIfNeeded(
     conversationId: string,
     toolCallId: string,
@@ -18263,7 +18632,7 @@ ${raw}
       : 0
     const systemPrompt = this.isCloudCodeBackend(route.backend)
       ? this.buildGoogleSystemPrompt(session)
-      : this.buildSystemPrompt(session)
+      : this.buildSystemPrompt(session, session.deferredToolCatalog)
     const budget = this.resolveMessageBudget(route.backend, {
       session,
       protectedContextTokens,
@@ -18848,6 +19217,31 @@ ${raw}
       return "completed_inline"
     }
 
+    // Bridge-internal `discover_tool`. The defer-loading mechanism (see
+    // tools/tool-defer-policy.ts) trims low-frequency tools out of the
+    // upstream payload and surfaces them via the <deferred_tools>
+    // catalog in the system prompt.  When the model asks for one we
+    // serve the call inline — the catalog is already on the session,
+    // no upstream / IDE round-trip is needed.  On success we add the
+    // requested name to session.discoveredTools so the next turn's
+    // tools array includes the full schema.
+    if (
+      preparedTool.canonicalToolName === DISCOVER_TOOL_NAME ||
+      preparedTool.protocolToolName === DISCOVER_TOOL_NAME
+    ) {
+      yield* this.handleDiscoverToolInvocation(
+        conversationId,
+        session,
+        activeToolCall,
+        preparedTool.input
+      )
+      return this.sessionManager
+        .getPendingToolCallIds(conversationId)
+        .includes(activeToolCall.id)
+        ? "waiting_for_result"
+        : "completed_inline"
+    }
+
     if (
       !preparedTool.deferredToolFamily &&
       preparedTool.canDispatchExec &&
@@ -18948,13 +19342,129 @@ ${raw}
       batchToolCallIds
     )
 
-    for (const preparedTool of preparedTools) {
-      yield* this.executePreparedToolInvocation(
+    // Concurrent dispatch fan-out
+    // ──────────────────────────
+    // The agent.v1 protocol allows a parent turn to emit N independent
+    // tool_use blocks (and explicitly carries an `is_parallel_worker`
+    // bit on SubagentStartRequestQuery for this exact case). Old
+    // behaviour was to `yield* executePreparedToolInvocation` for each
+    // tool sequentially, which blocked every subsequent tool — most
+    // visibly any `task` (sub-agent) tool would queue up behind the
+    // earlier ones, defeating the user-observed "parallel sub-agent"
+    // expectation.
+    //
+    // New behaviour: each `executePreparedToolInvocation` runs as its
+    // own consumer of a shared `BufferChannel<Buffer>`. We fork them
+    // all at once via `pipeGeneratorIntoChannel`, then `for await` on
+    // the channel and yield each buffer as it arrives. The channel
+    // closes when every fork has finished (or one fails). This gives
+    // us interleaved buffers in real wall-clock arrival order — the
+    // BiDi sink writes them out as fast as they're produced, so the
+    // IDE sees genuine parallel progress.
+    //
+    // Edit serialisation is preserved because `acquireOrQueueEdit` is a
+    // synchronous `ChatSessionManager` API: two concurrent edits to the
+    // same path race on the manager's mutex, the loser parks on the
+    // queue and is dispatched later by the picker on result detach.
+    // Other tool families (read_file, grep_search, web_search, task,
+    // ...) have no such constraint and run fully in parallel.
+    const channel = new BufferChannel<Buffer>()
+    const outcomes = new Array<ToolDispatchOutcome>(preparedTools.length)
+    const failures: unknown[] = []
+
+    const forkSubGenerator = async (
+      preparedTool: PreparedToolInvocation,
+      index: number
+    ): Promise<void> => {
+      const subGenerator = this.executePreparedToolInvocation(
         conversationId,
         registeredSession,
         streamId,
         preparedTool
       )
+      // Cannot use the simple `pipeGeneratorIntoChannel` helper here
+      // because we also need the generator's terminal *return* value
+      // (the per-tool ToolDispatchOutcome). The protocol-aware part
+      // of the parent turn cares whether each tool already settled
+      // inline (so it doesn't need to wait for an ExecClientMessage)
+      // versus is awaiting an upstream IDE response.
+      let next = await subGenerator.next()
+      while (!next.done) {
+        if (!channel.push(next.value)) {
+          // Channel was closed mid-flight (early failure on a sibling).
+          // Stop pumping; per-fork generator is closed via finally
+          // below so any active resources are released.
+          break
+        }
+        next = await subGenerator.next()
+      }
+      if (next.done) {
+        outcomes[index] = next.value
+      } else {
+        // Channel was closed before we observed `done`; ensure the
+        // generator's finally blocks run.
+        try {
+          await subGenerator.return(undefined as unknown as ToolDispatchOutcome)
+        } catch (returnError) {
+          // `return()` propagating an error is not actionable here —
+          // the channel-close path that triggered us already records
+          // the originating failure. Log and move on.
+          this.logger.warn(
+            `Sub-generator return() raised after channel close ` +
+              `(${preparedTool.activeToolCall.id}): ${String(returnError)}`
+          )
+        }
+        outcomes[index] = "completed_inline"
+      }
+    }
+
+    const driveAll = async (): Promise<void> => {
+      const settled = await Promise.allSettled(
+        preparedTools.map((tool, index) => forkSubGenerator(tool, index))
+      )
+      for (const result of settled) {
+        if (result.status === "rejected") {
+          failures.push(result.reason)
+        }
+      }
+    }
+
+    // Kick off the fan-out and immediately start consuming the channel.
+    // We don't await `driveAll` here — that would defeat the whole
+    // point. Instead, schedule it and tie the channel close to its
+    // completion via .finally.
+    const drivePromise = driveAll().finally(() => {
+      if (failures.length > 0) {
+        // Surface the FIRST failure to the consumer; subsequent ones
+        // are logged for diagnosis. This matches the previous
+        // sequential semantics where a thrown sub-generator aborted
+        // the whole batch.
+        if (failures.length > 1) {
+          for (let i = 1; i < failures.length; i++) {
+            this.logger.warn(
+              `[parallel-tool-dispatch] Additional failure ` +
+                `(${i + 1}/${failures.length}): ${String(failures[i])}`
+            )
+          }
+        }
+        channel.error(failures[0])
+      } else {
+        channel.close()
+      }
+    })
+
+    for await (const buffer of channel) {
+      yield buffer
+    }
+    // Channel iteration ended (drained + closed). Wait for the drive
+    // promise so we propagate the very last failure if any.
+    await drivePromise
+
+    if (failures.length > 0) {
+      // Re-throw the first failure for caller visibility; this matches
+      // the prior sequential behaviour where the throwing sub-generator
+      // would propagate up `yield*`.
+      throw failures[0]
     }
 
     const activeSession = this.sessionManager.getSession(conversationId)
@@ -19969,9 +20479,6 @@ ${raw}
     const contextMessages = useGoogleContextMessages
       ? this.buildGoogleContextMessages(parsed, conversationId)
       : []
-    const systemPrompt = useGoogleContextMessages
-      ? this.buildGoogleSystemPrompt(parsed)
-      : this.buildSystemPrompt(parsed)
 
     // Add tools in strict protocol order:
     // request supportedTools > session supportedTools > empty (no implicit defaults)
@@ -20014,11 +20521,36 @@ ${raw}
       parsed.mcpToolDefs && parsed.mcpToolDefs.length > 0
         ? parsed.mcpToolDefs
         : session.mcpToolDefs
-    const apiTools = buildToolsForApi(toolsToUse, {
+    // Defer-loading split. Trim low-frequency / MCP tools out of the
+    // upstream payload and surface them via a one-line catalog in the
+    // system prompt; the model fetches full schemas on demand via the
+    // bridge-internal `discover_tool` tool.  Strategy is per-backend
+    // (kiro / google-claude / codex run aggressive defer; claude-api
+    // stays off so prompt cache prefix remains stable).
+    const deferStrategy = pickDeferStrategy(route.backend)
+    const apiToolsResult = buildToolsForApiWithDefer(toolsToUse, {
       mcpToolDefs,
       backend: route.backend,
       subagentDefinitions: this.buildSubagentDefinitionsForToolPrompt(session),
+      defer: {
+        strategy: deferStrategy,
+        discoveredTools: session.discoveredTools,
+      },
     })
+    const apiTools = apiToolsResult.tools
+    // Snapshot the deferred catalog onto the session so the
+    // `discover_tool` handler can serve schema lookups for whichever
+    // names the model saw in the system prompt this turn.
+    session.deferredToolCatalog = apiToolsResult.deferred
+
+    // System prompt is built AFTER the defer split so we can advertise
+    // the catalog to the model in the same prompt.  Google
+    // (CloudCode) prompt ignores the catalog because that backend's
+    // own request shape doesn't currently route through buildToolsForApi
+    // anyway.
+    const systemPrompt = useGoogleContextMessages
+      ? this.buildGoogleSystemPrompt(parsed)
+      : this.buildSystemPrompt(parsed, apiToolsResult.deferred)
 
     // Apply truncation to stay within token limits
     const budget = this.resolveMessageBudget(route.backend, {
@@ -20843,12 +21375,18 @@ ${raw}
         )
       }
 
-      const apiTools = buildToolsForApi(filteredToolsToUse, {
+      const apiToolsResult = buildToolsForApiWithDefer(filteredToolsToUse, {
         mcpToolDefs: activeSession.mcpToolDefs,
         backend: route.backend,
         subagentDefinitions:
           this.buildSubagentDefinitionsForToolPrompt(activeSession),
+        defer: {
+          strategy: pickDeferStrategy(route.backend),
+          discoveredTools: activeSession.discoveredTools,
+        },
       })
+      const apiTools = apiToolsResult.tools
+      activeSession.deferredToolCatalog = apiToolsResult.deferred
 
       const normalizedShellHistory = this.normalizeHistoryForBackend(
         activeSession.messages as Array<{
@@ -22298,15 +22836,21 @@ ${raw}
         )
       }
 
-      const allContinuationTools = buildToolsForApi(
+      const allContinuationToolsResult = buildToolsForApiWithDefer(
         filteredToolsForContinuation,
         {
           mcpToolDefs: activeSession.mcpToolDefs,
           backend: route.backend,
           subagentDefinitions:
             this.buildSubagentDefinitionsForToolPrompt(activeSession),
+          defer: {
+            strategy: pickDeferStrategy(route.backend),
+            discoveredTools: activeSession.discoveredTools,
+          },
         }
       )
+      const allContinuationTools = allContinuationToolsResult.tools
+      activeSession.deferredToolCatalog = allContinuationToolsResult.deferred
       const normalizedContinuationHistory = this.normalizeHistoryForBackend(
         activeSession.messages as Array<{
           role: "user" | "assistant"
@@ -23845,9 +24389,21 @@ ${raw}
   ] as const
 
   /**
-   * Build system prompt from context
+   * Build system prompt from context.
+   *
+   * Optional `deferredCatalog` argument: when defer-loading is enabled
+   * (see `tools/tool-defer-policy.ts`), the cursor-connect-stream layer
+   * splits the tool surface into a slim core sent to the upstream and a
+   * larger "deferred" set the model can pull on demand via the
+   * `discover_tool` tool.  Passing the deferred catalog here causes us
+   * to append a `<deferred_tools>` section at the end of the prompt
+   * with a one-line index of every available deferred tool, so the
+   * model knows what's reachable without paying the full schema cost.
    */
-  private buildSystemPrompt(context: PromptContext): string {
+  private buildSystemPrompt(
+    context: PromptContext,
+    deferredCatalog?: DeferredToolDescriptor[]
+  ): string {
     const parts: string[] = []
 
     if (context.customSystemPrompt) {
@@ -23904,9 +24460,59 @@ ${raw}
       parts.push("Code Context:\n" + chunkTexts.join("\n\n"))
     }
 
+    const deferredSection = this.buildDeferredToolsSection(deferredCatalog)
+    if (deferredSection) {
+      parts.push(deferredSection)
+    }
+
     parts.push(CursorConnectStreamService.LANGUAGE_INSTRUCTION)
 
     return parts.join("\n\n")
+  }
+
+  /**
+   * Render the `<deferred_tools>` system-prompt section.  Returns
+   * `undefined` when there is nothing to advertise so the caller can
+   * skip the join.
+   *
+   * Layout:
+   *   <deferred_tools>
+   *   Additional tools are available but not loaded by default. To use
+   *   any of them, call `discover_tool({ tool_name: "<name>" })` first;
+   *   the bridge will return the full schema and load the tool for the
+   *   rest of this session. Names are case-sensitive.
+   *
+   *   - tool_name: one-line description
+   *   - ...
+   *   </deferred_tools>
+   *
+   * The instructional preamble is intentionally short (≤ 60 tokens):
+   * each catalog line is ≤ ~50 tokens, so even with 50 deferred tools
+   * the section costs ~2.5K tokens — about half the savings vs. the
+   * 7K-token schemas we trimmed.
+   */
+  private buildDeferredToolsSection(
+    deferredCatalog?: DeferredToolDescriptor[]
+  ): string | undefined {
+    if (!deferredCatalog || deferredCatalog.length === 0) return undefined
+    const lines: string[] = []
+    lines.push("<deferred_tools>")
+    lines.push(
+      "Additional tools are available but their full schemas are not " +
+        "loaded by default to save context. To use any of the tools below, " +
+        'call `discover_tool({ tool_name: "<exact_name>" })` first. ' +
+        "The bridge returns the full schema and the tool stays loaded for " +
+        "the rest of this session — you only need to discover each tool " +
+        "once. Names are case-sensitive; do not invent names that aren't " +
+        "in this list."
+    )
+    lines.push("")
+    for (const entry of deferredCatalog) {
+      const summary = entry.oneLineDescription || "(no description)"
+      lines.push(`- ${entry.name}: ${summary}`)
+    }
+    lines.push("</deferred_tools>")
+    return lines.join("\n")
   }
 
   private buildCodexSystemPrompt(context: PromptContext): string {

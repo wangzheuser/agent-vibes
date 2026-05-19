@@ -111,6 +111,12 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 - 没暴露的工具记 `not_directly_invokable`；暴露但本轮未调用记 `not_observed`。
 - 出现 `truncatedToolCall` 即视为 inner tool 镜像或 size-guard 异常，记为 gap。
 - 任何 user-facing 工具与 proto case 之间的具体映射，由 trace 的 `topCase/nestedCase` 事实决定，**不要靠脑补**。
+- **filesystem.write family 必须额外验证 5 个变体**（任务 3b-3f）：noop edit
+  (`[edit applied: no-op]` 路径) / multi-chunk / new-file / replace_all / 同 path 并发串行化。
+  任一变体回归到 `[edit_apply_failed]` 误报或文件互相覆盖，记 hard failure。
+- **sub-agent family 必须额外验证 2 个并发场景**（任务 8a.5 / 8a.6）：parallel dispatch
+  时间戳间隔 < 200ms，sub-agent 结果回流报告含 `Sub-agent execution summary` +
+  `Tool calls:` 三段式。任一退化记 hard failure。
 
 ### F. ConversationAction / background 状态机
 
@@ -159,13 +165,104 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
 
 验收：能读到 `alpha`；源码文件搜索和文本搜索返回非空或合理结果；trace 中能看到对应 started/completed 或 exec/result 摘要。
 
-### 任务 3：编辑与删除闭环
+### 任务 3：编辑与删除闭环（含 edit 工具完整覆盖）
+
+`edit_file_v2` 的协议形态比 `read_file` 复杂得多：含 search/replace pair、范围限定、
+multi-chunk、replace_all、新文件创建、同 path 串行化。本任务必须覆盖完整子集，
+不能只跑一次"alpha → alpha-1"就交差。
+
+#### 3a. 基础读 / 改 / 重读 / 删（最小闭环）
 
 调用客户端可见工具完成以下目标：先用 `read_file` 读取 `<SMOKE>/a.txt`，
 再用 `edit_file_v2` 把其中的 `alpha` 更新为 `alpha-1`，然后再次读取确认；
 接着用 `delete_file` 删除 `<SMOKE>/delete_me.txt`，最后确认 smoke 目录中已经没有这个文件。
 
-验收：编辑和删除都有可见副作用；如果编辑失败，记录失败原因。
+验收：编辑和删除都有可见副作用；read 后内容是 `alpha-1`；delete_me.txt 不再存在。
+
+#### 3b. Noop 编辑（search 与 replace 完全相同）
+
+调一次 `edit_file_v2` 让 search 与 replace **逐字符完全相同**（例如：
+search=`alpha-1`、replace=`alpha-1`）。这是模型在重试 / 上游代理重发 tool_use 输入 /
+模型只想"确认某段内容存在"时的常见形态，bridge 必须区分"幂等 noop"和"真正失败"。
+
+验收（这是 #3 修复的核心场景）：
+
+- 工具结果状态是 **`success`**，**不是** `error`；
+- 工具结果文本以 `[edit applied: no-op]` 开头，**绝不能**出现
+  `[edit_apply_failed]` 或 `target_content_matches_in_current_file:` 这类
+  原 failure projection 字段；
+- 文件内容、mtime 都不变（写盘步骤被跳过）；
+- trace 中 `editToolCall.result` 命中 `success` 分支。
+
+如果看到 `[edit_apply_failed]`，记 hard failure 并写明 noop guard 报告路径回归。
+
+#### 3c. 多 chunk 编辑（`replacementChunks`）
+
+调一次 `edit_file_v2`，使用 `replacementChunks` 一次性改 `<SMOKE>/b.txt`：
+先把 `b.txt` 内容预置成多行（例如 3 行：`line 1\nline 2\nline 3\n`），
+然后通过 chunks 数组一次性改两段不重叠的内容（例如把 `line 1` 改成 `LINE-A`、把 `line 3` 改成 `LINE-C`）。
+
+验收：
+
+- 一次 toolCall 后 b.txt 内容是 `LINE-A\nline 2\nLINE-C\n`；
+- 没有出现 chunk 被丢弃 / 顺序错乱（applyEditInputToFileText 内部按 startLine 倒序处理）；
+- trace 中只有**一次** `editToolCall.success`，不是两次。
+
+完成后把 b.txt 还原成原始 `beta` 一行（或留作 multi-chunk 状态，但要在报告里说明）。
+
+#### 3d. 新文件创建（path 不存在 + `file_text`）
+
+调一次 `edit_file_v2` 创建一个新文件 `<SMOKE>/created_by_test.txt`，
+**不**使用 search/replace，而是直接传 `file_text="created via edit_file_v2 smoke probe\n"`。
+
+验收：
+
+- 文件被新建，内容与 `file_text` 完全一致；
+- 没有 `unsafe_overwrite` 拒绝（因为 beforeContent 为空）；
+- trace 中 `read_result` 失败但 dispatcher 进入 new-file 路径并发 `writeArgs`。
+
+完成后用 `delete_file` 把这个文件删掉，避免污染后续测试。
+
+#### 3e. `replace_all` / `allow_multiple` 多匹配
+
+把 `<SMOKE>/a.txt` 内容预置成 `alpha\nalpha\nalpha\n`（三个 alpha），
+然后调一次 `edit_file_v2(search="alpha", replace="ALPHA", replace_all=true)`。
+
+验收：
+
+- 三处都被替换，文件内容变成 `ALPHA\nALPHA\nALPHA\n`；
+- **不**报 `ambiguous_target` —— 那只在 `replace_all=false` 且匹配数 > 1 时才出现。
+
+完成后把 a.txt 还原成 `alpha-1`（接续 3a 的状态）。
+
+#### 3f. 同一文件并发 edit（acquireOrQueueEdit 串行化验证）
+
+在**同一个**用户消息 / agent turn 内，让 agent 同时调用两次 `edit_file_v2`，
+都对 `<SMOKE>/a.txt` 进行不同的 search/replace（例如：
+edit-1 把 `alpha-1` 改成 `alpha-2`、edit-2 把 `alpha-2` 改成 `alpha-3`）。
+
+验收（这是 sub-agent 并行 + edit 串行化的协同验证点）：
+
+- **两个 toolCall 都成功**，最终 a.txt 内容是 `alpha-3`（说明顺序生效，没有第二个 edit 基于 `alpha-1` 反向覆盖）；
+- trace 中两个 `editToolCall.toolCallStarted` 事件**几乎同时**出现（说明 dispatcher 并发派发了），
+  但两个 `writeResult` **严格串行**（acquireOrQueueEdit 同 path 排队）；
+- 没有 pending 泄漏 / 重复结算。
+
+如果两次 edit 互相覆盖（最终内容是 `alpha-2` 或 `alpha-3` 之外的状态），记 hard failure。
+
+#### 3g. 失败诊断回报（target 找不到时的结构化 hint）
+
+故意调一次 `edit_file_v2(path="<SMOKE>/a.txt", search="THIS_TEXT_DEFINITELY_NOT_IN_FILE", replace="x")`。
+
+验收：
+
+- 工具结果文本以 `[edit_apply_failed]` 开头；
+- 包含 `target_content_matches_in_current_file: 0` 与
+  `diagnosis: TargetContent does not exist verbatim in the current file. Re-copy the exact current_text before retrying.`；
+- 包含 `latest_snapshot_source` 行（说明 bridge 找到了之前 read_file 的快照）；
+- 文件内容不变。
+
+这是 noop guard **不应该**误吞的负样本。同样需要确保 noop 修复没有把"真正找不到"的 case 也误判成 success。
 
 ### 任务 4：任务状态与计划
 
@@ -310,6 +407,39 @@ trace 文件不允许出现在仓库工作树内。如果在 `apps/**/.log/`、`
    `kill_agent` / `wait_agent` 等可见 kill 工具。验收 worker 在 abort checkpoint 停下，
    `metadata.status="killed"`、`errorMessage="aborted by registry"`，**不是 `failed`**。
 4. **Custom agent**（可选）：如果项目根 `.cursor/agents/*.md` 有自定义 agent 定义，至少派发一次确认 `SubagentRegistryService` 能挂上来；没有则记 `not_observed`。
+5. **Parallel sub-agent dispatch**（**必须执行**——验证 dispatchPreparedToolBatch 的并发 fork）：
+   在**同一个用户消息 / agent turn** 内，让 agent **一次性同时**派发 3 个 foreground sub-agent
+   （建议 `general-purpose` + `explore` + `bash` 各一）。每个 sub-agent 任务都要够短
+   （5-10 秒级，例如各跑一次 grep_search / read_file / `pwd && date`）但**互相之间无依赖**，
+   这样真并行才能体现。
+
+   验收（这是 #1 修复的核心场景）：
+   - **三个 task tool 的 `taskToolCallStarted` 帧时间戳间隔 < 200ms**（说明并发 fork 而不是串行）；
+   - 三个 sub-agent 的 transcript JSONL 写入时间窗口**重叠**（互相之间起点 / 终点交错）；
+   - 三个 task tool 都正常 settle，没有任何一个被前面的 sub-agent 阻塞超过 1s；
+   - parent BiDi stream 上**没有出现** `proxy restarted` / NAL stall 误报；
+   - 没有 pending tool call 泄漏（结束时 session.pendingToolCalls 为空）；
+   - 多个 sub-agent 的 ExecServerMessage（如果他们各自调 shell / read）**没有 execId 冲突**。
+
+   如果发现三个 sub-agent 是按时间顺序"一个完成才下一个开始"，标记 hard failure ——
+   说明 `dispatchPreparedToolBatch` 退化回 sequential `yield*` 了。
+
+6. **Sub-agent 结果回流**（**必须执行**——验证 #2 修复）：
+   挑上面任意一个 foreground sub-agent，让它在最终 final answer 里**只写一句"done"**，
+   但执行过程中调过若干工具（例如先 grep_search 再 read_file 再 list_directory）。
+
+   验收（这是 #2 修复的核心场景）：
+   - 父 agent 收到的 `task` 工具结果**包含三段**：
+     1. sub-agent 的 final answer 原文（"done"）；
+     2. `Sub-agent execution summary:` 块，含 `turns`、`tool calls`、`duration` 行；
+     3. `Tool calls:` 块，含每个 sub-agent 工具调用的一行摘要
+        （形如 `1. grep — pattern=...` 或 `2. read — path=... → ok: ...`）。
+   - 父 agent 的下一个 LLM turn 看到的 `tool_result` **不止是** `"done"`——
+     它能在自己的 reasoning 里引用 sub-agent 实际查到的内容
+     （例如能说出 grep_search 的命中数、read_file 看到的关键字）。
+   - 如果只看到 `"done"` / `[sub-agent completed with no output]`，
+     标记 hard failure —— 说明 `buildSubAgentFinalReport` 没有被调用，
+     或者 conversationSteps 没积累。
 
 验收要点（汇总）：
 
