@@ -216,56 +216,6 @@ export function claudeToKiro(
       | undefined
   )
 
-  // Prompt-cache breakpoint injection (Bedrock Converse-style).
-  //
-  // Verified upstream wire support against
-  // `Kiro.app/.../kiro.kiro-agent/dist/extension.js` Smithy serializers:
-  //   - `Tool` is a union with arms `toolSpecification` and `cachePoint`,
-  //     so we may insert a bare `{ cachePoint: ... }` element into the
-  //     tools array.
-  //   - `UserInputMessage` and `AssistantResponseMessage` both serialize
-  //     a top-level `cachePoint` field via `_json`.
-  //
-  // We always emit two breakpoints when there is something to cache:
-  //   1) After the tools array — caches tool definitions (the largest
-  //      stable prefix; tools rarely change between turns).
-  //   2) On the last assistant turn in history (or fallback to the last
-  //      user turn) — caches the conversation prefix up to and
-  //      including that turn.
-  //
-  // Whether the Q Developer backend actually returns
-  // `cacheReadInputTokens > 0` for these markers is observable via
-  // `KiroStreamCallback.onCacheUsage`; if upstream ignores cachePoint,
-  // these markers are no-ops on the wire.
-  if (kiroTools.length > 0) {
-    kiroTools.push({ cachePoint: { type: "default" } })
-  }
-  if (trimmedHistory.length > 0) {
-    let marked = false
-    for (let idx = trimmedHistory.length - 1; idx >= 0 && !marked; idx--) {
-      const entry = trimmedHistory[idx]!
-      if (entry.assistantResponseMessage) {
-        entry.assistantResponseMessage = {
-          ...entry.assistantResponseMessage,
-          cachePoint: { type: "default" },
-        }
-        marked = true
-      }
-    }
-    if (!marked) {
-      for (let idx = trimmedHistory.length - 1; idx >= 0 && !marked; idx--) {
-        const entry = trimmedHistory[idx]!
-        if (entry.userInputMessage) {
-          entry.userInputMessage = {
-            ...entry.userInputMessage,
-            cachePoint: { type: "default" },
-          }
-          marked = true
-        }
-      }
-    }
-  }
-
   // Agent-mode resolution: caller can override via options.agentMode, otherwise
   // we infer from tool presence (matches the official Kiro client, which only
   // emits agentTaskType / agentContinuationId in its agent-mode path).

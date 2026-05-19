@@ -40,8 +40,6 @@ export async function parseKiroEventStream(
   let inputTokens = 0
   let outputTokens = 0
   let totalCredits = 0
-  let cacheReadTokens = 0
-  let cacheWriteTokens = 0
   let currentToolUse: ToolUseState | null = null
 
   const append = (chunk: Uint8Array): void => {
@@ -121,14 +119,11 @@ export async function parseKiroEventStream(
           continue
         }
 
-        ;[inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens] =
-          updateTokensFromEvent(
-            event,
-            inputTokens,
-            outputTokens,
-            cacheReadTokens,
-            cacheWriteTokens
-          )
+        ;[inputTokens, outputTokens] = updateTokensFromEvent(
+          event,
+          inputTokens,
+          outputTokens
+        )
 
         switch (eventType) {
           case "assistantResponseEvent": {
@@ -159,22 +154,6 @@ export async function parseKiroEventStream(
             if (usage != null) {
               totalCredits += usage
             }
-            break
-          }
-          case "metadataEvent":
-          case "messageMetadataEvent": {
-            // Diagnostic: surface the raw metadata payload so we can tell
-            // whether the upstream is emitting cache counters at all.
-            // Bedrock's `MetadataEvent` carries a `tokenUsage` sub-object
-            // with `cacheReadInputTokens / cacheWriteInputTokens`; if the
-            // dump shows the field but our `onCacheUsage` callback never
-            // fires, parsing has a bug; if the field is absent, the
-            // upstream is silently dropping our cachePoint markers.
-            // eslint-disable-next-line no-console
-            console.log(
-              `[Kiro][diagnostic] ${eventType} payload:`,
-              JSON.stringify(event)
-            )
             break
           }
           case "contextUsageEvent": {
@@ -214,22 +193,8 @@ export async function parseKiroEventStream(
             // error, subsequent frames are unreliable.
             throw err
           }
-          default: {
-            // Diagnostic: surface unknown event types once per stream so
-            // we can build an exhaustive map of what the upstream is
-            // actually emitting.  Kiro's wire frames include `usage`
-            // counters under `metadataEvent` per the Smithy schema, but
-            // empirical observation shows they never arrive on
-            // `q.us-east-1.amazonaws.com`; this dump tells us where they
-            // really live (or confirms the upstream simply doesn't emit
-            // them at all).
-            const keys = Object.keys(event).slice(0, 16)
-            // eslint-disable-next-line no-console
-            console.log(
-              `[Kiro][diagnostic] unknown event-type=${eventType} keys=[${keys.join(",")}] payload=${JSON.stringify(event).slice(0, 800)}`
-            )
+          default:
             break
-          }
         }
       }
     }
@@ -243,12 +208,6 @@ export async function parseKiroEventStream(
 
     if (callback.onCredits && totalCredits > 0) {
       callback.onCredits(totalCredits)
-    }
-    if (
-      callback.onCacheUsage &&
-      (cacheReadTokens > 0 || cacheWriteTokens > 0)
-    ) {
-      callback.onCacheUsage(cacheReadTokens, cacheWriteTokens)
     }
     if (callback.onComplete) {
       callback.onComplete(inputTokens, outputTokens)
@@ -340,17 +299,13 @@ function collectUsageMaps(
 function updateTokensFromEvent(
   event: Record<string, unknown>,
   currentInputTokens: number,
-  currentOutputTokens: number,
-  currentCacheReadTokens: number = 0,
-  currentCacheWriteTokens: number = 0
-): [number, number, number, number] {
+  currentOutputTokens: number
+): [number, number] {
   const candidates: Array<Record<string, unknown>> = [event]
   collectUsageMaps(event, candidates)
 
   let inputTokens = currentInputTokens
   let outputTokens = currentOutputTokens
-  let cacheReadTokens = currentCacheReadTokens
-  let cacheWriteTokens = currentCacheWriteTokens
 
   for (const usage of candidates) {
     if (!usage) continue
@@ -379,28 +334,6 @@ function updateTokensFromEvent(
     )
     if (inp != null) {
       inputTokens = inp
-      // Even when total inputTokens is reported directly, the upstream
-      // may still attach cache counters in the same usage map; track
-      // them so the proxy can surface real cache hits separately from
-      // the client-side simulation.
-      const cr = readTokenNumber(
-        usage,
-        "cacheReadInputTokens",
-        "cache_read_input_tokens"
-      )
-      if (cr != null && cr > cacheReadTokens) {
-        cacheReadTokens = cr
-      }
-      const cw = readTokenNumber(
-        usage,
-        "cacheWriteInputTokens",
-        "cache_write_input_tokens",
-        "cacheCreationInputTokens",
-        "cache_creation_input_tokens"
-      )
-      if (cw != null && cw > cacheWriteTokens) {
-        cacheWriteTokens = cw
-      }
       continue
     }
 
@@ -424,12 +357,6 @@ function updateTokensFromEvent(
     const sum = (uncached ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0)
     if (sum > 0) {
       inputTokens = sum
-      if (cacheRead != null && cacheRead > cacheReadTokens) {
-        cacheReadTokens = cacheRead
-      }
-      if (cacheWrite != null && cacheWrite > cacheWriteTokens) {
-        cacheWriteTokens = cacheWrite
-      }
       continue
     }
 
@@ -454,7 +381,7 @@ function updateTokensFromEvent(
     }
   }
 
-  return [inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens]
+  return [inputTokens, outputTokens]
 }
 
 /**

@@ -22,39 +22,13 @@ export interface KiroToolInputSchema {
   json: unknown
 }
 
-/**
- * Prompt cache breakpoint marker (Bedrock Converse-style).
- *
- * Verified against the official Kiro client (`Kiro.app/.../extension.js`):
- * `Tool` is a Smithy union with two arms — `toolSpecification` or
- * `cachePoint` — and `UserInputMessage` / `AssistantResponseMessage`
- * accept a top-level `cachePoint` field. The value is forwarded to the
- * upstream verbatim via `_json`, so any object Bedrock recognises is
- * accepted; we use `{ type: "default" }` (5-minute TTL) by default.
- */
-export interface KiroCachePoint {
-  /**
-   * "default": Bedrock 5-minute breakpoint (always supported).
-   * "ephemeral": opt-in 1-hour breakpoint; only honoured by a subset of
-   *              models, treat as best-effort.
-   */
-  type: "default" | "ephemeral"
+export interface KiroToolWrapper {
+  toolSpecification: {
+    name: string
+    description: string
+    inputSchema: KiroToolInputSchema
+  }
 }
-
-/**
- * `tools` array element.  Either a regular tool specification, or a
- * cachePoint marker that splits the array into a cacheable prefix and a
- * non-cacheable suffix.
- */
-export type KiroToolWrapper =
-  | {
-      toolSpecification: {
-        name: string
-        description: string
-        inputSchema: KiroToolInputSchema
-      }
-    }
-  | { cachePoint: KiroCachePoint }
 
 export interface KiroResultContent {
   text: string
@@ -77,12 +51,6 @@ export interface KiroUserInputMessage {
   origin?: string
   images?: KiroImage[]
   userInputMessageContext?: KiroUserInputMessageContext
-  /**
-   * Optional prompt-cache breakpoint marker.  When set, the upstream is
-   * told to checkpoint the prefix ending at this message so subsequent
-   * requests with an identical prefix can be billed as `cacheRead`.
-   */
-  cachePoint?: KiroCachePoint
 }
 
 export interface KiroToolUse {
@@ -94,8 +62,6 @@ export interface KiroToolUse {
 export interface KiroAssistantResponseMessage {
   content: string
   toolUses?: KiroToolUse[]
-  /** See KiroUserInputMessage.cachePoint. */
-  cachePoint?: KiroCachePoint
 }
 
 export interface KiroHistoryMessage {
@@ -167,15 +133,6 @@ export interface KiroStreamCallback {
   onError?: (err: Error) => void
   onCredits?: (credits: number) => void
   onContextUsage?: (percentage: number) => void
-  /**
-   * Called when the upstream `usage` block carries Bedrock-style cache
-   * counters (`cacheReadInputTokens` / `cacheWriteInputTokens`).  These
-   * are surfaced separately from `onComplete` so the proxy can
-   * distinguish real upstream cache hits from the client-side simulation
-   * performed by `KiroPromptCacheTracker`.  Both fields default to 0
-   * when the upstream omits them.
-   */
-  onCacheUsage?: (cacheReadTokens: number, cacheWriteTokens: number) => void
   /**
    * Called when the model emits a `codeReferenceEvent`. Caller decides
    * whether to surface license attribution to the user (Q Developer
