@@ -1432,6 +1432,28 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     )
   }
 
+  /**
+   * Detect "Previous response with id ... not found" errors from the Codex API.
+   * This happens when the server evicts the response from its cache (e.g. due to
+   * parallel tool calls taking too long). The fix is to retry without
+   * previous_response_id, sending the full input instead.
+   */
+  private isStaleResponseIdError(error: unknown): boolean {
+    if (error instanceof CodexWebSocketUpgradeError) {
+      return (
+        error.statusCode === 400 &&
+        /previous.response.*not found/i.test(error.body)
+      )
+    }
+    if (error instanceof CodexApiError) {
+      return (
+        error.getStatus() === 400 &&
+        /previous.response.*not found/i.test(error.message)
+      )
+    }
+    return false
+  }
+
   private shouldFallbackToHttpAfterWebSocketError(error: unknown): boolean {
     if (error instanceof CodexWebSocketUpgradeError) {
       return error.shouldFallbackToHttp()
@@ -4149,16 +4171,31 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
 
       // Send generate:false warmup payload to prime the server-side prompt cache (mirrors Codex CLI).
-      // IMPORTANT: Skip when the conversation already has a cached response_id.
-      // Sending generate:false would create a new response on the server and invalidate
-      // the previous_response_id routing needed by the upcoming continuation request.
+      //
+      // IMPORTANT: Only send warmup payload for initial-chat warmups (session startup).
+      // The official Codex CLI only does prewarm_websocket() when last_request.is_none()
+      // (i.e., before the first request in a session). For continuation warmups
+      // (shell-continuation, tool-continuation), sending generate:false creates a new
+      // response on the server that breaks the previous_response_id chain — the server
+      // won't recognize the response_id from the actual request because it belongs to
+      // a different chain than the warmup response.
+      //
+      // Skip conditions:
+      // 1. Connection was reused (no new connection to warm up)
+      // 2. Conversation already has a cached response_id (would invalidate it)
+      // 3. This is a continuation warmup (not initial-chat) — mirrors official CLI behavior
+      const isContinuationWarmup =
+        warmupReason.includes("continuation") ||
+        warmupReason.includes("shell") ||
+        warmupReason.includes("tool")
       const cachedEntry = this.cachedWsSessions.get(
         this.getCachedWsKey(slot, modelName, conversationId || undefined)
       )
       const skipWarmupPayload =
-        !!conversationId &&
-        (this.hasActiveTurnContext(conversationId) ||
-          !!cachedEntry?.lastResponse?.responseId)
+        isContinuationWarmup ||
+        (!!conversationId &&
+          (this.hasActiveTurnContext(conversationId) ||
+            !!cachedEntry?.lastResponse?.responseId))
       if (warmupPayload && !reusedConnection && !skipWarmupPayload) {
         let warmupBody = { ...warmupPayload }
         if (cacheId) {
@@ -4838,6 +4875,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
       // NOW inject previous_response_id — only after we know the connection is valid.
       // Mirrors prepare_websocket_request() + get_incremental_items().
+      const originalCodexRequest = codexRequest
       if (turnContext && conversationId) {
         codexRequest = this.prepareRequestWithTurnContext(
           codexRequest,
@@ -4873,6 +4911,46 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
         return
       } catch (error) {
+        // Handle "Previous response with id ... not found" — the server evicted
+        // the response from its cache. Clear turn context and retry with the full
+        // input (no previous_response_id). This commonly happens when parallel
+        // tool calls take long enough for the server-side session to expire.
+        if (
+          conversationId &&
+          this.isStaleResponseIdError(error) &&
+          codexRequest !== originalCodexRequest
+        ) {
+          this.logger.warn(
+            `[Codex] Previous response_id rejected by server for ${conversationId}, ` +
+              `retrying without previous_response_id (full input)`
+          )
+          this.resetTurnContextResponseState(
+            conversationId,
+            "Server rejected stale previous_response_id"
+          )
+          codexRequest = originalCodexRequest
+          this.wsService.invalidateSessionConnection(sessionId, ws)
+          ws = await this.wsService.ensureSessionConnection(
+            sessionId,
+            wsUrl,
+            wsHeaders,
+            slot.proxyUrl || undefined
+          )
+          yield* this.streamViaWebSocketConnection(
+            ws,
+            slot,
+            modelName,
+            reverseToolMap,
+            cacheId,
+            codexRequest,
+            Date.now(),
+            sessionId,
+            abortSignal,
+            conversationId
+          )
+          return
+        }
+
         if (!this.shouldRetrySessionWebSocketError(error)) {
           throw error
         }
