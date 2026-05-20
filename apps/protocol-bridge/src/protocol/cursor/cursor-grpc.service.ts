@@ -2323,6 +2323,17 @@ export class CursorGrpcService {
     if (normalized.includes("resumeagent")) return "task"
     if (normalized.includes("waitagent")) return "await"
     if (normalized.includes("closeagent")) return "task"
+    // Bridge-defined sub-agent control surface — the IDE proto has no
+    // dedicated ToolCall oneof for `kill_agent`, so we project it onto
+    // the inline-only `truncated` family. Without this the family
+    // resolver lands on `unknown` and the gRPC layer logs
+    // `[ToolProjection] toolName="kill_agent" family="unknown"` while
+    // emitting a `truncatedToolCall` placeholder. Mapping straight to
+    // `truncated` keeps the result envelope identical (the IDE renders
+    // both as `[Tool: truncatedToolCall]`) and silences the
+    // misleading "unknown ToolCall result type" warning.
+    if (normalized.includes("killagent") || normalized.includes("kill_agent"))
+      return "truncated"
     if (normalized.includes("applypatch")) return "apply_agent_diff"
 
     if (

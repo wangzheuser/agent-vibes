@@ -2379,6 +2379,60 @@ export class CursorConnectStreamService {
     }
   }
 
+  /**
+   * Resolve the sub-agent tool surface + system addendum that
+   * `buildSubAgentStreamingDtoForRoute` and the two Codex sub-agent
+   * request builders all share. Centralising this matters because the
+   * Codex / openai-compat path used to pass neither the tool definitions
+   * nor the addendum, leaving GPT-backed sub-agents with an empty tool
+   * surface (every smoke probe came back with `tool calls: 0`).
+   *
+   * `forceFinalSynthesis` mirrors the matching flag on the DTO builder:
+   * on the post-MAX_TURNS synthesis turn we strip tools and swap in a
+   * "produce a final answer from tool_results" addendum so the LLM
+   * cannot emit more tool_use blocks.
+   */
+  private resolveSubAgentToolSurface(
+    candidateTools: unknown,
+    forceFinalSynthesis: boolean
+  ): {
+    toolDefinitions: ToolDefinition[] | undefined
+    systemAddendum: string
+  } {
+    const toolDefinitions = forceFinalSynthesis
+      ? undefined
+      : Array.isArray(candidateTools) && candidateTools.length > 0
+        ? (candidateTools as ToolDefinition[])
+        : undefined
+
+    const availableToolNames = (toolDefinitions || [])
+      .map((tool) => tool?.name)
+      .filter((value): value is string => typeof value === "string")
+
+    const systemAddendum = forceFinalSynthesis
+      ? "You are a sub-agent that has reached its turn limit. You can " +
+        "no longer use any tools. The conversation above already contains " +
+        "every tool_result you collected. Your task NOW is to write a " +
+        "single final assistant message that synthesizes those results " +
+        "into a clear answer for the parent agent. Do not ask follow-up " +
+        "questions, do not announce you ran out of turns — just produce " +
+        "the best answer you can from the evidence on hand. Be concise " +
+        "but complete; cite specific findings from the tool_results when " +
+        "relevant."
+      : "You are a sub-agent. Operate strictly within the tool surface " +
+        "below; never invent tools. Use read-only workspace tools such as " +
+        "grep_search, read_file, and list_directory only when they are listed. " +
+        "Use shell/edit/delete only when those tools are explicitly listed " +
+        "for this agent. " +
+        (availableToolNames.length > 0
+          ? `Available tools: ${availableToolNames.join(", ")}. `
+          : "No tools are available in this sub-agent. ") +
+        "Use the smallest number of tool calls needed, then produce a final " +
+        "plain-text summary as your last assistant message (no tool_use)."
+
+    return { toolDefinitions, systemAddendum }
+  }
+
   private buildSubAgentStreamingDtoForRoute(
     session: ChatSession,
     ctx: SubAgentContext,
@@ -2410,42 +2464,10 @@ export class CursorConnectStreamService {
     // front in executeSubAgentTask via buildToolsForApi(). On a final
     // synthesis turn we deliberately omit the tools so the LLM has no
     // choice but to write a plain-text answer.
-    const subAgentToolDefinitions = (() => {
-      if (forceFinalSynthesis) return undefined
-      const candidate = ctx.tools as unknown
-      if (!Array.isArray(candidate) || candidate.length === 0) {
-        return undefined
-      }
-      return candidate as ToolDefinition[]
-    })()
-
-    // Tell the sub-agent explicitly which tools it has and that it must
-    // commit a final summary after at most a few tool calls. This avoids
-    // the "think forever, never call a tool" failure mode observed during
-    // the smoke regression.
-    const availableToolNames = (subAgentToolDefinitions || [])
-      .map((tool) => tool?.name)
-      .filter((value): value is string => typeof value === "string")
-    const subAgentSystemAddendum = forceFinalSynthesis
-      ? "You are a sub-agent that has reached its turn limit. You can " +
-        "no longer use any tools. The conversation above already contains " +
-        "every tool_result you collected. Your task NOW is to write a " +
-        "single final assistant message that synthesizes those results " +
-        "into a clear answer for the parent agent. Do not ask follow-up " +
-        "questions, do not announce you ran out of turns — just produce " +
-        "the best answer you can from the evidence on hand. Be concise " +
-        "but complete; cite specific findings from the tool_results when " +
-        "relevant."
-      : "You are a sub-agent. Operate strictly within the tool surface " +
-        "below; never invent tools. Use read-only workspace tools such as " +
-        "grep_search, read_file, and list_directory only when they are listed. " +
-        "Use shell/edit/delete only when those tools are explicitly listed " +
-        "for this agent. " +
-        (availableToolNames.length > 0
-          ? `Available tools: ${availableToolNames.join(", ")}. `
-          : "No tools are available in this sub-agent. ") +
-        "Use the smallest number of tool calls needed, then produce a final " +
-        "plain-text summary as your last assistant message (no tool_use)."
+    const {
+      toolDefinitions: subAgentToolDefinitions,
+      systemAddendum: subAgentSystemAddendum,
+    } = this.resolveSubAgentToolSurface(ctx.tools, forceFinalSynthesis)
 
     const dto = this.buildStreamingDtoForRoute(streamRoute, {
       model: ctx.model,
@@ -12177,8 +12199,14 @@ ${raw}
       const buildSubAgentCodexRequestForRoute = (
         streamRoute: ModelRouteResult,
         hints?: BackendStreamHints
-      ): CodexExecutionRequest =>
-        this.buildCodexStreamingRequestForRoute(streamRoute, {
+      ): CodexExecutionRequest => {
+        // Mirror the Anthropic DTO path: a sub-agent on the Codex
+        // backend MUST receive the same tool definitions and system
+        // addendum, otherwise GPT-routed sub-agents come back with
+        // `tool calls: 0` and answer "no tools are available".
+        const { toolDefinitions, systemAddendum } =
+          this.resolveSubAgentToolSurface(ctx.tools, false)
+        return this.buildCodexStreamingRequestForRoute(streamRoute, {
           model: ctx.model,
           promptContext: this.buildPromptContextFromSession(session),
           conversationId,
@@ -12186,6 +12214,8 @@ ${raw}
           thinkingLevel: session.thinkingLevel,
           thinkingDetailsRequested: session.thinkingDetailsRequested,
           budgetOverride: hints?.budgetOverride,
+          toolDefinitions,
+          additionalSystemPrompt: systemAddendum,
           buildMessages: (budget) => {
             const compacted =
               this.contextManager.buildBackendMessagesFromMessages(
@@ -12204,6 +12234,7 @@ ${raw}
             return compacted.messages as CodexExecutionRequest["messages"]
           },
         })
+      }
 
       const route = this.modelRouter.resolveModel(ctx.model)
       const streamModel = route.model
@@ -12736,8 +12767,18 @@ ${raw}
       const buildSynthesisCodexRequestForRoute = (
         streamRoute: ModelRouteResult,
         hints?: BackendStreamHints
-      ): CodexExecutionRequest =>
-        this.buildCodexStreamingRequestForRoute(streamRoute, {
+      ): CodexExecutionRequest => {
+        // Synthesis turn: tools are intentionally undefined, but the
+        // model still needs the "produce a final answer from
+        // tool_results" addendum so it doesn't sit silent. Anthropic
+        // DTO path supplies this via the forceFinalSynthesis branch in
+        // buildSubAgentStreamingDtoForRoute; the Codex path used to
+        // skip it entirely.
+        const { systemAddendum } = this.resolveSubAgentToolSurface(
+          undefined,
+          true
+        )
+        return this.buildCodexStreamingRequestForRoute(streamRoute, {
           model: ctx.model,
           promptContext: this.buildPromptContextFromSession(session),
           conversationId,
@@ -12745,6 +12786,7 @@ ${raw}
           thinkingLevel: session.thinkingLevel,
           thinkingDetailsRequested: session.thinkingDetailsRequested,
           budgetOverride: hints?.budgetOverride,
+          additionalSystemPrompt: systemAddendum,
           // No toolDefinitions — synthesis turn must be text-only.
           buildMessages: (budget) => {
             const compacted =
@@ -12764,6 +12806,7 @@ ${raw}
             return compacted.messages as CodexExecutionRequest["messages"]
           },
         })
+      }
 
       // Heartbeat at the synthesis turn boundary, mirroring what
       // every other LLM turn in this loop does.
@@ -12952,8 +12995,20 @@ ${raw}
     const buildCodexRequestForRoute = (
       streamRoute: ModelRouteResult,
       hints?: BackendStreamHints
-    ): CodexExecutionRequest =>
-      this.buildCodexStreamingRequestForRoute(streamRoute, {
+    ): CodexExecutionRequest => {
+      // Background sub-agent on Codex needs the SAME tool surface and
+      // system addendum the Anthropic DTO path injects. Without this,
+      // GPT-routed background sub-agents see no tools and immediately
+      // return a "no tools available" assistant message after `turn=1,
+      // tools=0` — exactly the failure mode reported in the smoke
+      // probe. On the post-MAX_TURNS synthesis pass we strip tools
+      // anyway, so we honour args.forceFinalSynthesis here.
+      const { toolDefinitions: codexTools, systemAddendum: codexAddendum } =
+        this.resolveSubAgentToolSurface(
+          tempCtx.tools,
+          args.forceFinalSynthesis === true
+        )
+      return this.buildCodexStreamingRequestForRoute(streamRoute, {
         model: args.model,
         promptContext: this.buildPromptContextFromSession(session),
         conversationId,
@@ -12961,6 +13016,8 @@ ${raw}
         thinkingLevel: session.thinkingLevel,
         thinkingDetailsRequested: session.thinkingDetailsRequested,
         budgetOverride: hints?.budgetOverride,
+        toolDefinitions: codexTools,
+        additionalSystemPrompt: codexAddendum,
         buildMessages: (budget) => {
           const compacted =
             this.contextManager.buildBackendMessagesFromMessages(
@@ -12978,6 +13035,7 @@ ${raw}
           return compacted.messages as CodexExecutionRequest["messages"]
         },
       })
+    }
 
     const streamModel = route.model
 
