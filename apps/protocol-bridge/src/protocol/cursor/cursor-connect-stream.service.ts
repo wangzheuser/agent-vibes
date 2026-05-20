@@ -19928,7 +19928,7 @@ ${raw}
       // inline (so it doesn't need to wait for an ExecClientMessage)
       // versus is awaiting an upstream IDE response.
       let next = await subGenerator.next()
-      while (!next.done) {
+      while (next.done !== true) {
         if (!channel.push(next.value)) {
           // Channel was closed mid-flight (early failure on a sibling).
           // Stop pumping; per-fork generator is closed via finally
