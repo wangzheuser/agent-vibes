@@ -2192,6 +2192,162 @@ export class CursorRequestParser {
         }
       }
 
+      if (action && actionCase && actionCase !== "userMessageAction") {
+        const control = (() => {
+          switch (actionCase) {
+            case "summarizeAction":
+              this.logger.log(
+                `AgentRunRequest summarizeAction: conversationId=${conversationId || "(none)"}`
+              )
+              return makeControlMessage("summarizeAction", {
+                conversationId,
+                model,
+              })
+            case "shellCommandAction": {
+              const shellAction = action.action.value as {
+                shellCommand?: { command?: string }
+                execId?: string
+              }
+              const command = shellAction.shellCommand?.command || ""
+              const execId = shellAction.execId || ""
+              this.logger.log(
+                `AgentRunRequest shellCommandAction: conversationId=${conversationId || "(none)"} command="${command.substring(0, 80)}" execId=${execId}`
+              )
+              return makeControlMessage("shellCommandAction", {
+                conversationId,
+                model,
+                shellCommand: { command, execId },
+              })
+            }
+            case "startPlanAction":
+              this.logger.log(
+                `AgentRunRequest startPlanAction: conversationId=${conversationId || "(none)"}`
+              )
+              return makeControlMessage("startPlanAction", {
+                conversationId,
+                model,
+              })
+            case "executePlanAction":
+              this.logger.log(
+                `AgentRunRequest executePlanAction: conversationId=${conversationId || "(none)"}`
+              )
+              return makeControlMessage("executePlanAction", {
+                conversationId,
+                model,
+              })
+            case "asyncAskQuestionCompletionAction": {
+              const asyncAction = action.action.value as {
+                originalToolCallId?: string
+              }
+              this.logger.log(
+                `AgentRunRequest asyncAskQuestionCompletionAction: conversationId=${conversationId || "(none)"} toolCallId=${asyncAction.originalToolCallId || "(none)"}`
+              )
+              return makeControlMessage("asyncAskQuestionCompletionAction", {
+                conversationId,
+                model,
+                toolCallId: asyncAction.originalToolCallId || "",
+              })
+            }
+            case "cancelSubagentAction": {
+              const cancelSub = action.action.value as {
+                subagentId?: string
+              }
+              this.logger.log(
+                `AgentRunRequest cancelSubagentAction: conversationId=${conversationId || "(none)"} subagentId=${cancelSub.subagentId || "(none)"}`
+              )
+              return makeControlMessage("cancelSubagentAction", {
+                conversationId,
+                model,
+                subagentId: cancelSub.subagentId || "",
+              })
+            }
+            case "backgroundTaskCompletionAction": {
+              const bgTask = action.action.value as {
+                completions?: Array<{
+                  taskId?: string
+                  status?: number
+                  reason?: number
+                }>
+              }
+              this.logger.log(
+                `AgentRunRequest backgroundTaskCompletionAction: conversationId=${conversationId || "(none)"} completions=${bgTask.completions?.length || 0}`
+              )
+              return makeControlMessage("backgroundTaskCompletionAction", {
+                conversationId,
+                model,
+              })
+            }
+            case "backgroundShellAction": {
+              const bgShell = action.action.value as {
+                toolCallId?: string
+              }
+              this.logger.log(
+                `AgentRunRequest backgroundShellAction: conversationId=${conversationId || "(none)"} toolCallId=${bgShell.toolCallId || "(none)"}`
+              )
+              return makeControlMessage("backgroundShellAction", {
+                conversationId,
+                model,
+                toolCallId: bgShell.toolCallId || "",
+              })
+            }
+            case "backgroundSubagentAction": {
+              const bgSub = action.action.value as {
+                toolCallId?: string
+              }
+              this.logger.log(
+                `AgentRunRequest backgroundSubagentAction: conversationId=${conversationId || "(none)"} toolCallId=${bgSub.toolCallId || "(none)"}`
+              )
+              return makeControlMessage("backgroundSubagentAction", {
+                conversationId,
+                model,
+                toolCallId: bgSub.toolCallId || "",
+              })
+            }
+            default:
+              this.logger.log(
+                `AgentRunRequest control action: conversationId=${conversationId || "(none)"}`
+              )
+              return makeControlMessage("other", {
+                conversationId,
+                model,
+              })
+          }
+        })()
+
+        return {
+          ...control,
+          conversation: stateHistory,
+          model: control.model || model,
+          thinkingLevel,
+          thinkingDetailsRequested,
+          supportedTools,
+          useWeb,
+          conversationId,
+          projectContext: rootPath
+            ? { rootPath, directories, files: [] }
+            : undefined,
+          cursorRules,
+          selectedCursorRulePaths:
+            selectedCursorRulePaths.size > 0
+              ? Array.from(selectedCursorRulePaths)
+              : undefined,
+          selectedCursorRuleNames:
+            selectedCursorRuleNames.size > 0
+              ? Array.from(selectedCursorRuleNames)
+              : undefined,
+          cursorCommands:
+            cursorCommands.length > 0 ? cursorCommands : undefined,
+          customSystemPrompt: customSystemPrompt || undefined,
+          contextTokenLimit,
+          usedContextTokens,
+          requestedMaxOutputTokens,
+          requestedModelParameters,
+          requestContextEnv,
+          statePendingToolCallIds,
+          mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
+        }
+      }
+
       if (
         !actionCase &&
         (conversationId ||

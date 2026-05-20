@@ -20444,6 +20444,7 @@ ${raw}
             this.logger.log(
               `ConversationAction.backgroundTaskCompletion: ${conversationId}`
             )
+            return
           } else if (
             parsed.agentControlType === "backgroundShellAction" &&
             conversationId
