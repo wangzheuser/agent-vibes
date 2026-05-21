@@ -2,7 +2,7 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 
-function normalizeAntigravityVersion(rawValue: unknown): string | null {
+function normalizeKiroVersion(rawValue: unknown): string | null {
   const rawString =
     typeof rawValue === "string" || typeof rawValue === "number"
       ? String(rawValue)
@@ -28,7 +28,7 @@ function readVersionFromPackageJson(packageJsonPath: string): string | null {
   try {
     const raw = fs.readFileSync(packageJsonPath, "utf8")
     const parsed = JSON.parse(raw) as { version?: unknown }
-    return normalizeAntigravityVersion(parsed.version)
+    return normalizeKiroVersion(parsed.version)
   } catch {
     return null
   }
@@ -44,7 +44,7 @@ function readVersionFromInfoPlist(infoPlistPath: string): string | null {
     const match = plist.match(
       /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/
     )
-    return normalizeAntigravityVersion(match?.[1])
+    return normalizeKiroVersion(match?.[1])
   } catch {
     return null
   }
@@ -142,42 +142,49 @@ function getLinuxAppPathCandidates(appName: string): string[] {
   ]
 }
 
-function getAntigravityAppPathCandidates(): string[] {
-  const envPath = String(process.env.ANTIGRAVITY_APP_PATH || "").trim()
+function getKiroAppPathCandidates(): string[] {
+  const envPath = String(process.env.KIRO_APP_PATH || "").trim()
   const candidates = envPath ? [envPath] : []
 
   switch (process.platform) {
     case "darwin":
       candidates.push(
-        "/Applications/Antigravity.app",
-        "/Applications/Antigravity Beta.app",
-        "/Applications/Setapp/Antigravity.app",
-        path.join(os.homedir(), "Applications", "Antigravity.app")
+        "/Applications/Kiro.app",
+        "/Applications/Kiro - Insiders.app",
+        "/Applications/Kiro Beta.app",
+        "/Applications/Setapp/Kiro.app",
+        path.join(os.homedir(), "Applications", "Kiro.app")
       )
       break
     case "win32":
-      candidates.push(...getWindowsAppPathCandidates("Antigravity"))
+      candidates.push(
+        ...getWindowsAppPathCandidates("Kiro"),
+        ...getWindowsAppPathCandidates("Kiro - Insiders"),
+        ...getWindowsAppPathCandidates("Kiro Beta")
+      )
       break
     case "linux":
-      candidates.push(...getLinuxAppPathCandidates("Antigravity"))
+      candidates.push(
+        ...getLinuxAppPathCandidates("Kiro"),
+        ...getLinuxAppPathCandidates("Kiro - Insiders"),
+        ...getLinuxAppPathCandidates("Kiro Beta")
+      )
       break
     default:
-      candidates.push(...getLinuxAppPathCandidates("Antigravity"))
+      candidates.push(...getLinuxAppPathCandidates("Kiro"))
       break
   }
 
   return uniquePaths(candidates)
 }
 
-export function detectCurrentAntigravityVersion(): string | null {
-  const envVersion = normalizeAntigravityVersion(
-    process.env.ANTIGRAVITY_IDE_VERSION
-  )
+export function detectCurrentKiroVersion(): string | null {
+  const envVersion = normalizeKiroVersion(process.env.KIRO_VERSION)
   if (envVersion) {
     return envVersion
   }
 
-  for (const candidate of getAntigravityAppPathCandidates()) {
+  for (const candidate of getKiroAppPathCandidates()) {
     const version = readVersionFromAppPath(candidate)
     if (version) {
       return version

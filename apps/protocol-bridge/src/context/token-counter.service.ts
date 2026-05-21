@@ -8,6 +8,7 @@ import {
 import type { Tiktoken } from "tiktoken/lite"
 import {
   ContentBlock,
+  isCacheEditsBlock,
   UnifiedMessage,
   isImageBlock,
   isTextBlock,
@@ -177,6 +178,8 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
       tokens = this.TOKENS_PER_IMAGE
     } else if (isThinkingBlock(block)) {
       tokens = this.countText(block.thinking, false)
+    } else if (isCacheEditsBlock(block)) {
+      tokens = this.countJsonValue(block.edits, false)
     }
 
     return applyCorrection

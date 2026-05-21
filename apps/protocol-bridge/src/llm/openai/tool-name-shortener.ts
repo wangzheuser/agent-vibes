@@ -76,7 +76,7 @@ export function buildShortNameMap(names: string[]): Map<string, string> {
     }
   }
 
-  for (const n of names) {
+  for (const n of [...names].sort((a, b) => a.localeCompare(b))) {
     const cand = baseCandidate(n)
     const uniq = makeUnique(cand)
     used.add(uniq)

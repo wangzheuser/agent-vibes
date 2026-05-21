@@ -2,6 +2,9 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import {
   type ContextAttachmentSnapshot,
   ContextManagerService,
+  ContextNativeManagementService,
+  ContextRequestPlannerService,
+  type ContextRequestBudget,
   detectPromptTooLong,
   TokenCounterService,
   UnifiedMessage,
@@ -69,6 +72,8 @@ export class MessagesService implements OnModuleInit {
     private readonly tokenizer: TokenizerService,
     private readonly tokenCounter: TokenCounterService,
     private readonly contextManager: ContextManagerService,
+    private readonly contextRequestPlanner: ContextRequestPlannerService,
+    private readonly contextNativeManagement: ContextNativeManagementService,
     private readonly codexService: CodexService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly anthropicApiService: AnthropicApiService,
@@ -251,7 +256,6 @@ export class MessagesService implements OnModuleInit {
     return {
       ...dto,
       messages: [...(contextMessages as typeof dto.messages), ...dto.messages],
-      _protectedContextMessageCount: contextMessages.length,
       system: undefined,
     }
   }
@@ -300,33 +304,35 @@ export class MessagesService implements OnModuleInit {
   private resolveContextBudget(
     dto: CreateMessageDto,
     route: ModelRouteResult
-  ): {
-    maxTokens: number
-    systemPromptTokens: number
-  } {
-    let maxTokens =
-      this.normalizePositiveInteger(dto._contextTokenBudget) ||
-      this.DEFAULT_HISTORY_MAX_TOKENS
+  ): ContextRequestBudget {
     const backendLimit = this.getBackendContextLimit(route)
-    if (backendLimit && maxTokens > backendLimit) {
+    const budget = this.contextRequestPlanner.resolveBudget({
+      backend: route.backend,
+      protocolMaxTokens: dto._contextTokenBudget,
+      backendMaxTokens: backendLimit,
+      defaultMaxTokens: this.DEFAULT_HISTORY_MAX_TOKENS,
+      systemPromptTokens: this.countSystemPromptTokens(dto),
+      toolDefinitions: dto.tools,
+      backendSystemPromptTokens: this.isGoogleBackend(route)
+        ? this.googleService.getSystemPromptTokenEstimate()
+        : 0,
+      fixedOverheadTokens: this.isGoogleBackend(route)
+        ? this.CLOUD_CODE_EXTRA_OVERHEAD_TOKENS
+        : this.GENERIC_EXTRA_OVERHEAD_TOKENS,
+      maxOutputTokens: dto.max_tokens,
+      requestedServiceTier:
+        route.backend === "codex" && typeof dto.service_tier === "string"
+          ? dto.service_tier
+          : undefined,
+    })
+
+    if (budget.backendClampedFrom && budget.backendClampedTo) {
       this.logger.warn(
-        `Request context budget ${maxTokens} exceeds backend cap ${backendLimit}, clamping`
+        `Request context budget ${budget.backendClampedFrom} exceeds backend cap ${budget.backendClampedTo}, clamping`
       )
-      maxTokens = backendLimit
     }
 
-    const systemPromptTokens =
-      this.countSystemPromptTokens(dto) +
-      this.tokenCounter.countJsonValue(dto.tools) +
-      (this.isGoogleBackend(route)
-        ? this.googleService.getSystemPromptTokenEstimate() +
-          this.CLOUD_CODE_EXTRA_OVERHEAD_TOKENS
-        : this.GENERIC_EXTRA_OVERHEAD_TOKENS)
-
-    return {
-      maxTokens,
-      systemPromptTokens,
-    }
+    return budget
   }
 
   private applyContextCompaction(
@@ -337,12 +343,11 @@ export class MessagesService implements OnModuleInit {
       dto.messages as UnifiedMessage[]
     )
     const budget = this.resolveContextBudget(dto, route)
-    const result = this.contextManager.buildBackendMessagesFromMessages(
+    const result = this.contextRequestPlanner.projectMessages(
       dto.messages as UnifiedMessage[],
       this.EMPTY_ATTACHMENT_SNAPSHOT,
+      budget,
       {
-        maxTokens: budget.maxTokens,
-        systemPromptTokens: budget.systemPromptTokens,
         pendingToolUseIds: dto._pendingToolUseIds,
         strategy: "auto",
       }
@@ -369,9 +374,19 @@ export class MessagesService implements OnModuleInit {
       )
     }
 
+    const contextManagement =
+      this.contextNativeManagement.buildAnthropicContextManagement({
+        backend: route.backend,
+        messages: result.messages,
+        maxTokens: budget.maxTokens,
+        systemPromptTokens: budget.systemPromptTokens,
+        autoCompactTokenLimit: budget.autoCompactTokenLimit,
+      })
+
     return {
       ...dto,
       messages: result.messages as typeof dto.messages,
+      context_management: contextManagement,
     }
   }
 
@@ -605,6 +620,7 @@ export class MessagesService implements OnModuleInit {
         {
           maxTokens: previousBudget.maxTokens,
           systemPromptTokens: previousBudget.systemPromptTokens,
+          autoCompactTokenLimit: previousBudget.autoCompactTokenLimit,
           pendingToolUseIds: dto._pendingToolUseIds,
         },
         {
@@ -765,6 +781,7 @@ export class MessagesService implements OnModuleInit {
             {
               maxTokens: previousBudget.maxTokens,
               systemPromptTokens: previousBudget.systemPromptTokens,
+              autoCompactTokenLimit: previousBudget.autoCompactTokenLimit,
               pendingToolUseIds: dto._pendingToolUseIds,
             },
             {

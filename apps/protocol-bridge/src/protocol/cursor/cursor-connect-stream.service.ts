@@ -2,28 +2,34 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
 import { spawn, spawnSync } from "child_process"
 import * as crypto from "crypto"
-import {
-  closeSync,
-  openSync,
-  readFileSync,
-  readSync,
-  realpathSync,
-  statSync,
-} from "fs"
+import { closeSync, openSync, readFileSync, readSync, statSync } from "fs"
 import * as os from "os"
 import * as path from "path"
 import {
+  buildSubAgentMemorySourceCompactionId,
+  CodexContextAdapterService,
+  ContextCompactRunnerService,
   type ContextAttachmentSnapshot,
+  type ContextCompactRunnerSummaryProvider,
+  type ContextCompactionCandidate,
   type ContextCompactionResult,
   ContextHookExecutorService,
   type ContextInvestigationMemoryEntry,
   ContextManagerService,
+  ContextNativeManagementService,
+  ContextRequestPlannerService,
+  type ContextRequestBudget,
+  type ContextProjectionBudget,
+  type ContextSessionMemoryEntry,
   type ContextUsageSnapshot,
   detectPromptTooLong,
   extractText,
+  formatSubAgentMemoryEntry,
+  isMessageRecord,
   type LooseMessageContent,
   normalizeToolProtocolMessages,
   type PreCompactHookPayload,
+  type SubAgentMemoryFormatInput,
   TokenCounterService,
   ToolIntegrityService,
   UnifiedMessage,
@@ -57,6 +63,7 @@ import {
 } from "../../llm/anthropic/anthropic-api.service"
 import { KiroService } from "../../llm/aws/kiro.service"
 import { GoogleService } from "../../llm/google/google.service"
+import { ImageGenerationService } from "../../llm/image-generation/image-generation.service"
 import { type CodexExecutionRequest } from "../../llm/openai/codex-request-builder"
 import { CodexService } from "../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
@@ -73,6 +80,7 @@ import {
   type RequestedThinkingEffort,
 } from "../../llm/shared/thinking-intent"
 import { backendRequiresCompleteToolBatchBeforeContinuation } from "../../llm/shared/tool-continuation-policy"
+import type { AnthropicResponse } from "../../shared/anthropic"
 import {
   canonicalizeOfficialAntigravityToolInvocation as canonicalizeOfficialAntigravityToolInvocationFromContract,
   extractOfficialAntigravityArtifactMetadata as extractOfficialAntigravityArtifactMetadataFromContract,
@@ -86,6 +94,10 @@ import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import { BackendStreamAbortRegistry } from "./session/backend-stream-abort-registry"
+import {
+  isPathWithinAllowedRoots,
+  normalizePathForBoundaryCheck,
+} from "./session/workspace-root-resolver"
 import {
   ChatSession,
   ChatSessionManager,
@@ -108,6 +120,7 @@ import {
 } from "./subagents/subagent-exec-bridge.service"
 import { SubagentRegistryService } from "./subagents/subagent-registry.service"
 import { SubagentTaskRegistry } from "./subagents/subagent-task-registry.service"
+import { projectSubAgentFinalSynthesisMessages } from "./subagents/subagent-final-synthesis-projector"
 import { resolveSubagentToolSurface } from "./subagents/subagent-tool-resolver"
 import {
   type SubagentTaskMetadata,
@@ -157,7 +170,11 @@ import {
   formatLineNumberedSnippet,
   messageContainsToolResult,
 } from "./tools/tool-protocol-helpers"
-import { WebSearchAbortError, WebSearchService } from "./web-search"
+import {
+  WebSearchAbortError,
+  WebSearchEmptyResultError,
+  WebSearchService,
+} from "./web-search"
 
 /**
  * SSE Event content block structure (content_block_start)
@@ -445,6 +462,23 @@ interface EditResolvedMatch {
   chunkIndex?: number
 }
 
+interface CompatibilityNormalizedText {
+  normalized: string
+  normalizedToOriginal: number[]
+  normalizedBoundary: boolean[]
+}
+
+interface CompatibilityNormalizedMatch {
+  normalizedOffset: number
+  originalStart: number
+  originalEnd: number
+}
+
+interface CompatibilityNormalizedMatchSet {
+  allMatches: CompatibilityNormalizedMatch[]
+  matchesInRange: CompatibilityNormalizedMatch[]
+}
+
 interface ActiveToolCall {
   id: string
   name: string
@@ -489,6 +523,10 @@ interface BackendStreamOptions {
     route: ModelRouteResult,
     hints?: BackendStreamHints
   ) => CodexExecutionRequest
+  prepareContextForRoute?: (
+    route: ModelRouteResult,
+    hints?: BackendStreamHints
+  ) => Promise<void>
   abortSignal?: AbortSignal
   streamAbortBinding?: {
     conversationId: string
@@ -879,12 +917,17 @@ export class CursorConnectStreamService {
     private readonly sessionManager: ChatSessionManager,
     private readonly grpcService: CursorGrpcService,
     private readonly googleService: GoogleService,
+    private readonly imageGenerationService: ImageGenerationService,
     private readonly codexService: CodexService,
     private readonly anthropicApiService: AnthropicApiService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly modelRouter: ModelRouterService,
     private readonly kvStorageService: KvStorageService,
     private readonly contextManager: ContextManagerService,
+    private readonly contextCompactRunner: ContextCompactRunnerService,
+    private readonly codexContextAdapter: CodexContextAdapterService,
+    private readonly contextRequestPlanner: ContextRequestPlannerService,
+    private readonly contextNativeManagement: ContextNativeManagementService,
     private readonly clientSideToolV2Executor: ClientSideToolV2ExecutorService,
     private readonly semanticSearchProvider: SemanticSearchProviderService,
     private readonly tokenCounter: TokenCounterService,
@@ -1197,6 +1240,25 @@ export class CursorConnectStreamService {
       return 0
     }
 
+    // Record an "interrupted" session-memory breadcrumb for each
+    // sub-agent we are about to tear down, BEFORE clearing the
+    // context — once the context is cleared we lose access to the
+    // turn / tool-call counts. This is what keeps the parent agent
+    // from re-spawning the same task on its next turn.
+    for (const subagentId of interruptedSubagentIds) {
+      const ctx = this.sessionManager.getSubAgentContextById(
+        conversationId,
+        subagentId
+      )
+      if (!ctx) continue
+      this.recordAbortedSubAgentMemory(
+        conversationId,
+        ctx,
+        "interrupted",
+        reason
+      )
+    }
+
     // Tear down only the sub-agents we just interrupted; sibling
     // sub-agents from the same batch remain alive.
     for (const subagentId of interruptedSubagentIds) {
@@ -1288,6 +1350,7 @@ export class CursorConnectStreamService {
           `sub-agent cancelled: ${reason}`
         )
       }
+      this.recordAbortedSubAgentMemory(conversationId, ctx, "cancelled", reason)
       this.sessionManager.clearSubAgentContext(conversationId, ctx.subagentId)
       this.logger.warn(
         `Cancelled sub-agent ${ctx.subagentId}: cleared ${ownedPendingIds.length} pending tool call(s)`
@@ -1667,50 +1730,98 @@ export class CursorConnectStreamService {
     // produce the same shape of commit.
     const MANUAL_SUMMARIZE_BUDGET = 4_000
 
-    // Run the user's project-scoped `.cursor/hooks/preCompact` script
-    // (if any) before we commit a boundary. This is the bridge half of
-    // the dual-track design — the cursor IDE runs the same hook
-    // through `cursor-agent-exec` when *it* owns the conversation;
-    // when the bridge owns the conversation we run it ourselves so
-    // the user sees identical hook semantics either way. The hook's
-    // stdout becomes a `user_message` we splice onto the front of the
-    // generated summary, mirroring the proto
-    // `PreCompactRequestResponse.user_message` field.
-    const messageCount = session.contextState.records.length
-    const hookPayload: PreCompactHookPayload = {
-      trigger: "manual",
-      context_usage_percent: 0,
-      context_tokens: 0,
-      context_window_size: 0,
-      message_count: messageCount,
-      messages_to_compact: messageCount,
-      is_first_compaction: session.contextState.compactionHistory.length === 0,
-      conversation_id: conversationId,
-      generation_id: undefined,
-      model: session.lastAssistantBackend || undefined,
-    }
-    const hookUserMessage = await this.contextHookExecutor.runPreCompactHook(
-      session.projectContext?.rootPath,
-      hookPayload
-    )
-
-    let result: ContextCompactionResult
+    let applied: Awaited<
+      ReturnType<ContextCompactRunnerService["compactIfNeeded"]>
+    >
+    let hookUserMessage: string | undefined
     try {
-      result = this.contextManager.manualCompact(
-        session.contextState,
-        // Empty attachment snapshot: the same trade-off the dashboard
-        // entry point makes. The streaming path that has a live
-        // attachment snapshot would not normally reach this handler —
-        // summarizeAction comes from the IDE, not from inside an
-        // assistant turn — so we don't try to materialise one. The
-        // planner falls back to transcript-only compaction when the
-        // snapshot is empty.
-        { readPaths: [], fileStates: [], todos: [] },
-        {
-          maxTokens: MANUAL_SUMMARIZE_BUDGET,
-          systemPromptTokens: 0,
-        }
-      )
+      const route = this.modelRouter.resolveModel(session.model)
+      const manualBudget = {
+        maxTokens: MANUAL_SUMMARIZE_BUDGET,
+        systemPromptTokens: 0,
+      }
+      if (route.backend === "codex") {
+        const promptContext = this.buildPromptContextFromSession(session)
+        const systemPrompt = this.buildCodexSystemPrompt(
+          promptContext,
+          session.deferredToolCatalog
+        )
+        const referenceContextItem =
+          this.codexContextAdapter.buildReferenceContextItem({
+            conversationId,
+            model: route.model || session.model,
+            systemPrompt,
+            contextTokenLimit: manualBudget.maxTokens,
+            serviceTier: this.resolveRequestedCodexServiceTier(
+              session.requestedModelParameters
+            ),
+            reasoningEffort: this.resolveRequestedReasoningEffort(
+              session.requestedModelParameters
+            ),
+          })
+        applied = await this.codexContextAdapter.compactIfNeeded(
+          session.contextState,
+          this.buildContextAttachmentSnapshot(session),
+          {
+            ...manualBudget,
+            strategy: "manual",
+            referenceContextItem,
+            injectionMode: "pre_turn",
+            hookProvider: async (candidate) => {
+              hookUserMessage = await this.runPreCompactHookForCandidate(
+                session,
+                "manual",
+                route,
+                manualBudget,
+                candidate
+              )
+              return hookUserMessage
+            },
+            remoteCompactProvider: async ({ messages }) => ({
+              replacementHistory:
+                await this.codexService.compactConversationHistory({
+                  model: route.model || session.model,
+                  system: systemPrompt,
+                  messages: this.toCodexConversationMessages(messages),
+                  conversationId,
+                  serviceTier: this.resolveRequestedCodexServiceTier(
+                    session.requestedModelParameters
+                  ),
+                  textVerbosity: "low",
+                }),
+            }),
+          }
+        )
+      } else {
+        applied = await this.contextCompactRunner.compactIfNeeded(
+          session.contextState,
+          this.buildContextAttachmentSnapshot(session),
+          {
+            ...manualBudget,
+            strategy: "manual",
+            integrityMode: this.shouldUseStrictAdjacentToolIntegrity(
+              route.backend
+            )
+              ? "strict-adjacent"
+              : "global",
+            summaryProvider: this.buildNoToolsCompactSummaryProvider(
+              route,
+              session,
+              `manual summarize: ${conversationId}`
+            ),
+            hookProvider: async (candidate) => {
+              hookUserMessage = await this.runPreCompactHookForCandidate(
+                session,
+                "manual",
+                route,
+                manualBudget,
+                candidate
+              )
+              return hookUserMessage
+            },
+          }
+        )
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       this.logger.error(
@@ -1719,12 +1830,8 @@ export class CursorConnectStreamService {
       return true
     }
 
-    const applied = result.appliedCompaction
     if (!applied) {
-      this.logger.log(
-        `Summarize action: no_progress for ${conversationId} ` +
-          `(estimatedTokens=${result.estimatedTokens})`
-      )
+      this.logger.log(`Summarize action: no_progress for ${conversationId}`)
       return true
     }
 
@@ -1737,12 +1844,6 @@ export class CursorConnectStreamService {
         (hookUserMessage ? " (with preCompact hook)" : "")
     )
 
-    // Splice the hook's user_message onto the front of the summary so
-    // the IDE chat view shows it. We do not write the augmented text
-    // back into `applied.commit.summary` itself — the commit lives in
-    // the projection ledger and bridges multiple downstream consumers,
-    // so we keep its summary canonical and only override the UI-bound
-    // text here.
     const renderedSummary = hookUserMessage
       ? `${hookUserMessage}\n\n${applied.commit.summary}`
       : applied.commit.summary
@@ -1759,6 +1860,87 @@ export class CursorConnectStreamService {
     })
     yield* this.emitPendingContextSummaryUiUpdate(conversationId)
     return true
+  }
+
+  async compactConversationNow(
+    conversationId: string,
+    maxTokens: number
+  ): Promise<{
+    applied: boolean
+    estimatedTokens?: number
+    archivedMessageCount?: number
+    summaryTokenCount?: number
+  }> {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      throw new Error(`Session not found: ${conversationId}`)
+    }
+    const route = this.modelRouter.resolveModel(session.model)
+    let hookUserMessage: string | undefined
+    const manualBudget = { maxTokens, systemPromptTokens: 0 }
+    const plan =
+      route.backend === "codex"
+        ? await this.compactCodexSessionForRoute(session, route, manualBudget, {
+            contextLabel: `manual compact api: ${conversationId}`,
+            strategy: "manual",
+            injectionMode: "pre_turn",
+            hookProvider: async (candidate) => {
+              hookUserMessage = await this.runPreCompactHookForCandidate(
+                session,
+                "manual",
+                route,
+                manualBudget,
+                candidate
+              )
+              return hookUserMessage
+            },
+          })
+        : await this.contextCompactRunner.compactIfNeeded(
+            session.contextState,
+            this.buildContextAttachmentSnapshot(session),
+            {
+              ...manualBudget,
+              strategy: "manual",
+              integrityMode: this.shouldUseStrictAdjacentToolIntegrity(
+                route.backend
+              )
+                ? "strict-adjacent"
+                : "global",
+              summaryProvider: this.buildNoToolsCompactSummaryProvider(
+                route,
+                session,
+                `manual compact api: ${conversationId}`
+              ),
+              hookProvider: async (candidate) => {
+                hookUserMessage = await this.runPreCompactHookForCandidate(
+                  session,
+                  "manual",
+                  route,
+                  manualBudget,
+                  candidate
+                )
+                return hookUserMessage
+              },
+            }
+          )
+    if (!plan) {
+      return { applied: false }
+    }
+    this.sessionManager.markContextStateDirty(conversationId)
+    const renderedSummary = hookUserMessage
+      ? `${hookUserMessage}\n\n${plan.commit.summary}`
+      : plan.commit.summary
+    this.queuePendingContextSummaryUiUpdate(session, conversationId, {
+      compactionId: plan.commit.id,
+      summary: renderedSummary,
+      epoch: session.contextState.compactionEpoch || 0,
+    })
+    return {
+      applied: true,
+      estimatedTokens: plan.estimatedTokens,
+      archivedMessageCount: plan.commit.archivedMessageCount,
+      summaryTokenCount: plan.commit.summaryTokenCount,
+    }
   }
 
   private async *handleBackgroundShellAction(
@@ -2191,6 +2373,7 @@ export class CursorConnectStreamService {
     try {
       while (true) {
         try {
+          await options?.prepareContextForRoute?.(route, activeHints)
           const backendStream = this.resolveBackendStream(
             route,
             options,
@@ -2286,43 +2469,25 @@ export class CursorConnectStreamService {
   ): BackendStreamHints | undefined {
     const previousBudget = previousHints?.budgetOverride?.maxTokens
     const baselineBudget = previousBudget ?? this.DEFAULT_HISTORY_MAX_TOKENS
-    const recovery =
-      this.contextManager.applyReactivePromptTooLongRecoveryFromMessages(
-        [],
-        this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
-        {
-          maxTokens: baselineBudget,
-          // The bridge does not know the system-prompt token count when
-          // using the empty fallback state; pass 0 so the breaker only
-          // judges by the upstream-reported budget delta and the failure
-          // counter, not by the synthetic computation.
-          systemPromptTokens: 0,
-        },
-        {
-          actualTokens: detection.actualTokens,
-          maxTokens: detection.maxTokens,
-        },
-        recoveryKey
-      )
-
-    // applyReactivePromptTooLongRecoveryFromMessages always returns a
-    // ReactiveRecoveryOutcome.  We only need the new budget; the empty
-    // ephemeral state cannot produce useful messages here, so we ignore
-    // `recovery.result.messages` and simply rebuild the request with a
-    // tighter budget on the next iteration.
-    if (!recovery.shouldRetry) {
-      this.logger.warn(
-        `[REACTIVE-COMPACT] giving up for ${recoveryKey}: ${
-          recovery.reason ?? "unknown"
-        } (failures=${recovery.consecutiveFailures})`
-      )
-      return undefined
-    }
-
-    const nextBudget = recovery.result?.estimatedTokens
-      ? Math.min(baselineBudget, recovery.result.estimatedTokens)
-      : Math.floor(baselineBudget * 0.75)
+    const upstreamMax =
+      typeof detection.maxTokens === "number" &&
+      Number.isFinite(detection.maxTokens) &&
+      detection.maxTokens > 0
+        ? detection.maxTokens
+        : undefined
+    const nextBudget = upstreamMax
+      ? Math.max(
+          256,
+          Math.min(
+            baselineBudget,
+            upstreamMax - Math.max(2048, Math.floor(upstreamMax * 0.04))
+          )
+        )
+      : Math.max(256, Math.floor(baselineBudget * 0.75))
     if (nextBudget >= baselineBudget) {
+      this.logger.warn(
+        `[REACTIVE-COMPACT] giving up for ${recoveryKey}: no smaller budget available`
+      )
       return undefined
     }
 
@@ -2480,18 +2645,24 @@ export class CursorConnectStreamService {
       toolDefinitions: subAgentToolDefinitions,
       additionalSystemPrompt: subAgentSystemAddendum,
       buildMessages: (budget) => {
-        const compacted = this.contextManager.buildBackendMessagesFromMessages(
+        const compacted = this.contextRequestPlanner.projectMessages(
           ctx.messages.map((message) => ({
             role: message.role,
             content: message.content as UnifiedMessage["content"],
           })) as UnifiedMessage[],
           this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
-          {
-            maxTokens: budget.maxTokens,
-            systemPromptTokens: budget.systemPromptTokens,
-            strategy: "auto",
-          }
+          budget,
+          { strategy: "auto" }
         )
+
+        if (forceFinalSynthesis) {
+          return projectSubAgentFinalSynthesisMessages(
+            compacted.messages as Array<{
+              role: "user" | "assistant"
+              content: unknown
+            }>
+          ) as CreateMessageDto["messages"]
+        }
 
         return compacted.messages as CreateMessageDto["messages"]
       },
@@ -2513,12 +2684,11 @@ export class CursorConnectStreamService {
       pendingToolUseIds?: string[]
       thinkingLevel?: number
       thinkingDetailsRequested?: boolean
+      suppressThinkingSummary?: boolean
       budgetOverride?: { maxTokens?: number }
-      buildMessages: (budget: {
-        maxTokens: number
-        systemPromptTokens: number
-        maxOutputTokens: number
-      }) => CreateMessageDto["messages"]
+      buildMessages: (
+        budget: ContextRequestBudget
+      ) => CreateMessageDto["messages"]
     }
   ): CreateMessageDto {
     const useGoogleContextMessages = this.isCloudCodeBackend(route.backend)
@@ -2575,11 +2745,21 @@ export class CursorConnectStreamService {
     if (options.toolDefinitions) {
       dto.tools = options.toolDefinitions
     }
+    const nativeContextManagement =
+      this.contextNativeManagement.buildAnthropicContextManagement({
+        backend: route.backend,
+        messages: outgoingMessages as UnifiedMessage[],
+        maxTokens: budget.maxTokens,
+        systemPromptTokens: budget.systemPromptTokens,
+        autoCompactTokenLimit: budget.autoCompactTokenLimit,
+      })
+    if (nativeContextManagement) {
+      dto.context_management = nativeContextManagement
+    }
     if (options.conversationId) {
       dto._conversationId = options.conversationId
     }
     dto._contextTokenBudget = budget.maxTokens
-    dto._protectedContextMessageCount = contextMessages.length || undefined
     if (options.pendingToolUseIds && options.pendingToolUseIds.length > 0) {
       dto._pendingToolUseIds = options.pendingToolUseIds
     }
@@ -2587,12 +2767,19 @@ export class CursorConnectStreamService {
     const requestedReasoningEffort = this.resolveRequestedReasoningEffort(
       options.session?.requestedModelParameters
     )
+    const suppressThinkingSummary = this.shouldSuppressThinkingSummaryForRoute(
+      route.backend,
+      options.session?.requestedModelParameters,
+      options.suppressThinkingSummary
+    )
 
-    const shouldRequestThinkingSummary =
-      options.thinkingDetailsRequested === true ||
-      (route.backend === "codex" &&
-        ((options.thinkingLevel || 0) > 0 ||
-          (!!requestedReasoningEffort && requestedReasoningEffort !== "none")))
+    const shouldRequestThinkingSummary = suppressThinkingSummary
+      ? false
+      : options.thinkingDetailsRequested === true ||
+        (route.backend === "codex" &&
+          ((options.thinkingLevel || 0) > 0 ||
+            (!!requestedReasoningEffort &&
+              requestedReasoningEffort !== "none")))
 
     if ((options.thinkingLevel || 0) > 0 || requestedReasoningEffort) {
       const thinkingIntent = this.buildCursorThinkingIntent(
@@ -2632,15 +2819,17 @@ export class CursorConnectStreamService {
       pendingToolUseIds?: string[]
       thinkingLevel?: number
       thinkingDetailsRequested?: boolean
+      suppressThinkingSummary?: boolean
       budgetOverride?: { maxTokens?: number }
-      buildMessages: (budget: {
-        maxTokens: number
-        systemPromptTokens: number
-        maxOutputTokens: number
-      }) => CodexExecutionRequest["messages"]
+      buildMessages: (
+        budget: ContextRequestBudget
+      ) => CodexExecutionRequest["messages"]
     }
   ): CodexExecutionRequest {
-    const systemPrompt = this.buildCodexSystemPrompt(options.promptContext)
+    const systemPrompt = this.buildCodexSystemPrompt(
+      options.promptContext,
+      options.session?.deferredToolCatalog
+    )
     const effectiveSystemPrompt = options.additionalSystemPrompt
       ? [systemPrompt, options.additionalSystemPrompt]
           .filter((part) => typeof part === "string" && part.trim().length > 0)
@@ -2657,6 +2846,11 @@ export class CursorConnectStreamService {
     const historyMessages = options.buildMessages(budget)
     const requestedReasoningEffort = this.resolveRequestedReasoningEffort(
       options.session?.requestedModelParameters
+    )
+    const suppressThinkingSummary = this.shouldSuppressThinkingSummaryForRoute(
+      route.backend,
+      options.session?.requestedModelParameters,
+      options.suppressThinkingSummary
     )
     const thinkingIntent =
       (options.thinkingLevel || 0) > 0 || requestedReasoningEffort
@@ -2675,11 +2869,13 @@ export class CursorConnectStreamService {
       ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
       : 0
 
-    const shouldRequestThinkingSummary =
-      options.thinkingDetailsRequested === true ||
-      (route.backend === "codex" &&
-        ((options.thinkingLevel || 0) > 0 ||
-          (!!requestedReasoningEffort && requestedReasoningEffort !== "none")))
+    const shouldRequestThinkingSummary = suppressThinkingSummary
+      ? false
+      : options.thinkingDetailsRequested === true ||
+        (route.backend === "codex" &&
+          ((options.thinkingLevel || 0) > 0 ||
+            (!!requestedReasoningEffort &&
+              requestedReasoningEffort !== "none")))
 
     const request: CodexExecutionRequest = {
       model: route.model,
@@ -2733,6 +2929,17 @@ export class CursorConnectStreamService {
       pendingToolUseIds?: string[]
     }
   ): void {
+    const isContinuationWarmup =
+      reason.includes("continuation") ||
+      reason.includes("shell") ||
+      reason.includes("tool")
+    if (route.backend === "codex" && isContinuationWarmup) {
+      this.logger.debug(
+        `Skipping Codex ${reason} warmup for ${conversationId || "global"}; the stream request will reuse or rebuild the turn connection directly`
+      )
+      return
+    }
+
     this.resolveProviderAdapter(route.backend)?.warmup({
       model: route.model,
       conversationId,
@@ -2877,10 +3084,6 @@ export class CursorConnectStreamService {
     return Math.floor(value)
   }
 
-  private estimateJsonTokens(value: unknown): number {
-    return this.tokenCounter.countJsonValue(value)
-  }
-
   private getBackendContextLimit(
     backend: BackendType,
     model?: string
@@ -2918,7 +3121,9 @@ export class CursorConnectStreamService {
     )
 
     let resolved =
-      protocolLimit || backendLimit || this.CLOUD_CODE_CONTEXT_LIMIT_TOKENS
+      session.contextMaxMode && backendLimit
+        ? backendLimit
+        : protocolLimit || this.DEFAULT_HISTORY_MAX_TOKENS
     if (backendLimit && resolved > backendLimit) {
       resolved = backendLimit
     }
@@ -2961,61 +3166,73 @@ export class CursorConnectStreamService {
       model?: string
       budgetOverride?: { maxTokens?: number }
     }
-  ): {
-    maxTokens: number
-    systemPromptTokens: number
-    maxOutputTokens: number
-  } {
-    const protocolContextLimit =
-      this.normalizePositiveInteger(options?.parsed?.contextTokenLimit) ||
-      this.normalizePositiveInteger(options?.session?.contextTokenLimit)
-
-    let maxTokens = protocolContextLimit || this.DEFAULT_HISTORY_MAX_TOKENS
+  ): ContextRequestBudget {
     const backendContextLimit = this.getBackendContextLimit(
       backend,
       options?.model
     )
-    if (backendContextLimit && maxTokens > backendContextLimit) {
-      this.logger.warn(
-        `Cursor protocol context limit ${maxTokens} exceeds backend cap ${backendContextLimit}, clamping`
-      )
-      maxTokens = backendContextLimit
-    }
+    let effectiveBackendContextLimit = backendContextLimit
     if (backend === "google" || backend === "google-claude") {
-      if (maxTokens > this.CLOUD_CODE_SOFT_CONTEXT_LIMIT_TOKENS) {
+      const cloudHardLimit =
+        backendContextLimit || this.CLOUD_CODE_CONTEXT_LIMIT_TOKENS
+      effectiveBackendContextLimit = Math.min(
+        cloudHardLimit,
+        this.CLOUD_CODE_SOFT_CONTEXT_LIMIT_TOKENS
+      )
+      if (cloudHardLimit > effectiveBackendContextLimit) {
         this.logger.warn(
-          `Applying Cloud Code safety budget clamp: ${maxTokens} -> ${this.CLOUD_CODE_SOFT_CONTEXT_LIMIT_TOKENS}`
+          `Applying Cloud Code safety budget clamp: ${cloudHardLimit} -> ${effectiveBackendContextLimit}`
         )
-        maxTokens = this.CLOUD_CODE_SOFT_CONTEXT_LIMIT_TOKENS
       }
     }
 
-    // Reactive recovery override: when an upstream request just failed
-    // with prompt-too-long, the caller asks us to honour a smaller cap on
-    // the next attempt.  Use min() so this can only shrink the budget,
-    // never expand it past the protocol/backend limits computed above.
+    const parsedContextLimit = this.normalizePositiveInteger(
+      options?.parsed?.contextTokenLimit
+    )
+    const sessionContextLimit = this.normalizePositiveInteger(
+      options?.session?.contextTokenLimit
+    )
+    const parsedHasContextMode =
+      typeof options?.parsed?.contextMaxMode === "boolean"
+    const maxMode =
+      options?.parsed?.contextMaxMode === true ||
+      (!parsedHasContextMode && options?.session?.contextMaxMode === true)
+    let protocolContextLimit = parsedContextLimit
+    if (!protocolContextLimit) {
+      if (maxMode && effectiveBackendContextLimit) {
+        protocolContextLimit = effectiveBackendContextLimit
+      } else if (!parsedHasContextMode) {
+        protocolContextLimit = sessionContextLimit
+      }
+    }
+
     const overrideMax = this.normalizePositiveInteger(
       options?.budgetOverride?.maxTokens
     )
-    if (overrideMax && overrideMax < maxTokens) {
+    let requestedMaxTokens = protocolContextLimit
+    if (
+      overrideMax &&
+      (!requestedMaxTokens || overrideMax < requestedMaxTokens)
+    ) {
       this.logger.warn(
-        `Reactive recovery override active: clamping context budget ${maxTokens} -> ${overrideMax}`
+        `Reactive recovery override active: clamping context budget ${requestedMaxTokens || effectiveBackendContextLimit || this.DEFAULT_HISTORY_MAX_TOKENS} -> ${overrideMax}`
       )
-      maxTokens = overrideMax
+      requestedMaxTokens = overrideMax
     }
 
-    const protectedContextTokens = options?.protectedContextTokens || 0
-    const protocolSystemPromptTokens = options?.systemPrompt
-      ? this.tokenCounter.countMessages([
-          {
-            role: "user",
-            content: options.systemPrompt,
-          } as UnifiedMessage,
-        ])
-      : 0
-    const toolDefinitionTokens = this.estimateJsonTokens(
-      options?.toolDefinitions
+    const maxOutputTokens = this.resolveMaxOutputTokens(
+      backend,
+      options?.parsed,
+      options?.session
     )
+    const requestedServiceTier =
+      backend === "codex"
+        ? this.resolveRequestedCodexServiceTier(
+            options?.parsed?.requestedModelParameters ||
+              options?.session?.requestedModelParameters
+          )
+        : undefined
+    const protectedContextTokens = options?.protectedContextTokens || 0
     const backendSystemPromptTokens =
       backend === "google" || backend === "google-claude"
         ? this.googleService.getSystemPromptTokenEstimate()
@@ -3025,26 +3242,41 @@ export class CursorConnectStreamService {
         ? this.CLOUD_CODE_EXTRA_OVERHEAD_TOKENS
         : this.GENERIC_EXTRA_OVERHEAD_TOKENS
 
-    const systemPromptTokens =
-      protectedContextTokens +
-      protocolSystemPromptTokens +
-      toolDefinitionTokens +
-      backendSystemPromptTokens +
-      fixedOverheadTokens
-
-    const maxOutputTokens = this.resolveMaxOutputTokens(
+    const budget = this.contextRequestPlanner.resolveBudget({
       backend,
-      options?.parsed,
-      options?.session
-    )
+      protocolMaxTokens: requestedMaxTokens,
+      backendMaxTokens: effectiveBackendContextLimit,
+      defaultMaxTokens: this.DEFAULT_HISTORY_MAX_TOKENS,
+      protectedContextTokens,
+      systemPrompt: options?.systemPrompt,
+      toolDefinitions: options?.toolDefinitions,
+      backendSystemPromptTokens,
+      fixedOverheadTokens,
+      maxOutputTokens,
+      requestedServiceTier,
+    })
+
+    if (budget.backendClampedFrom && budget.backendClampedTo) {
+      this.logger.warn(
+        `Cursor protocol context limit ${budget.backendClampedFrom} exceeds backend cap ${budget.backendClampedTo}, clamping`
+      )
+    }
+
+    if (budget.autoCompactTokenLimit) {
+      this.logger.debug(
+        `Auto compact limit resolved: backend=${backend}, hardMaxTokens=${budget.maxTokens}, ` +
+          `autoCompactTokenLimit=${budget.autoCompactTokenLimit}`
+      )
+    }
 
     this.logger.debug(
-      `Token budget resolved: backend=${backend}, maxTokens=${maxTokens}, ` +
-        `systemPromptTokens=${systemPromptTokens} (protectedContext=${protectedContextTokens}, protocolSystem=${protocolSystemPromptTokens}, tools=${toolDefinitionTokens}, backendSystem=${backendSystemPromptTokens}), ` +
-        `maxOutput=${maxOutputTokens}`
+      `Token budget resolved: backend=${backend}, maxTokens=${budget.maxTokens}, ` +
+        `systemPromptTokens=${budget.systemPromptTokens} (protectedContext=${protectedContextTokens}, backendSystem=${backendSystemPromptTokens}), ` +
+        `maxOutput=${budget.maxOutputTokens}, autoCompactTokenLimit=${budget.autoCompactTokenLimit || "(none)"}, ` +
+        `maxMode=${maxMode}`
     )
 
-    return { maxTokens, systemPromptTokens, maxOutputTokens }
+    return budget
   }
 
   private buildContextAttachmentSnapshot(
@@ -3073,6 +3305,14 @@ export class CursorConnectStreamService {
         content: todo.content,
         status: todo.status,
       })),
+      sessionMemory: (session.contextState.sessionMemory || []).map(
+        (entry) => ({
+          kind: entry.kind,
+          text: entry.text,
+          createdAt: entry.createdAt,
+          weight: entry.weight,
+        })
+      ),
       investigationSummaries:
         this.sessionManager.getInvestigationMemoryAttachmentSnapshot(
           session.conversationId
@@ -3128,6 +3368,14 @@ export class CursorConnectStreamService {
 
   private isCloudCodeBackend(backend: BackendType): boolean {
     return backend === "google" || backend === "google-claude"
+  }
+
+  private shouldUseStrictAdjacentToolIntegrity(backend: BackendType): boolean {
+    return (
+      this.isCloudCodeBackend(backend) ||
+      backend === "kiro" ||
+      backend === "claude-api"
+    )
   }
 
   private hasPendingStreamWork(session: ChatSession | undefined): boolean {
@@ -3982,27 +4230,40 @@ export class CursorConnectStreamService {
   private truncateMessagesForBackend(
     session: ChatSession,
     backend: BackendType,
-    budget: { maxTokens: number; systemPromptTokens: number },
+    budget: ContextProjectionBudget,
     options?: {
       contextLabel?: string
+      model?: string
       pendingToolUseIds?: string[]
       strategy?: "auto" | "manual" | "reactive"
+      dryRun?: boolean
     }
   ): Array<{ role: "user" | "assistant"; content: MessageContent }> {
     const contextLabel = options?.contextLabel || session.conversationId
-    const integrityMode = this.isCloudCodeBackend(backend)
+    const integrityMode = this.shouldUseStrictAdjacentToolIntegrity(backend)
       ? "strict-adjacent"
       : "global"
-    const primary = this.contextManager.buildBackendMessages(
+    const primary = this.contextRequestPlanner.projectState(
       session.contextState,
       this.buildContextAttachmentSnapshot(session),
+      budget,
       {
-        systemPromptTokens: budget.systemPromptTokens,
-        maxTokens: budget.maxTokens,
         pendingToolUseIds: options?.pendingToolUseIds,
         integrityMode,
         strategy: options?.strategy || "auto",
+        dryRun: options?.dryRun,
+        nativeCacheEdits: this.shouldUseClaudeNativeCacheEdits(
+          backend,
+          options?.model || session.model
+        ),
       }
+    )
+    this.resetCodexContinuationAfterProjectionRewrite(
+      backend,
+      session.conversationId,
+      options?.model || session.model,
+      primary,
+      contextLabel
     )
     if (primary.appliedCompaction) {
       this.sessionManager.markContextStateDirty(session.conversationId)
@@ -4013,6 +4274,11 @@ export class CursorConnectStreamService {
       })
       this.logger.log(
         `Applied context compaction (${contextLabel}): estimated ${primary.estimatedTokens} tokens after projection`
+      )
+    }
+    if (options?.dryRun && primary.wasCompacted) {
+      this.logger.debug(
+        `Dry-run context compaction projected (${contextLabel}): estimated ${primary.estimatedTokens} tokens`
       )
     }
     if (primary.snipCompaction?.changed) {
@@ -4029,8 +4295,34 @@ export class CursorConnectStreamService {
           `${primary.microcompactCompaction.compactedRounds} API rounds`
       )
     }
+    if (
+      primary.nativeCacheEditCompaction?.changed ||
+      (primary.nativeCacheEditCompaction?.newlyRegisteredToolResults ?? 0) > 0
+    ) {
+      this.sessionManager.markContextStateDirty(session.conversationId)
+    }
+    if (primary.nativeCacheEditCompaction?.changed) {
+      this.logger.log(
+        `Applied native cache edits (${contextLabel}): ` +
+          `${primary.nativeCacheEditCompaction.newlyDeletedToolResults} tool results, ` +
+          `${primary.nativeCacheEditCompaction.pinnedEditBlocks} pinned edit block(s)`
+      )
+    }
 
-    const truncatedMessages = primary.messages as Array<{
+    const projectedForBackend =
+      backend === "codex"
+        ? this.codexContextAdapter.projectCodexMessages(
+            session.contextState,
+            primary.messages,
+            {
+              maxTokens: budget.maxTokens,
+              systemPromptTokens: budget.systemPromptTokens,
+              pendingToolUseIds: options?.pendingToolUseIds,
+            }
+          )
+        : primary.messages
+
+    const truncatedMessages = projectedForBackend as Array<{
       role: "user" | "assistant"
       content: MessageContent
     }>
@@ -4055,20 +4347,584 @@ export class CursorConnectStreamService {
         role: "user" | "assistant"
         content: MessageContent
       }>
+      const modelMessages =
+        this.stripSubAgentUiPayloadsForBackend(repairedMessages)
       this.updatePendingRequestContextLedger(
         session,
         primary.projectedMessages,
-        repairedMessages
+        modelMessages
       )
-      return repairedMessages
+      return modelMessages
     }
 
+    const modelMessages =
+      this.stripSubAgentUiPayloadsForBackend(truncatedMessages)
     this.updatePendingRequestContextLedger(
       session,
       primary.projectedMessages,
-      truncatedMessages
+      modelMessages
     )
-    return truncatedMessages
+    return modelMessages
+  }
+
+  private toCodexConversationMessages(
+    messages: UnifiedMessage[]
+  ): CodexExecutionRequest["messages"] {
+    return messages.flatMap((message) => {
+      if (message.role !== "user" && message.role !== "assistant") {
+        return []
+      }
+      return [
+        {
+          role: message.role,
+          content: message.content,
+        },
+      ]
+    })
+  }
+
+  private async compactCodexSessionForRoute(
+    session: ChatSession,
+    route: ModelRouteResult,
+    budget: ContextProjectionBudget,
+    options: {
+      contextLabel: string
+      model?: string
+      pendingToolUseIds?: string[]
+      toolDefinitions?: ToolDefinition[]
+      strategy: "auto" | "manual" | "reactive"
+      injectionMode: "pre_turn" | "mid_turn"
+      hookUserMessage?: string
+      hookProvider?: (
+        candidate: ContextCompactionCandidate
+      ) => Promise<string | undefined>
+    }
+  ) {
+    const promptContext = this.buildPromptContextFromSession(session)
+    const systemPrompt = this.buildCodexSystemPrompt(
+      promptContext,
+      session.deferredToolCatalog
+    )
+    const referenceContextItem =
+      this.codexContextAdapter.buildReferenceContextItem({
+        conversationId: session.conversationId,
+        model: options.model || route.model || session.model,
+        systemPrompt,
+        toolDefinitions: options.toolDefinitions,
+        contextTokenLimit: budget.maxTokens,
+        serviceTier: this.resolveRequestedCodexServiceTier(
+          session.requestedModelParameters
+        ),
+        reasoningEffort: this.resolveRequestedReasoningEffort(
+          session.requestedModelParameters
+        ),
+      })
+    return this.codexContextAdapter.compactIfNeeded(
+      session.contextState,
+      this.buildContextAttachmentSnapshot(session),
+      {
+        maxTokens: budget.maxTokens,
+        systemPromptTokens: budget.systemPromptTokens,
+        autoCompactTokenLimit: budget.autoCompactTokenLimit,
+        predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
+        strategy: options.strategy,
+        integrityMode: "global",
+        referenceContextItem,
+        injectionMode: options.injectionMode,
+        hookUserMessage: options.hookUserMessage,
+        hookProvider: options.hookProvider,
+        remoteCompactProvider: async ({ messages }) => ({
+          replacementHistory:
+            await this.codexService.compactConversationHistory({
+              model: options.model || route.model || session.model,
+              system: systemPrompt,
+              messages: this.toCodexConversationMessages(messages),
+              tools: options.toolDefinitions,
+              conversationId: session.conversationId,
+              pendingToolUseIds: options.pendingToolUseIds,
+              serviceTier: this.resolveRequestedCodexServiceTier(
+                session.requestedModelParameters
+              ),
+              textVerbosity: "low",
+            }),
+        }),
+      }
+    )
+  }
+
+  private async prepareContextWithCompactRunner(
+    session: ChatSession,
+    route: ModelRouteResult,
+    budget: ContextProjectionBudget,
+    options: {
+      contextLabel: string
+      model?: string
+      pendingToolUseIds?: string[]
+      toolDefinitions?: ToolDefinition[]
+      strategy: "auto" | "manual" | "reactive"
+      hookUserMessage?: string
+    }
+  ): Promise<void> {
+    const integrityMode = this.shouldUseStrictAdjacentToolIntegrity(
+      route.backend
+    )
+      ? "strict-adjacent"
+      : "global"
+    if (route.backend === "codex") {
+      let hookUserMessage = options.hookUserMessage
+      const promptContext = this.buildPromptContextFromSession(session)
+      const systemPrompt = this.buildCodexSystemPrompt(
+        promptContext,
+        session.deferredToolCatalog
+      )
+      const referenceContextItem =
+        this.codexContextAdapter.buildReferenceContextItem({
+          conversationId: session.conversationId,
+          model: options.model || route.model || session.model,
+          systemPrompt,
+          toolDefinitions: options.toolDefinitions,
+          contextTokenLimit: budget.maxTokens,
+          serviceTier: this.resolveRequestedCodexServiceTier(
+            session.requestedModelParameters
+          ),
+          reasoningEffort: this.resolveRequestedReasoningEffort(
+            session.requestedModelParameters
+          ),
+        })
+      const plan = await this.codexContextAdapter.compactIfNeeded(
+        session.contextState,
+        this.buildContextAttachmentSnapshot(session),
+        {
+          maxTokens: budget.maxTokens,
+          systemPromptTokens: budget.systemPromptTokens,
+          autoCompactTokenLimit: budget.autoCompactTokenLimit,
+          predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
+          strategy: options.strategy,
+          integrityMode,
+          referenceContextItem,
+          injectionMode:
+            options.strategy === "reactive" ? "mid_turn" : "pre_turn",
+          hookUserMessage,
+          hookProvider: async (candidate) => {
+            hookUserMessage = await this.runPreCompactHookForCandidate(
+              session,
+              options.strategy,
+              route,
+              budget,
+              candidate,
+              options.model
+            )
+            return hookUserMessage
+          },
+          remoteCompactProvider: async ({ messages }) => ({
+            replacementHistory:
+              await this.codexService.compactConversationHistory({
+                model: options.model || route.model || session.model,
+                system: systemPrompt,
+                messages: this.toCodexConversationMessages(messages),
+                tools: options.toolDefinitions,
+                conversationId: session.conversationId,
+                pendingToolUseIds: options.pendingToolUseIds,
+                serviceTier: this.resolveRequestedCodexServiceTier(
+                  session.requestedModelParameters
+                ),
+                textVerbosity: "low",
+              }),
+          }),
+        }
+      )
+      if (!plan) return
+
+      this.sessionManager.markContextStateDirty(session.conversationId)
+      const renderedSummary = hookUserMessage
+        ? `${hookUserMessage}\n\n${plan.commit.summary}`
+        : plan.commit.summary
+      this.queuePendingContextSummaryUiUpdate(session, session.conversationId, {
+        compactionId: plan.commit.id,
+        summary: renderedSummary,
+        epoch: session.contextState.compactionEpoch || 0,
+      })
+      this.logger.log(
+        `Context compact applied: backend=${route.backend}, model=${options.model || route.model || session.model}, ` +
+          `strategy=${options.strategy}, budget=${budget.maxTokens}, estimatedTokens=${plan.estimatedTokens}, ` +
+          `compactionId=${plan.commit.id}`
+      )
+      this.resetCodexContinuationAfterProjectionRewrite(
+        route.backend,
+        session.conversationId,
+        options.model || session.model,
+        {
+          messages: [],
+          projectedMessages: [],
+          estimatedTokens: plan.estimatedTokens,
+          wasCompacted: true,
+          appliedCompaction: plan,
+        },
+        options.contextLabel
+      )
+      return
+    }
+    const provider = this.buildNoToolsCompactSummaryProvider(
+      route,
+      session,
+      options.contextLabel
+    )
+    let hookUserMessage = options.hookUserMessage
+    const plan = await this.contextCompactRunner.compactIfNeeded(
+      session.contextState,
+      this.buildContextAttachmentSnapshot(session),
+      {
+        maxTokens: budget.maxTokens,
+        systemPromptTokens: budget.systemPromptTokens,
+        autoCompactTokenLimit: budget.autoCompactTokenLimit,
+        predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
+        strategy: options.strategy,
+        integrityMode,
+        summaryProvider: provider,
+        hookUserMessage,
+        hookProvider: async (candidate) => {
+          hookUserMessage = await this.runPreCompactHookForCandidate(
+            session,
+            options.strategy,
+            route,
+            budget,
+            candidate,
+            options.model
+          )
+          return hookUserMessage
+        },
+      }
+    )
+    if (!plan) return
+
+    this.sessionManager.markContextStateDirty(session.conversationId)
+    const renderedSummary = hookUserMessage
+      ? `${hookUserMessage}\n\n${plan.commit.summary}`
+      : plan.commit.summary
+    this.queuePendingContextSummaryUiUpdate(session, session.conversationId, {
+      compactionId: plan.commit.id,
+      summary: renderedSummary,
+      epoch: session.contextState.compactionEpoch || 0,
+    })
+    this.logger.log(
+      `Context compact applied: backend=${route.backend}, model=${options.model || route.model || session.model}, ` +
+        `strategy=${options.strategy}, budget=${budget.maxTokens}, estimatedTokens=${plan.estimatedTokens}, ` +
+        `compactionId=${plan.commit.id}`
+    )
+    this.resetCodexContinuationAfterProjectionRewrite(
+      route.backend,
+      session.conversationId,
+      options.model || session.model,
+      {
+        messages: [],
+        projectedMessages: [],
+        estimatedTokens: plan.estimatedTokens,
+        wasCompacted: true,
+        appliedCompaction: plan,
+      },
+      options.contextLabel
+    )
+  }
+
+  private async runPreCompactHookForCandidate(
+    session: ChatSession,
+    strategy: "auto" | "manual" | "reactive",
+    route: ModelRouteResult,
+    budget: Pick<ContextProjectionBudget, "maxTokens" | "systemPromptTokens">,
+    candidate: ContextCompactionCandidate,
+    model?: string
+  ): Promise<string | undefined> {
+    const contextTokens = Math.max(
+      0,
+      candidate.sourceTokenCount + candidate.retainedTokenCount
+    )
+    const contextWindow = Math.max(
+      1,
+      budget.maxTokens - budget.systemPromptTokens
+    )
+    const archivedMessageCount =
+      candidate.archivedRecords.filter(isMessageRecord).length
+    const hookPayload: PreCompactHookPayload = {
+      trigger: this.toPreCompactHookTrigger(strategy),
+      context_usage_percent: Math.min(
+        100,
+        Math.max(0, Math.round((contextTokens / contextWindow) * 100))
+      ),
+      context_tokens: contextTokens,
+      context_window_size: contextWindow,
+      message_count:
+        session.contextState.records.filter(isMessageRecord).length,
+      messages_to_compact: archivedMessageCount,
+      is_first_compaction: session.contextState.compactionHistory.length === 0,
+      conversation_id: session.conversationId,
+      generation_id: candidate.commitId,
+      model: model || route.model || session.model,
+    }
+    return this.contextHookExecutor.runPreCompactHook(
+      session.projectContext?.rootPath,
+      hookPayload
+    )
+  }
+
+  private toPreCompactHookTrigger(
+    strategy: "auto" | "manual" | "reactive"
+  ): string {
+    switch (strategy) {
+      case "manual":
+        return "manual"
+      case "reactive":
+        return "context_full"
+      case "auto":
+        return "automatic"
+    }
+  }
+
+  private buildNoToolsCompactSummaryProvider(
+    route: ModelRouteResult,
+    session: ChatSession,
+    contextLabel: string
+  ): ContextCompactRunnerSummaryProvider {
+    return async ({ prompt, maxTokens }) => {
+      const dto: CreateMessageDto = {
+        model: route.model,
+        max_tokens: Math.max(256, Math.min(4096, maxTokens)),
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        tools: [],
+        stream: false,
+      }
+      if (session.conversationId) {
+        dto._conversationId = `${session.conversationId}:compact`
+      }
+      const response = await this.sendNoToolsCompactRequest(route, dto)
+      const summary = this.extractTextFromAnthropicResponse(response)
+      this.logger.log(
+        `No-tools compact summary generated (${contextLabel}): model=${route.model}, tokens=${response.usage?.output_tokens || 0}`
+      )
+      return { summary }
+    }
+  }
+
+  private async sendNoToolsCompactRequest(
+    route: ModelRouteResult,
+    dto: CreateMessageDto
+  ): Promise<AnthropicResponse> {
+    switch (route.backend) {
+      case "codex":
+        throw new Error(
+          "Codex compact must use the Codex context adapter and Responses compact endpoint."
+        )
+      case "claude-api":
+        return this.anthropicApiService.sendClaudeMessage(dto)
+      case "kiro":
+        return this.kiroService.sendClaudeMessage(dto)
+      case "openai-compat":
+        return this.openaiCompatService.sendClaudeMessage(dto)
+      case "google":
+      case "google-claude":
+        return this.googleService.sendClaudeMessage(dto)
+    }
+  }
+
+  private extractTextFromAnthropicResponse(
+    response: AnthropicResponse
+  ): string {
+    return (response.content || [])
+      .flatMap((block) => (block.type === "text" ? [block.text] : []))
+      .join("\n")
+      .trim()
+  }
+
+  private stripSubAgentUiPayloadsForBackend(
+    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+  ): Array<{ role: "user" | "assistant"; content: MessageContent }> {
+    let changed = false
+    const nextMessages = messages.map((message) => {
+      if (message.role !== "user" || !Array.isArray(message.content)) {
+        return message
+      }
+
+      let contentChanged = false
+      const nextContent = message.content.map((block) => {
+        if (!this.isLooseRecord(block) || block.type !== "tool_result") {
+          return block
+        }
+
+        let nextBlock: Record<string, unknown> = block
+        const structured = this.isLooseRecord(block.structuredContent)
+          ? block.structuredContent
+          : undefined
+        const strippedStructured =
+          this.stripTaskSuccessConversationSteps(structured)
+        if (strippedStructured !== structured) {
+          nextBlock = {
+            ...nextBlock,
+            structuredContent: strippedStructured,
+          }
+          contentChanged = true
+        }
+
+        const compactedContent = this.compactSubAgentReportForBackend(
+          nextBlock.content
+        )
+        if (compactedContent !== nextBlock.content) {
+          nextBlock = {
+            ...nextBlock,
+            content: compactedContent,
+          }
+          contentChanged = true
+        }
+
+        return nextBlock
+      })
+
+      if (!contentChanged) return message
+      changed = true
+      return {
+        ...message,
+        content: nextContent as MessageContent,
+      }
+    })
+
+    return changed ? nextMessages : messages
+  }
+
+  private stripTaskSuccessConversationSteps(
+    structured: Record<string, unknown> | undefined
+  ): Record<string, unknown> | undefined {
+    if (!structured) return structured
+    const taskSuccess = structured.taskSuccess
+    if (
+      !this.isLooseRecord(taskSuccess) ||
+      !Array.isArray(taskSuccess.conversationSteps)
+    ) {
+      return structured
+    }
+
+    const { conversationSteps: _conversationSteps, ...taskSuccessRest } =
+      taskSuccess
+    return {
+      ...structured,
+      taskSuccess: taskSuccessRest,
+    }
+  }
+
+  private compactSubAgentReportForBackend(content: unknown): unknown {
+    if (typeof content === "string") {
+      return this.compactSubAgentReportText(content)
+    }
+    if (!Array.isArray(content)) {
+      return content
+    }
+
+    let changed = false
+    const nextContent = content.map((item) => {
+      if (!this.isLooseRecord(item) || item.type !== "text") {
+        return item
+      }
+      const text = typeof item.text === "string" ? item.text : ""
+      const compacted = this.compactSubAgentReportText(text)
+      if (compacted === text) return item
+      changed = true
+      return {
+        ...item,
+        text: compacted,
+      }
+    })
+    return changed ? nextContent : content
+  }
+
+  private compactSubAgentReportText(text: string): string {
+    if (
+      !/(?:Sub-agent execution summary:|Sub-agent result metadata:)/i.test(text)
+    ) {
+      return text
+    }
+
+    const sections = text.split(/\n\s*---\s*\n/u)
+    const finalBlock =
+      sections.length > 1 ? sections[0]?.trim() || "" : text.trim()
+    const rest = sections.length > 1 ? sections.slice(1).join("\n---\n") : text
+    const lines = rest
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter(Boolean)
+
+    const metadataLines = lines.filter((line) =>
+      /^(?:Sub-agent execution summary:|Sub-agent result metadata:|- agentId:|- turns:|- tool calls:|- duration:|- modified files:)/i.test(
+        line
+      )
+    )
+    const evidenceLines = lines
+      .filter((line) => /^\d+\.\s+/.test(line))
+      .slice(0, 6)
+
+    const rendered: string[] = []
+    if (finalBlock) rendered.push(finalBlock)
+    if (metadataLines.length > 0 || evidenceLines.length > 0) {
+      rendered.push("---")
+      rendered.push(
+        [
+          "Sub-agent result metadata:",
+          ...metadataLines.filter(
+            (line) =>
+              !/^(?:Sub-agent execution summary:|Sub-agent result metadata:)$/i.test(
+                line
+              )
+          ),
+        ].join("\n")
+      )
+    }
+    if (evidenceLines.length > 0) {
+      rendered.push(`Key tool evidence:\n${evidenceLines.join("\n")}`)
+    }
+    return rendered.join("\n\n").trim() || text
+  }
+
+  private shouldUseClaudeNativeCacheEdits(
+    backend: BackendType,
+    model?: string
+  ): boolean {
+    if (backend !== "claude-api") return false
+    const betaHeader =
+      process.env.ANTHROPIC_CACHE_EDITING_BETA_HEADER?.trim() ||
+      process.env.CACHE_EDITING_BETA_HEADER?.trim() ||
+      ""
+    if (!betaHeader) return false
+    if (!model) return false
+    return /claude-[a-z]+-4[-\d]/i.test(model) || /claude-4/i.test(model)
+  }
+
+  private resetCodexContinuationAfterProjectionRewrite(
+    backend: BackendType,
+    conversationId: string | undefined,
+    modelName: string | undefined,
+    result: ContextCompactionResult,
+    contextLabel: string
+  ): void {
+    if (backend !== "codex") {
+      return
+    }
+
+    const projectionRewritten =
+      result.wasCompacted ||
+      result.snipCompaction?.changed === true ||
+      result.microcompactCompaction?.changed === true ||
+      result.toolResultCompaction?.changed === true ||
+      result.messages.length < result.projectedMessages.length
+    if (!projectionRewritten) {
+      return
+    }
+
+    this.codexService.resetConversationContinuationState(
+      conversationId,
+      modelName,
+      `context projection rewritten (${contextLabel})`
+    )
   }
 
   private updatePendingRequestContextLedger(
@@ -4190,6 +5046,7 @@ ${raw}
       customSystemPrompt: session.customSystemPrompt,
       explicitContext: session.explicitContext,
       contextTokenLimit: session.contextTokenLimit,
+      contextMaxMode: session.contextMaxMode,
       usedContextTokens: session.usedContextTokens,
       requestedMaxOutputTokens: session.requestedMaxOutputTokens,
       requestedModelParameters: session.requestedModelParameters,
@@ -4230,146 +5087,10 @@ ${raw}
     return optimized
   }
 
-  private filterImageGenerationToolsForTurn(
-    backend: BackendType,
-    toolNames: string[],
-    session: ChatSession,
-    contextLabel: string
-  ): string[] {
-    if (toolNames.length === 0) {
-      return toolNames
-    }
-    if (this.latestUserExplicitlyRequestsImageGeneration(session)) {
-      return toolNames
-    }
-
-    const filtered = toolNames.filter(
-      (toolName) => !this.isImageGenerationToolName(toolName)
-    )
-    if (filtered.length !== toolNames.length) {
-      this.logger.warn(
-        `Removed ${toolNames.length - filtered.length} image generation tool(s) ` +
-          `for ${contextLabel} (backend=${backend}); latest user message did not explicitly request image creation`
-      )
-    }
-    return filtered
-  }
-
-  private latestUserExplicitlyRequestsImageGeneration(
-    session: ChatSession | undefined
-  ): boolean {
-    if (!session) return false
-    const latestUserText = this.extractLatestUserPlainText(
-      session.messages as Array<{
-        role: "user" | "assistant"
-        content: MessageContent
-      }>
-    )
-    return this.textExplicitlyRequestsImageGeneration(latestUserText || "")
-  }
-
-  private textExplicitlyRequestsImageGeneration(text: string): boolean {
-    const normalized = text.trim().toLowerCase()
-    if (!normalized) return false
-
-    const asksAboutFailure = this.containsAnyTerm(
-      normalized,
-      CursorConnectStreamService.INTENT_FAILURE_TERMS
-    )
-    const hasImageNoun = this.containsAnyTerm(
-      normalized,
-      CursorConnectStreamService.IMAGE_TARGET_TERMS
-    )
-    const hasCreateVerb = this.containsAnyTerm(
-      normalized,
-      CursorConnectStreamService.IMAGE_ACTION_TERMS
-    )
-    const explicitRequestPrefix = this.containsOrderedTermsWithinWindow(
-      normalized,
-      CursorConnectStreamService.REQUEST_PREFIX_TERMS,
-      CursorConnectStreamService.IMAGE_ACTION_TERMS,
-      24
-    )
-
-    if (!hasImageNoun || !hasCreateVerb) {
-      return false
-    }
-    if (asksAboutFailure && !explicitRequestPrefix) {
-      return false
-    }
-    return true
-  }
-
-  private isImageGenerationToolName(toolName: string): boolean {
-    const normalized = toolName.trim().toLowerCase()
-    if (!normalized) return false
-    const compact = this.compactAsciiAlphaNumeric(normalized)
-    return (
-      normalized === "generate_image" ||
-      normalized === "create_diagram" ||
-      normalized === "client_side_tool_v2_generate_image" ||
-      normalized === "client_side_tool_v2_create_diagram" ||
-      compact === "generateimage" ||
-      compact === "creatediagram" ||
-      compact === "clientsidetoolv2generateimage" ||
-      compact === "clientsidetoolv2creatediagram"
-    )
-  }
-
-  private containsAnyTerm(text: string, terms: readonly string[]): boolean {
-    return terms.some((term) => text.includes(term))
-  }
-
-  private containsOrderedTermsWithinWindow(
-    text: string,
-    leftTerms: readonly string[],
-    rightTerms: readonly string[],
-    maxCharsBetween: number
-  ): boolean {
-    for (const left of this.findTermRanges(text, leftTerms)) {
-      for (const right of this.findTermRanges(text, rightTerms)) {
-        if (
-          right.start >= left.end &&
-          right.start - left.end <= maxCharsBetween
-        ) {
-          return true
-        }
-      }
-    }
-    return false
-  }
-
-  private findTermRanges(
-    text: string,
-    terms: readonly string[]
-  ): Array<{ start: number; end: number }> {
-    const ranges: Array<{ start: number; end: number }> = []
-    for (const term of terms) {
-      if (!term) continue
-      let searchFrom = 0
-      while (searchFrom < text.length) {
-        const start = text.indexOf(term, searchFrom)
-        if (start < 0) break
-        ranges.push({ start, end: start + term.length })
-        searchFrom = start + Math.max(term.length, 1)
-      }
-    }
-    return ranges
-  }
-
-  private compactAsciiAlphaNumeric(text: string): string {
-    let compact = ""
-    for (const char of text) {
-      const code = char.charCodeAt(0)
-      const isDigit = code >= 48 && code <= 57
-      const isLowerAlpha = code >= 97 && code <= 122
-      if (isDigit || isLowerAlpha) {
-        compact += char
-      }
-    }
-    return compact
-  }
-
+  /**
+   * Image generation tools are now always exposed to the model — no
+   * client-side intent gating. Modern LLMs reliably decide when to use them.
+   */
   private tryParseJsonRecord(value: string): Record<string, unknown> | null {
     try {
       const parsed = JSON.parse(value)
@@ -6423,6 +7144,333 @@ ${raw}
   }
 
   /**
+   * Build an NFKC-normalized view of a string while retaining a map back to the
+   * original UTF-16 offsets. The boundary bitmap prevents replacing half of a
+   * compatibility-expanded character such as a ligature.
+   */
+  private buildCompatibilityNormalizedText(
+    value: string
+  ): CompatibilityNormalizedText {
+    const normalizedParts: string[] = []
+    const normalizedToOriginal: number[] = [0]
+    const normalizedBoundary: boolean[] = [true]
+    let originalOffset = 0
+    let normalizedOffset = 0
+
+    for (const char of value) {
+      const originalStart = originalOffset
+      const originalEnd = originalStart + char.length
+      const normalizedChar = char.normalize("NFKC")
+      normalizedParts.push(normalizedChar)
+
+      for (let index = 0; index < normalizedChar.length; index++) {
+        normalizedToOriginal[normalizedOffset + index] = originalStart
+        normalizedBoundary[normalizedOffset + index] = index === 0
+      }
+
+      normalizedOffset += normalizedChar.length
+      normalizedToOriginal[normalizedOffset] = originalEnd
+      normalizedBoundary[normalizedOffset] = true
+      originalOffset = originalEnd
+    }
+
+    return {
+      normalized: normalizedParts.join(""),
+      normalizedToOriginal,
+      normalizedBoundary,
+    }
+  }
+
+  private findCompatibilityNormalizedMatches(
+    content: string,
+    searchText: string,
+    range: { startOffset: number; endOffset: number }
+  ): CompatibilityNormalizedMatchSet {
+    const normalizedContent = this.buildCompatibilityNormalizedText(content)
+    const normalizedSearch = searchText.normalize("NFKC")
+    if (normalizedSearch.length === 0) {
+      return { allMatches: [], matchesInRange: [] }
+    }
+
+    const normalizedRange = {
+      startOffset: content.slice(0, range.startOffset).normalize("NFKC").length,
+      endOffset: content.slice(0, range.endOffset).normalize("NFKC").length,
+    }
+    const normalizedOffsets = this.findSubstringOffsets(
+      normalizedContent.normalized,
+      normalizedSearch
+    )
+    const allMatches = normalizedOffsets
+      .map((normalizedOffset): CompatibilityNormalizedMatch | null => {
+        const normalizedEnd = normalizedOffset + normalizedSearch.length
+        if (
+          !normalizedContent.normalizedBoundary[normalizedOffset] ||
+          !normalizedContent.normalizedBoundary[normalizedEnd]
+        ) {
+          return null
+        }
+
+        const originalStart =
+          normalizedContent.normalizedToOriginal[normalizedOffset]
+        const originalEnd =
+          normalizedContent.normalizedToOriginal[normalizedEnd]
+        if (originalStart == null || originalEnd == null) return null
+
+        const actualSlice = content.slice(originalStart, originalEnd)
+        if (actualSlice.normalize("NFKC") !== normalizedSearch) return null
+
+        return {
+          normalizedOffset,
+          originalStart,
+          originalEnd,
+        }
+      })
+      .filter((match): match is CompatibilityNormalizedMatch => match !== null)
+
+    const matchesInRange = allMatches.filter((match) => {
+      const normalizedEnd = match.normalizedOffset + normalizedSearch.length
+      return (
+        match.normalizedOffset >= normalizedRange.startOffset &&
+        normalizedEnd <= normalizedRange.endOffset
+      )
+    })
+
+    return {
+      allMatches,
+      matchesInRange,
+    }
+  }
+
+  private commonPrefixLength(left: string, right: string): number {
+    const limit = Math.min(left.length, right.length)
+    let offset = 0
+    while (offset < limit && left[offset] === right[offset]) {
+      offset += 1
+    }
+    return offset
+  }
+
+  private commonSuffixLength(
+    left: string,
+    right: string,
+    prefixLength: number
+  ): number {
+    const limit = Math.min(left.length, right.length) - prefixLength
+    let offset = 0
+    while (
+      offset < limit &&
+      left[left.length - 1 - offset] === right[right.length - 1 - offset]
+    ) {
+      offset += 1
+    }
+    return offset
+  }
+
+  /**
+   * When a match was found through NFKC compatibility normalization, preserve
+   * unchanged fullwidth/curly/compatibility characters from the actual file
+   * around the edited region. This mirrors claude-code's "find actual string"
+   * approach: use tolerant matching to locate the real span, but avoid changing
+   * typography that the replacement did not semantically edit.
+   */
+  private preserveCompatibilityStyleForReplacement(
+    actualSearchText: string,
+    requestedSearchText: string,
+    requestedReplaceText: string
+  ): string {
+    const normalizedActual = actualSearchText.normalize("NFKC")
+    const normalizedSearch = requestedSearchText.normalize("NFKC")
+    const normalizedReplace = requestedReplaceText.normalize("NFKC")
+    if (normalizedActual !== normalizedSearch) return requestedReplaceText
+    if (normalizedSearch === normalizedReplace) return requestedReplaceText
+
+    const prefixLength = this.commonPrefixLength(
+      normalizedSearch,
+      normalizedReplace
+    )
+    const suffixLength = this.commonSuffixLength(
+      normalizedSearch,
+      normalizedReplace,
+      prefixLength
+    )
+    if (prefixLength === 0 && suffixLength === 0) return requestedReplaceText
+
+    const actualMap = this.buildCompatibilityNormalizedText(actualSearchText)
+    const replaceMap =
+      this.buildCompatibilityNormalizedText(requestedReplaceText)
+    const searchSuffixStart = normalizedSearch.length - suffixLength
+    const replaceSuffixStart = normalizedReplace.length - suffixLength
+
+    if (
+      !actualMap.normalizedBoundary[prefixLength] ||
+      !actualMap.normalizedBoundary[searchSuffixStart] ||
+      !replaceMap.normalizedBoundary[prefixLength] ||
+      !replaceMap.normalizedBoundary[replaceSuffixStart]
+    ) {
+      return requestedReplaceText
+    }
+
+    const actualPrefixEnd = actualMap.normalizedToOriginal[prefixLength]
+    const actualSuffixStart = actualMap.normalizedToOriginal[searchSuffixStart]
+    const replaceMiddleStart = replaceMap.normalizedToOriginal[prefixLength]
+    const replaceMiddleEnd = replaceMap.normalizedToOriginal[replaceSuffixStart]
+    if (
+      actualPrefixEnd == null ||
+      actualSuffixStart == null ||
+      replaceMiddleStart == null ||
+      replaceMiddleEnd == null
+    ) {
+      return requestedReplaceText
+    }
+
+    return (
+      actualSearchText.slice(0, actualPrefixEnd) +
+      requestedReplaceText.slice(replaceMiddleStart, replaceMiddleEnd) +
+      actualSearchText.slice(actualSuffixStart)
+    )
+  }
+
+  /**
+   * Fallback: Unicode compatibility matching.
+   * Models may copy current text through a UI/font/input path that normalizes
+   * fullwidth punctuation such as `：`/`；` into ASCII `:`/`;`. Match with NFKC
+   * only when the normalized target is unambiguous, then apply to the original
+   * byte span.
+   */
+  private attemptCompatibilityNormalizedMatch(
+    content: string,
+    range: { startOffset: number; endOffset: number; lineStarts: number[] },
+    options: {
+      searchText: string
+      replaceText: string
+      allowMultiple?: boolean
+      startLine?: number
+      endLine?: number
+      warningPrefix: string
+    }
+  ): {
+    fileText: string
+    resolvedMatch?: EditResolvedMatch
+  } | null {
+    const { searchText, replaceText } = options
+    const allowMultiple = options.allowMultiple || false
+    const normalizedSearch = searchText.normalize("NFKC")
+    const searchChangedByNormalization = normalizedSearch !== searchText
+    // Eligibility check: NFKC normalization only matters if the
+    // requested range OR the search text actually contains
+    // compatibility characters. Earlier code ran
+    // `content.normalize("NFKC")` on the entire file on every edit;
+    // for a 1MB file with no fullwidth characters that is ~3-5ms of
+    // pure waste per failed match. Slice the range first — even a
+    // 200KB file rarely has more than a few hundred chars of edit
+    // window — and only fall through to the full-file work when the
+    // range or search has at least one normalize-changing codepoint.
+    const rangeSlice = content.slice(range.startOffset, range.endOffset)
+    const rangeChangedByNormalization =
+      rangeSlice.normalize("NFKC") !== rangeSlice
+    if (!rangeChangedByNormalization && !searchChangedByNormalization) {
+      return null
+    }
+
+    const matchSet = this.findCompatibilityNormalizedMatches(
+      content,
+      searchText,
+      range
+    )
+    const effectiveMatches =
+      matchSet.allMatches.length === 1
+        ? matchSet.allMatches
+        : matchSet.matchesInRange
+
+    if (effectiveMatches.length === 0) return null
+    if (!allowMultiple && effectiveMatches.length > 1) return null
+
+    const replacementForMatch = (match: CompatibilityNormalizedMatch): string =>
+      this.preserveCompatibilityStyleForReplacement(
+        content.slice(match.originalStart, match.originalEnd),
+        searchText,
+        replaceText
+      )
+
+    if (allowMultiple && effectiveMatches.length > 1) {
+      let result = content
+      const sortedMatches = [...effectiveMatches].sort(
+        (left, right) => right.originalStart - left.originalStart
+      )
+      for (const match of sortedMatches) {
+        result =
+          result.slice(0, match.originalStart) +
+          replacementForMatch(match) +
+          result.slice(match.originalEnd)
+      }
+      this.logger.debug(
+        `${options.warningPrefix}: Unicode compatibility normalization retry succeeded ` +
+          `(${effectiveMatches.length} matches)`
+      )
+      return { fileText: result }
+    }
+
+    const firstMatch = effectiveMatches[0] as CompatibilityNormalizedMatch
+    const matchedStartLine = this.resolveLineNumberFromOffset(
+      range.lineStarts,
+      firstMatch.originalStart
+    )
+    const matchedEndLine = this.resolveLineNumberFromOffset(
+      range.lineStarts,
+      Math.max(firstMatch.originalStart, firstMatch.originalEnd - 1)
+    )
+
+    this.logger.debug(
+      `${options.warningPrefix}: Unicode compatibility normalization retry succeeded ` +
+        `(lines ${matchedStartLine}-${matchedEndLine})`
+    )
+
+    return {
+      fileText:
+        content.slice(0, firstMatch.originalStart) +
+        replacementForMatch(firstMatch) +
+        content.slice(firstMatch.originalEnd),
+      resolvedMatch: {
+        requestedStartLine: options.startLine,
+        requestedEndLine: options.endLine,
+        matchedStartLine,
+        matchedEndLine,
+      },
+    }
+  }
+
+  private buildCompatibilityNormalizedFailureHint(
+    content: string,
+    searchText: string,
+    range: { startOffset: number; endOffset: number }
+  ): string {
+    const rangeSlice = content.slice(range.startOffset, range.endOffset)
+    const rangeChangedByNormalization =
+      rangeSlice.normalize("NFKC") !== rangeSlice
+    const searchChangedByNormalization =
+      searchText.normalize("NFKC") !== searchText
+    if (!rangeChangedByNormalization && !searchChangedByNormalization) {
+      return ""
+    }
+
+    const matchSet = this.findCompatibilityNormalizedMatches(
+      content,
+      searchText,
+      range
+    )
+    if (matchSet.allMatches.length === 0) return ""
+
+    const inRangeCount = matchSet.matchesInRange.length
+    if (matchSet.allMatches.length === 1) {
+      return " A Unicode compatibility-normalized match exists in the file, but it could not be applied safely; re-copy the exact current text, especially fullwidth/halfwidth punctuation."
+    }
+    if (inRangeCount > 0) {
+      return ` Unicode compatibility-normalized TargetContent matches ${inRangeCount} time(s) in the requested range and ${matchSet.allMatches.length} time(s) in the file; narrow StartLine/EndLine or copy a more unique exact snippet.`
+    }
+    return ` Unicode compatibility-normalized TargetContent exists ${matchSet.allMatches.length} time(s) elsewhere in the file; re-read the target lines and copy exact punctuation.`
+  }
+
+  /**
    * Fallback: trailing whitespace tolerance matching.
    * Models sometimes omit or add trailing spaces/tabs that differ from the
    * actual file content.  Normalize trailing whitespace per line for matching,
@@ -6905,6 +7953,15 @@ ${raw}
         return crlfFallbackResult
       }
 
+      // Fallback: Unicode compatibility normalization — models sometimes copy
+      // fullwidth punctuation through a path that turns it into ASCII
+      // punctuation. Only accept an unambiguous normalized match.
+      const compatibilityFallbackResult =
+        this.attemptCompatibilityNormalizedMatch(content, range, options)
+      if (compatibilityFallbackResult) {
+        return compatibilityFallbackResult
+      }
+
       // Fallback: trailing whitespace tolerance — models sometimes omit or
       // add trailing spaces/tabs that differ from the actual file content.
       // Normalize trailing whitespace per line for matching, then apply the
@@ -6937,12 +7994,15 @@ ${raw}
         allMatchOffsets.length > 0
           ? ` TargetContent exists ${allMatchOffsets.length} time(s) elsewhere in the current file, so the requested line window is inaccurate or not selective enough.`
           : ""
+      const compatibilityDiagnosis =
+        this.buildCompatibilityNormalizedFailureHint(content, searchText, range)
       return {
         fileText: content,
         warning:
           `${options.warningPrefix} target content not found in specified line range${rangeLabel}; ` +
           `ensure StartLine/EndLine fully cover the entire TargetContent and re-read a slightly wider window.` +
           outOfRangeDiagnosis +
+          compatibilityDiagnosis +
           possiblyAppliedHint +
           retryGuidance,
         failureContext: {
@@ -8401,6 +9461,116 @@ ${raw}
     }
   }
 
+  /**
+   * Pre-dispatch input validator registry, keyed by canonical tool name.
+   *
+   * Each entry is invoked from `buildPreparedToolInvocation` *after*
+   * canonicalization but *before* dispatch resolution. A non-undefined
+   * return is folded into the standard `validationErrorMessage` channel,
+   * so the dispatcher emits the error through the same inline tool-result
+   * envelope the model already understands — no need for a per-tool
+   * if/else cascade in the dispatcher.
+   *
+   * Add a new entry here when a tool has a constraint that is cheaper to
+   * check on the bridge side than to roundtrip to the IDE / backend (e.g.
+   * workspace-root bounds, mutually exclusive fields, schema invariants
+   * the proto layer doesn't enforce).
+   *
+   * Mirrors the per-tool validator pattern in
+   * `apps/protocol-bridge/src/shared/official-antigravity-tools.ts::validateOfficialEditChunk`
+   * and claude-code's zod refinement validators on each builtin tool's
+   * input schema.
+   */
+  private static readonly CURSOR_TOOL_INPUT_VALIDATORS: Record<
+    string,
+    (
+      input: Record<string, unknown>,
+      ctx: { projectRoot?: string }
+    ) => string | undefined
+  > = {
+    /**
+     * `read_lints`: the IDE-side diagnostic provider rejects paths that
+     * fall outside the active workspace root with `path is outside
+     * workspace root`. Catch absolute out-of-bounds paths up front so
+     * the model gets a structured message instead of a generic IDE
+     * error after the round-trip.
+     *
+     * - Empty paths / no projectRoot: skip (let the IDE answer).
+     * - Relative paths: skip (IDE resolves them against root, always
+     *   in-bounds).
+     * - Absolute paths: must live under projectRoot.
+     */
+    read_lints: (input, ctx): string | undefined => {
+      const rootPath = ctx.projectRoot?.trim()
+      if (!rootPath) return undefined
+
+      const rawPaths = input.paths
+      const candidatePaths: string[] = []
+      if (Array.isArray(rawPaths)) {
+        for (const candidate of rawPaths) {
+          if (typeof candidate === "string" && candidate.trim().length > 0) {
+            candidatePaths.push(candidate.trim())
+          }
+        }
+      } else if (typeof rawPaths === "string" && rawPaths.trim().length > 0) {
+        candidatePaths.push(rawPaths.trim())
+      }
+      if (candidatePaths.length === 0) return undefined
+
+      let normalizedRoot = rootPath
+      try {
+        normalizedRoot = path.resolve(rootPath)
+      } catch {
+        // best-effort; if path.resolve throws (rare), keep the raw value.
+      }
+      const rootWithSep = normalizedRoot.endsWith(path.sep)
+        ? normalizedRoot
+        : `${normalizedRoot}${path.sep}`
+      const outOfBounds: string[] = []
+      for (const candidate of candidatePaths) {
+        if (!path.isAbsolute(candidate)) continue
+        let resolved = candidate
+        try {
+          resolved = path.resolve(candidate)
+        } catch {
+          // path.resolve almost never throws on a string input; ignore.
+        }
+        if (resolved !== normalizedRoot && !resolved.startsWith(rootWithSep)) {
+          outOfBounds.push(candidate)
+        }
+      }
+      if (outOfBounds.length === 0) return undefined
+
+      const sample = outOfBounds.slice(0, 3).join(", ")
+      const more =
+        outOfBounds.length > 3 ? ` (+${outOfBounds.length - 3} more)` : ""
+      return (
+        `read_lints rejected: paths must live under the active workspace root ` +
+        `"${normalizedRoot}". Out-of-bounds path(s): ${sample}${more}. ` +
+        `Use a workspace-relative path or an absolute path that resolves under ` +
+        `the workspace root.`
+      )
+    },
+  }
+
+  /**
+   * Run the registered input validator for `canonicalToolName`, if any.
+   * Returns the error message it produced, or undefined when no
+   * validator is registered or the validator passed.
+   */
+  private runRegisteredToolInputValidator(
+    session: ChatSession,
+    canonicalToolName: string,
+    input: Record<string, unknown>
+  ): string | undefined {
+    const validator =
+      CursorConnectStreamService.CURSOR_TOOL_INPUT_VALIDATORS[canonicalToolName]
+    if (!validator) return undefined
+    return validator(input, {
+      projectRoot: session.projectContext?.rootPath,
+    })
+  }
+
   private normalizeOfficialViewFileInvocation(
     session: ChatSession,
     invocation: CanonicalToolInvocation
@@ -9412,16 +10582,22 @@ ${raw}
    *    经常只传短名（"context7"），bridge 直接转发会导致 IDE
    *    端 registry lookup miss、回报 `Server "context7" not found`，但实际
    *    通道是健康的。
-   *  - 真实 providerIdentifier 集合在 session.mcpToolDefs 里，bridge 这一侧
-   *    完全有能力做对齐。
+   *  - bridge 一侧能拿到 IDE 真正用的 server registry key —— 它由
+   *    `cursor-request-parser.ts::computeMcpIdeRegistryKey` 在
+   *    `appendMcpToolDef` 入库时一次性算好，存到
+   *    `McpToolDef.ideRegistryKey`。该字段同时承担"短名 → prefixed key"
+   *    的去歧义责任：若 wire 上 `provider_identifier` 已是 prefixed 形式，
+   *    `ideRegistryKey === providerIdentifier`，函数就退化成 identity；
+   *    若是短名则补回 prefixed 段。
    *
    * 匹配策略（按优先级）：
-   *  1. 完全相等
-   *  2. 归一化字符串相等（去除非字母数字，忽略大小写）
-   *  3. 一方归一化字符串是另一方的前缀 / 后缀 / 子串
+   *  1. 完全相等：caller 已经传了 IDE 端期望的 server key
+   *     （`ideRegistryKey` 优先，否则 `providerIdentifier`）
+   *  2. 归一化字符串相等（去除非字母数字、忽略大小写）后再比一遍同样两个字段
+   *  3. 都不命中则原样返回，让 IDE 给真实错误（合法的"server 真没挂"）
    *
-   * 命中返回 mcpToolDefs 里真正的 providerIdentifier；找不到则原样返回，
-   * 让 IDE 端给出真实错误（比如 server 确实没挂）。
+   * 命中后总是返回 `ideRegistryKey`（IDE 端能识别）；当 `ideRegistryKey`
+   * 为空时回退到 `providerIdentifier`。
    */
   private resolveMountedMcpServer(
     session: ChatSession,
@@ -9433,45 +10609,58 @@ ${raw}
     const defs = session.mcpToolDefs || []
     if (defs.length === 0) return trimmed
 
-    const knownProviders = new Set<string>()
-    for (const def of defs) {
-      const provider = (def?.providerIdentifier || "").trim()
-      if (provider) knownProviders.add(provider)
+    // Each tool def contributes at most one candidate — the IDE
+    // registry key (with `providerIdentifier` as a fallback when
+    // `ideRegistryKey` is empty). Multiple defs from the same server
+    // collapse to the same candidate, so we de-dupe by forward value.
+    type Candidate = {
+      /** Value forwarded to the IDE if this candidate matches. */
+      forward: string
+      /** Short alias kept for matching against caller input. */
+      provider: string
     }
-    if (knownProviders.size === 0) return trimmed
+    const candidates: Candidate[] = []
+    const seenForwards = new Set<string>()
+    for (const def of defs) {
+      const forward = (
+        def?.ideRegistryKey ||
+        def?.providerIdentifier ||
+        ""
+      ).trim()
+      if (!forward || seenForwards.has(forward)) continue
+      seenForwards.add(forward)
+      candidates.push({
+        forward,
+        provider: (def?.providerIdentifier || "").trim() || forward,
+      })
+    }
+    if (candidates.length === 0) return trimmed
 
-    if (knownProviders.has(trimmed)) return trimmed
+    // Exact match: caller already typed the IDE registry key (or the
+    // short alias when wire-level identifiers are already correct).
+    for (const candidate of candidates) {
+      if (candidate.forward === trimmed) return candidate.forward
+      if (candidate.provider === trimmed) return candidate.forward
+    }
 
     const normalizedRequested = normalizeMcpToolIdentifier(trimmed)
     if (!normalizedRequested) return trimmed
 
-    let bestMatch: string | undefined
-    let bestDelta = Number.POSITIVE_INFINITY
-    for (const provider of knownProviders) {
-      const normalizedProvider = normalizeMcpToolIdentifier(provider)
-      if (!normalizedProvider) continue
-
-      if (normalizedProvider === normalizedRequested) {
-        return provider
-      }
-
-      const isFuzzyMatch =
-        normalizedProvider.endsWith(normalizedRequested) ||
-        normalizedRequested.endsWith(normalizedProvider) ||
-        normalizedProvider.includes(normalizedRequested) ||
-        normalizedRequested.includes(normalizedProvider)
-      if (!isFuzzyMatch) continue
-
-      const delta = Math.abs(
-        normalizedProvider.length - normalizedRequested.length
-      )
-      if (delta < bestDelta) {
-        bestDelta = delta
-        bestMatch = provider
+    for (const candidate of candidates) {
+      const normalizedForward = normalizeMcpToolIdentifier(candidate.forward)
+      const normalizedProvider = normalizeMcpToolIdentifier(candidate.provider)
+      if (
+        normalizedForward === normalizedRequested ||
+        normalizedProvider === normalizedRequested
+      ) {
+        return candidate.forward
       }
     }
 
-    return bestMatch || trimmed
+    // No match — let the IDE return the real "Server X not found" error
+    // so the model can self-correct using the available-servers hint
+    // (mirrors claude-code's ListMcpResourcesTool contract).
+    return trimmed
   }
 
   /**
@@ -10590,19 +11779,32 @@ ${raw}
     return match[1].replace(/\s+/g, " ").trim()
   }
 
-  private async fetchUrlDocument(url: string): Promise<{
+  private async fetchUrlDocument(
+    url: string,
+    externalSignal?: AbortSignal
+  ): Promise<{
     url: string
     contentType: string
     title: string
     content: string
   }> {
+    // Compose the per-request timeout with any external abort signal
+    // (e.g. the worker's `AbortController.signal` for a background
+    // sub-agent). `AbortSignal.any` returns a signal that aborts as
+    // soon as ANY input aborts, so a kill_agent fired mid-fetch
+    // unwinds without having to wait for the full 20s timeout.
+    const timeoutSignal = AbortSignal.timeout(20_000)
+    const signal = externalSignal
+      ? AbortSignal.any([timeoutSignal, externalSignal])
+      : timeoutSignal
+
     const response = await fetch(url, {
       method: "GET",
       redirect: "follow",
       headers: {
         "User-Agent": "protocol-bridge-web-fetch/1.0",
       },
-      signal: AbortSignal.timeout(20_000),
+      signal,
     })
 
     const contentType = response.headers.get("content-type") || ""
@@ -10692,7 +11894,8 @@ ${raw}
 
   private async executeInlineReadUrlContent(
     conversationId: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
   ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -10706,7 +11909,7 @@ ${raw}
     }
 
     try {
-      const doc = await this.fetchUrlDocument(url)
+      const doc = await this.fetchUrlDocument(url, options?.abortSignal)
       const storedDoc = this.storeLegacyWebDocument(conversationId, doc)
       const firstChunk = storedDoc.chunks[0] || "[empty document]"
       const totalChunks = storedDoc.chunks.length
@@ -10825,7 +12028,8 @@ ${raw}
   private async executeInlineWebTool(
     conversationId: string,
     toolName: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
   ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -10943,6 +12147,7 @@ ${raw}
             domain: domain || undefined,
             conversationId,
             model: session?.model,
+            abortSignal: options?.abortSignal,
           }
         )
 
@@ -10998,6 +12203,26 @@ ${raw}
         // as a "rejected" tool result so connect-stream short-circuits
         // the in-flight tool call without emitting a "search failed"
         // banner that the model would then have to interpret.
+        if (error instanceof WebSearchEmptyResultError) {
+          this.logger.warn(
+            `[web_search] ${error.adapter} returned no results for ` +
+              `query "${error.query.slice(0, 80)}"; returning empty success`
+          )
+          return {
+            content:
+              `Search query: ${normalizedQuery}\n` +
+              `Adapter: ${error.adapter}\n\n` +
+              "No search results were found. Try a broader query, another " +
+              "search adapter, or fetch a known URL directly with web_fetch.",
+            state: { status: "success" },
+            projection: {
+              webSearchResult: {
+                query: normalizedQuery,
+                references: [],
+              },
+            },
+          }
+        }
         if (error instanceof WebSearchAbortError) {
           return {
             content: "[web_search aborted]",
@@ -11033,7 +12258,7 @@ ${raw}
     }
 
     try {
-      const doc = await this.fetchUrlDocument(url)
+      const doc = await this.fetchUrlDocument(url, options?.abortSignal)
       const contentBody =
         doc.content.length > 18_000
           ? `${doc.content.slice(0, 18_000)}\n\n...[truncated]`
@@ -11222,7 +12447,8 @@ ${raw}
 
   private async executeInlineExaSearch(
     conversationId: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    _options?: { abortSignal?: AbortSignal }
   ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -11271,7 +12497,10 @@ ${raw}
     }
   }
 
-  private async executeInlineExaFetch(input: Record<string, unknown>): Promise<{
+  private async executeInlineExaFetch(
+    input: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
+  ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
   }> {
@@ -11288,13 +12517,17 @@ ${raw}
     const contents: Array<Record<string, unknown>> = []
 
     for (const id of uniqueIds) {
+      if (options?.abortSignal?.aborted) {
+        chunks.push(`ID: ${id}\n[aborted] kill signal received mid-batch`)
+        break
+      }
       if (!/^https?:\/\//i.test(id)) {
         chunks.push(`ID: ${id}\n[skip] non-http id is not fetchable in proxy`)
         continue
       }
 
       try {
-        const doc = await this.fetchUrlDocument(id)
+        const doc = await this.fetchUrlDocument(id, options?.abortSignal)
         const snippet =
           doc.content.length > 4_500
             ? `${doc.content.slice(0, 4_500)}\n...[truncated]`
@@ -11393,7 +12626,10 @@ ${raw}
     return headers
   }
 
-  private async executeInlineFetch(input: Record<string, unknown>): Promise<{
+  private async executeInlineFetch(
+    input: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
+  ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
   }> {
@@ -11484,7 +12720,9 @@ ${raw}
         headers,
         body,
         redirect: "follow",
-        signal: AbortSignal.timeout(20_000),
+        signal: options?.abortSignal
+          ? AbortSignal.any([AbortSignal.timeout(20_000), options.abortSignal])
+          : AbortSignal.timeout(20_000),
       })
       const contentType = response.headers.get("content-type") || ""
       const responseText = await response.text()
@@ -12106,7 +13344,15 @@ ${raw}
     const parentPendingToolCall = session.pendingToolCalls.get(parentToolCallId)
     const parentTaskModelCallId = parentPendingToolCall?.modelCallId || ""
 
-    const systemPrompt = getSubagentSystemPrompt(effectiveAgent)
+    const allowedWorkspaceRoots =
+      this.sessionManager.listAllowedWorkspaceRoots(conversationId)
+    const primaryRoot = this.resolveWorkspaceRoot(conversationId)
+    const workingDirectoriesPrompt =
+      this.formatAdditionalWorkingDirectoriesPrompt(
+        allowedWorkspaceRoots,
+        primaryRoot
+      )
+    const systemPrompt = `${getSubagentSystemPrompt(effectiveAgent)}${workingDirectoriesPrompt}`
     const subAgentModel = this.resolveSubAgentModel(effectiveAgent, session)
 
     const ctx: SubAgentContext = {
@@ -12137,6 +13383,7 @@ ${raw}
       pendingToolResults: new Map(),
       expectedToolCallIds: new Set(),
       conversationSteps: [],
+      allowedWorkspaceRoots,
     }
 
     this.sessionManager.setSubAgentContext(conversationId, ctx)
@@ -12217,19 +13464,22 @@ ${raw}
           toolDefinitions,
           additionalSystemPrompt: systemAddendum,
           buildMessages: (budget) => {
-            const compacted =
-              this.contextManager.buildBackendMessagesFromMessages(
-                ctx.messages.map((message) => ({
-                  role: message.role,
-                  content: message.content as UnifiedMessage["content"],
-                })) as UnifiedMessage[],
-                this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
-                {
-                  maxTokens: budget.maxTokens,
-                  systemPromptTokens: budget.systemPromptTokens,
-                  strategy: "auto",
-                }
-              )
+            const compacted = this.contextRequestPlanner.projectMessages(
+              ctx.messages.map((message) => ({
+                role: message.role,
+                content: message.content as UnifiedMessage["content"],
+              })) as UnifiedMessage[],
+              this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
+              budget,
+              { strategy: "auto" }
+            )
+            this.resetCodexContinuationAfterProjectionRewrite(
+              streamRoute.backend,
+              conversationId,
+              streamRoute.model,
+              compacted,
+              `sub-agent: ${conversationId}:${ctx.subagentId}`
+            )
 
             return compacted.messages as CodexExecutionRequest["messages"]
           },
@@ -12450,7 +13700,8 @@ ${raw}
         const bridgeInlineResult = await this.executeSubAgentBridgeInlineTool(
           conversationId,
           tc.name,
-          parsedInput
+          parsedInput,
+          ctx.allowedWorkspaceRoots
         )
         if (bridgeInlineResult) {
           this.logger.log(
@@ -12593,6 +13844,16 @@ ${raw}
             if (this.isSubAgentAbortError(err)) {
               const message = err instanceof Error ? err.message : String(err)
               this.sessionManager.consumePendingToolCall(conversationId, tc.id)
+              // Drop a session-memory breadcrumb BEFORE clearing the
+              // context so the parent agent's next turn can see that
+              // this sub-agent ran (and was aborted) without us
+              // having to keep the sub-agent context alive.
+              this.recordAbortedSubAgentMemory(
+                conversationId,
+                ctx,
+                "aborted",
+                `${tc.name} (${tc.id}): ${message}`
+              )
               // Tear down only this sub-agent's context; sibling
               // sub-agents in the same parent batch keep running.
               this.sessionManager.clearSubAgentContext(
@@ -12789,21 +14050,29 @@ ${raw}
           additionalSystemPrompt: systemAddendum,
           // No toolDefinitions — synthesis turn must be text-only.
           buildMessages: (budget) => {
-            const compacted =
-              this.contextManager.buildBackendMessagesFromMessages(
-                ctx.messages.map((message) => ({
-                  role: message.role,
-                  content: message.content as UnifiedMessage["content"],
-                })) as UnifiedMessage[],
-                this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
-                {
-                  maxTokens: budget.maxTokens,
-                  systemPromptTokens: budget.systemPromptTokens,
-                  strategy: "auto",
-                }
-              )
+            const compacted = this.contextRequestPlanner.projectMessages(
+              ctx.messages.map((message) => ({
+                role: message.role,
+                content: message.content as UnifiedMessage["content"],
+              })) as UnifiedMessage[],
+              this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
+              budget,
+              { strategy: "auto" }
+            )
+            this.resetCodexContinuationAfterProjectionRewrite(
+              streamRoute.backend,
+              conversationId,
+              streamRoute.model,
+              compacted,
+              `sub-agent synthesis: ${conversationId}:${ctx.subagentId}`
+            )
 
-            return compacted.messages as CodexExecutionRequest["messages"]
+            return projectSubAgentFinalSynthesisMessages(
+              compacted.messages as Array<{
+                role: "user" | "assistant"
+                content: unknown
+              }>
+            ) as CodexExecutionRequest["messages"]
           },
         })
       }
@@ -13019,19 +14288,30 @@ ${raw}
         toolDefinitions: codexTools,
         additionalSystemPrompt: codexAddendum,
         buildMessages: (budget) => {
-          const compacted =
-            this.contextManager.buildBackendMessagesFromMessages(
-              tempCtx.messages.map((message) => ({
-                role: message.role,
-                content: message.content as UnifiedMessage["content"],
-              })) as UnifiedMessage[],
-              this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
-              {
-                maxTokens: budget.maxTokens,
-                systemPromptTokens: budget.systemPromptTokens,
-                strategy: "auto",
-              }
-            )
+          const compacted = this.contextRequestPlanner.projectMessages(
+            tempCtx.messages.map((message) => ({
+              role: message.role,
+              content: message.content as UnifiedMessage["content"],
+            })) as UnifiedMessage[],
+            this.EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT,
+            budget,
+            { strategy: "auto" }
+          )
+          this.resetCodexContinuationAfterProjectionRewrite(
+            streamRoute.backend,
+            conversationId,
+            streamRoute.model,
+            compacted,
+            `background sub-agent: ${conversationId}:${args.subagentId}`
+          )
+          if (args.forceFinalSynthesis === true) {
+            return projectSubAgentFinalSynthesisMessages(
+              compacted.messages as Array<{
+                role: "user" | "assistant"
+                content: unknown
+              }>
+            ) as CodexExecutionRequest["messages"]
+          }
           return compacted.messages as CodexExecutionRequest["messages"]
         },
       })
@@ -13117,8 +14397,16 @@ ${raw}
   async runBackgroundInlineDeferredTool(
     conversationId: string,
     toolName: string,
-    parsedInput: Record<string, unknown>
+    parsedInput: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
   ): Promise<{ content: string; status: "success" | "error" }> {
+    if (options?.abortSignal?.aborted) {
+      return {
+        content: "[tool aborted] background sub-agent kill signal received",
+        status: "error",
+      }
+    }
+
     const bridgeInline = await this.executeSubAgentBridgeInlineTool(
       conversationId,
       toolName,
@@ -13146,13 +14434,26 @@ ${raw}
         conversationId,
         family,
         toolName,
-        parsedInput
+        parsedInput,
+        options
       )
       return {
         content: result.content,
         status: result.state?.status === "error" ? "error" : "success",
       }
     } catch (err) {
+      // Distinguish operator-initiated kill from generic tool errors so
+      // the worker's transcript records the correct terminal status.
+      if (
+        options?.abortSignal?.aborted ||
+        (err instanceof DOMException && err.name === "AbortError") ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
+        return {
+          content: `[tool aborted] ${toolName} cancelled by kill_agent`,
+          status: "error",
+        }
+      }
       return {
         content: `[tool error] ${String(err)}`,
         status: "error",
@@ -13262,14 +14563,22 @@ ${raw}
       description,
       agent: effectiveAgent,
       model: subAgentModel,
+      allowedWorkspaceRoots:
+        this.sessionManager.listAllowedWorkspaceRoots(conversationId),
       host: {
         logger: this.logger,
         runInlineDeferredTool: (
           convId: string,
           toolName: string,
-          parsedInput: Record<string, unknown>
+          parsedInput: Record<string, unknown>,
+          options?: { abortSignal?: AbortSignal }
         ) =>
-          this.runBackgroundInlineDeferredTool(convId, toolName, parsedInput),
+          this.runBackgroundInlineDeferredTool(
+            convId,
+            toolName,
+            parsedInput,
+            options
+          ),
         runSubAgentLlmTurn: (convId, llmArgs) =>
           this.runBackgroundSubAgentLlmTurn(convId, llmArgs),
         // ConversationStep builders — wrap the grpc service helpers so
@@ -13474,6 +14783,9 @@ ${raw}
       const transcriptPath = this.subagentTranscriptStore.getTranscriptPath(
         metadata.agentId
       )
+      const resultPath = this.subagentTranscriptStore.getResultPath(
+        metadata.agentId
+      )
       const durationMs = metadata.durationMs ?? 0
       const taskSuccess: NonNullable<ToolCompletedExtraData["taskSuccess"]> = {
         agentId: metadata.agentId,
@@ -13493,6 +14805,16 @@ ${raw}
         metadata.status === "completed"
           ? metadata.finalText || "Background sub-agent completed."
           : metadata.errorMessage || `Background sub-agent ${metadata.status}.`
+      this.recordCompletedBackgroundSubAgentMemory(session, {
+        agentId: metadata.agentId,
+        agentType: metadata.agentType,
+        parentToolCallId,
+        status: metadata.status,
+        resultText,
+        durationMs,
+        transcriptPath,
+        resultPath,
+      })
 
       yield this.grpcService.createToolCallCompletedResponse(
         parentToolCallId,
@@ -13598,6 +14920,12 @@ ${raw}
           },
         }
       )
+      this.recordSubAgentSessionMemory(conversationId, subAgentCtx, {
+        status: "completed",
+        finalText,
+        report,
+        durationMs,
+      })
     } else {
       this.logger.log(
         `[SubAgent] Backgrounded ${subAgentCtx.subagentId} completed without re-settling parent tool call`
@@ -13640,7 +14968,8 @@ ${raw}
         ? trimmedFinal
         : "[sub-agent completed without an explicit final answer]"
 
-    const summaryLines: string[] = ["Sub-agent execution summary:"]
+    const summaryLines: string[] = ["Sub-agent result metadata:"]
+    summaryLines.push(`- agentId: ${ctx.subagentId}`)
     summaryLines.push(`- turns: ${ctx.turnCount}`)
     summaryLines.push(`- tool calls: ${ctx.toolCallCount}`)
     summaryLines.push(`- duration: ${durationMs}ms`)
@@ -13653,17 +14982,19 @@ ${raw}
       summaryLines.push(`- modified files: ${filesPreview}${overflow}`)
     }
 
-    const toolLines: string[] = []
+    const evidenceLines: string[] = []
     let toolIndex = 0
     for (const step of ctx.conversationSteps) {
       const summary = this.summarizeSubAgentToolStep(step)
       if (!summary) continue
       toolIndex += 1
-      toolLines.push(`${toolIndex}. ${summary}`)
-      if (toolIndex >= 30) {
+      evidenceLines.push(`${toolIndex}. ${summary}`)
+      if (toolIndex >= 6) {
         const remaining = ctx.toolCallCount - toolIndex
         if (remaining > 0) {
-          toolLines.push(`… (${remaining} more tool calls truncated)`)
+          evidenceLines.push(
+            `… (${remaining} more tool calls kept in Cursor task details)`
+          )
         }
         break
       }
@@ -13671,10 +15002,216 @@ ${raw}
 
     const sections: string[] = [finalBlock]
     sections.push("---", summaryLines.join("\n"))
-    if (toolLines.length > 0) {
-      sections.push("Tool calls:\n" + toolLines.join("\n"))
+    if (evidenceLines.length > 0) {
+      sections.push("Key tool evidence:\n" + evidenceLines.join("\n"))
     }
     return sections.join("\n\n")
+  }
+
+  private recordSubAgentSessionMemory(
+    conversationId: string,
+    ctx: SubAgentContext,
+    options: {
+      status: string
+      finalText: string
+      report: string
+      durationMs: number
+    }
+  ): void {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) return
+    this.upsertSubAgentSessionMemory(session, {
+      agentId: ctx.subagentId,
+      parentToolCallId: ctx.parentToolCallId,
+      status: options.status,
+      resultText: options.finalText,
+      durationMs: options.durationMs,
+      turnCount: ctx.turnCount,
+      toolCallCount: ctx.toolCallCount,
+      modifiedFiles: ctx.modifiedFiles,
+      evidenceText: options.report,
+    })
+  }
+
+  private recordCompletedBackgroundSubAgentMemory(
+    session: ChatSession,
+    options: {
+      agentId: string
+      agentType?: string
+      parentToolCallId: string
+      status: string
+      resultText: string
+      durationMs: number
+      transcriptPath: string
+      resultPath: string
+    }
+  ): void {
+    this.upsertSubAgentSessionMemory(session, {
+      agentId: options.agentId,
+      agentType: options.agentType,
+      parentToolCallId: options.parentToolCallId,
+      status: options.status,
+      resultText: options.resultText,
+      durationMs: options.durationMs,
+      transcriptPath: options.transcriptPath,
+      resultPath: options.resultPath,
+    })
+  }
+
+  /**
+   * Record a sub-agent that was torn down before reaching a clean
+   * completion (aborted by a new user turn, cancelled via /abort,
+   * interrupted by stream-level recovery).
+   *
+   * Without this entry the parent agent has no signal that the
+   * sub-agent ran at all on its next turn, and may re-spawn the same
+   * task. claude-code achieves the same effect through the running
+   * task_status attachment (`createAsyncAgentAttachmentsIfNeeded`);
+   * we surface the breadcrumb directly in session memory because our
+   * sub-agent context is cleared the moment we abort.
+   *
+   * `weight` is below the success path (96) so a successful retry of
+   * the same agentId can supersede the abort entry on the next
+   * compaction cycle. Returns silently when the sub-agent context
+   * has no agentId (should not happen post-spawn, but keeps the
+   * call-site cheap).
+   */
+  private recordAbortedSubAgentMemory(
+    conversationId: string,
+    ctx: SubAgentContext,
+    status: "aborted" | "cancelled" | "interrupted",
+    reason: string
+  ): void {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) return
+    const reasonText = (reason || "").trim()
+    this.upsertSubAgentSessionMemory(session, {
+      agentId: ctx.subagentId,
+      parentToolCallId: ctx.parentToolCallId,
+      status,
+      durationMs: Math.max(0, Date.now() - ctx.startTime),
+      turnCount: ctx.turnCount,
+      toolCallCount: ctx.toolCallCount,
+      modifiedFiles: ctx.modifiedFiles,
+      resultText: reasonText
+        ? `[sub-agent ${status}] ${reasonText}`
+        : `[sub-agent ${status}]`,
+      // Keep the entry below the success path so a clean rerun wins.
+      weight: 80,
+    })
+  }
+
+  private upsertSubAgentSessionMemory(
+    session: ChatSession,
+    options: {
+      agentId: string
+      agentType?: string
+      parentToolCallId?: string
+      status: string
+      resultText?: string
+      durationMs?: number
+      turnCount?: number
+      toolCallCount?: number
+      modifiedFiles?: string[]
+      evidenceText?: string
+      transcriptPath?: string
+      resultPath?: string
+      /**
+       * Relative weight for the new entry. Defaults to 96 (success
+       * path). Abort/cancel/interrupt callers pass a lower weight so
+       * a successful retry of the same agent can supersede the
+       * abort entry on the next compaction cycle.
+       */
+      weight?: number
+    }
+  ): void {
+    const sourceCompactionId = buildSubAgentMemorySourceCompactionId(
+      options.agentId,
+      options.parentToolCallId
+    )
+    if (!sourceCompactionId) {
+      // No agentId AND no parentToolCallId — the entry would have no
+      // stable dedup key and would accumulate forever. Skip.
+      return
+    }
+
+    const evidence = options.evidenceText
+      ? this.extractSubAgentEvidenceLines(options.evidenceText).join(" ")
+      : ""
+    const formatInput: SubAgentMemoryFormatInput = {
+      agentId: options.agentId,
+      agentType: options.agentType,
+      status: options.status,
+      turnCount: options.turnCount,
+      toolCallCount: options.toolCallCount,
+      durationMs: options.durationMs,
+      modifiedFiles: options.modifiedFiles,
+      resultText: options.resultText,
+      evidenceText: evidence || undefined,
+      transcriptPath: options.transcriptPath,
+      resultPath: options.resultPath,
+    }
+    const text = formatSubAgentMemoryEntry(formatInput)
+    if (!text) {
+      // formatSubAgentMemoryEntry only returns null when agentId is
+      // empty. We already guarded above via sourceCompactionId, but
+      // if the caller relied on parentToolCallId fallback the
+      // formatter still requires agentId — drop in that case rather
+      // than emitting a malformed entry.
+      return
+    }
+
+    // Match by stable sourceCompactionId. Earlier versions used
+    // `text.includes("agentId=...")` which collided when (a) the
+    // same agentId appeared inside another entry's evidence text,
+    // or (b) the dedup key fell back to parentToolCallId and a
+    // later update brought the real agentId.
+    const existingIndex = session.contextState.sessionMemory.findIndex(
+      (entry) =>
+        entry.kind === "sub_agent" &&
+        entry.sourceCompactionId === sourceCompactionId
+    )
+    const entry: ContextSessionMemoryEntry = {
+      id:
+        existingIndex >= 0
+          ? session.contextState.sessionMemory[existingIndex]!.id
+          : `subagent_${crypto.randomUUID()}`,
+      kind: "sub_agent",
+      text,
+      sourceCompactionId,
+      sourceRecordId: options.parentToolCallId,
+      createdAt: Date.now(),
+      weight:
+        typeof options.weight === "number" && Number.isFinite(options.weight)
+          ? Math.max(0, Math.floor(options.weight))
+          : 96,
+    }
+
+    if (existingIndex >= 0) {
+      session.contextState.sessionMemory[existingIndex] = entry
+    } else {
+      session.contextState.sessionMemory.push(entry)
+    }
+    session.contextState.sessionMemory = session.contextState.sessionMemory
+      .sort((a, b) => b.weight - a.weight || b.createdAt - a.createdAt)
+      .slice(0, 64)
+      .sort((a, b) => a.createdAt - b.createdAt)
+    this.sessionManager.markContextStateDirty(session.conversationId)
+  }
+
+  private extractSubAgentEvidenceLines(text: string): string[] {
+    const lines = text
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter(Boolean)
+    const start = lines.findIndex((line) =>
+      /^(?:Key tool evidence:|Tool calls:)/i.test(line)
+    )
+    if (start < 0) return []
+    return lines
+      .slice(start + 1)
+      .filter((line) => /^\d+\.\s+/.test(line))
+      .slice(0, 6)
   }
 
   /**
@@ -13963,29 +15500,26 @@ ${raw}
 
     try {
       const session = this.sessionManager.getSession(conversationId)
-      if (!this.latestUserExplicitlyRequestsImageGeneration(session)) {
-        const message =
-          "generate_image blocked: latest user message did not explicitly request image creation"
-        this.logger.warn(`${message}; prompt_preview=${prompt.slice(0, 160)}`)
-        return {
-          content: `[generate_image error] ${message}`,
-          state: { status: "error", message },
-        }
-      }
       const filePath =
         this.pickFirstString(input, ["filePath", "file_path", "path"]) || ""
       const outputFormat =
         this.pickFirstString(input, ["outputFormat", "output_format"]) || "png"
-      const result = await this.codexService.generateImage({
+      const referenceImagePaths =
+        this.pickStringArray(input, ["referenceImagePaths"]).length > 0
+          ? this.pickStringArray(input, ["referenceImagePaths"])
+          : this.pickStringArray(input, ["reference_image_paths"])
+      const projectRoot = session?.projectContext?.rootPath || process.cwd()
+      const result = await this.imageGenerationService.generateImage({
         prompt,
         model: session?.model,
         conversationId,
         outputFormat,
+        referenceImagePaths,
+        projectRoot,
       })
 
       let savedPath = filePath
       if (filePath) {
-        const projectRoot = session?.projectContext?.rootPath || process.cwd()
         const absolutePath = path.isAbsolute(filePath)
           ? filePath
           : path.resolve(projectRoot, filePath)
@@ -14004,8 +15538,11 @@ ${raw}
         ? `\nrevised_prompt: ${result.revisedPrompt}`
         : ""
       const pathLine = savedPath ? `\nfile_path: ${savedPath}` : ""
+      const providerLine = result.provider
+        ? `\nprovider: ${result.provider}`
+        : ""
       return {
-        content: `[generate_image success]${pathLine}${revisedPromptLine}`,
+        content: `[generate_image success]${pathLine}${providerLine}${revisedPromptLine}`,
         state: { status: "success" },
         extraData: {
           generateImageSuccess: {
@@ -14378,6 +15915,10 @@ ${raw}
   }
 
   private resolveWorkspaceRoot(conversationId: string): string {
+    const allowedRoots =
+      this.sessionManager.listAllowedWorkspaceRoots(conversationId)
+    const firstAllowed = allowedRoots[0]
+    if (firstAllowed) return firstAllowed
     const session = this.sessionManager.getSession(conversationId)
     const root = session?.projectContext?.rootPath
     return typeof root === "string" && root.trim() !== "" ? root : process.cwd()
@@ -14388,40 +15929,73 @@ ${raw}
     filePath: string
   ): string {
     const rootPath = this.resolveWorkspaceRoot(conversationId)
-    const normalizedRoot = path.resolve(rootPath)
     return path.isAbsolute(filePath)
-      ? path.resolve(filePath)
-      : path.resolve(normalizedRoot, filePath)
+      ? normalizePathForBoundaryCheck(filePath)
+      : normalizePathForBoundaryCheck(path.resolve(rootPath, filePath))
   }
 
-  private resolvePathForWorkspaceBoundaryCheck(candidatePath: string): string {
-    try {
-      return realpathSync(candidatePath)
-    } catch {
-      return path.resolve(candidatePath)
-    }
-  }
-
-  private isPathWithinWorkspaceRoot(
+  private listAllowedWorkspaceRootsForMessage(
     conversationId: string,
-    candidatePath: string
+    allowedRootsOverride?: string[]
+  ): string[] {
+    if (allowedRootsOverride && allowedRootsOverride.length > 0) {
+      return allowedRootsOverride
+    }
+    const roots = this.sessionManager.listAllowedWorkspaceRoots(conversationId)
+    if (roots.length > 0) return roots
+    return [this.resolveWorkspaceRoot(conversationId)]
+  }
+
+  private isPathWithinAllowedWorkspaceRoots(
+    conversationId: string,
+    candidatePath: string,
+    allowedRootsOverride?: string[]
   ): boolean {
-    const normalizedRoot = this.resolvePathForWorkspaceBoundaryCheck(
-      this.resolveWorkspaceRoot(conversationId)
+    return isPathWithinAllowedRoots(
+      candidatePath,
+      this.listAllowedWorkspaceRootsForMessage(
+        conversationId,
+        allowedRootsOverride
+      )
     )
-    const normalizedCandidate =
-      this.resolvePathForWorkspaceBoundaryCheck(candidatePath)
-    const relative = path.relative(normalizedRoot, normalizedCandidate)
+  }
+
+  private formatAllowedWorkspaceRootsForError(
+    conversationId: string,
+    allowedRootsOverride?: string[]
+  ): string {
+    return this.listAllowedWorkspaceRootsForMessage(
+      conversationId,
+      allowedRootsOverride
+    )
+      .map((root) => `- ${root}`)
+      .join("\n")
+  }
+
+  private formatAdditionalWorkingDirectoriesPrompt(
+    allowedWorkspaceRoots: string[],
+    primaryWorkspaceRoot?: string
+  ): string {
+    // Only inject roots that are genuinely "additional" — i.e. not
+    // the primary workspace root the sub-agent already uses as cwd.
+    // Including the primary root would waste tokens and mislead the
+    // LLM into thinking it's an "extra" directory.
+    const additional = primaryWorkspaceRoot
+      ? allowedWorkspaceRoots.filter((root) => root !== primaryWorkspaceRoot)
+      : allowedWorkspaceRoots
+    if (additional.length === 0) return ""
     return (
-      relative === "" ||
-      (!relative.startsWith("..") && !path.isAbsolute(relative))
+      "\n\nAdditional working directories (you may read/search/list files in these paths):\n" +
+      additional.map((root) => `- ${root}`).join("\n") +
+      "\n"
     )
   }
 
   private async executeSubAgentBridgeInlineTool(
     conversationId: string,
     toolName: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    allowedRootsOverride?: string[]
   ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -14429,13 +16003,25 @@ ${raw}
   } | null> {
     switch (toolName) {
       case "grep_search":
-        return this.executeInlineSubAgentGrepSearch(conversationId, input)
+        return this.executeInlineSubAgentGrepSearch(
+          conversationId,
+          input,
+          allowedRootsOverride
+        )
       case "read_file":
       case "read_file_v2":
-        return this.executeInlineSubAgentReadFile(conversationId, input)
+        return this.executeInlineSubAgentReadFile(
+          conversationId,
+          input,
+          allowedRootsOverride
+        )
       case "list_directory":
       case "list_dir":
-        return this.executeInlineSubAgentListDirectory(conversationId, input)
+        return this.executeInlineSubAgentListDirectory(
+          conversationId,
+          input,
+          allowedRootsOverride
+        )
       case "run_terminal_command":
       case "run_terminal_command_v2":
         // Cursor IDE's ExecServerMessage shell path does not respond to
@@ -14461,7 +16047,8 @@ ${raw}
   private buildSubAgentWorkspaceTarget(
     conversationId: string,
     requestedPath: string | undefined,
-    fallbackToRoot: boolean
+    fallbackToRoot: boolean,
+    allowedRootsOverride?: string[]
   ):
     | { rootPath: string; absPath: string; displayPath: string }
     | { error: string; message: string } {
@@ -14474,18 +16061,33 @@ ${raw}
     const absPath = rawPath
       ? this.resolveWorkspaceFilePath(conversationId, rawPath)
       : rootPath
-    if (!this.isPathWithinWorkspaceRoot(conversationId, absPath)) {
+    if (
+      !this.isPathWithinAllowedWorkspaceRoots(
+        conversationId,
+        absPath,
+        allowedRootsOverride
+      )
+    ) {
       return {
         error: "path outside workspace",
-        message: `Path must stay within the active workspace: ${rawPath || absPath}`,
+        message:
+          `Path must stay within one of the allowed working directories: ${rawPath || absPath}\n\n` +
+          `Allowed working directories:\n${this.formatAllowedWorkspaceRootsForError(conversationId, allowedRootsOverride)}\n\n` +
+          `To grant access to another directory, add it to the Cursor workspace or call ` +
+          `POST /api/context/${conversationId}/working-directories with { "paths": ["/path/to/dir"] }.`,
       }
     }
 
+    const displayRoot =
+      this.listAllowedWorkspaceRootsForMessage(
+        conversationId,
+        allowedRootsOverride
+      ).find((root) => isPathWithinAllowedRoots(absPath, [root])) || rootPath
     const relPath = path
-      .relative(path.resolve(rootPath), path.resolve(absPath))
+      .relative(path.resolve(displayRoot), path.resolve(absPath))
       .replace(/\\/g, "/")
     return {
-      rootPath,
+      rootPath: displayRoot,
       absPath,
       displayPath: relPath.length > 0 ? relPath : ".",
     }
@@ -14493,7 +16095,8 @@ ${raw}
 
   private executeInlineSubAgentGrepSearch(
     conversationId: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    allowedRootsOverride?: string[]
   ): {
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -14517,7 +16120,8 @@ ${raw}
     const target = this.buildSubAgentWorkspaceTarget(
       conversationId,
       this.pickToolPath(input) || undefined,
-      true
+      true,
+      allowedRootsOverride
     )
     if ("error" in target) {
       return {
@@ -14662,7 +16266,8 @@ ${raw}
 
   private executeInlineSubAgentReadFile(
     conversationId: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    allowedRootsOverride?: string[]
   ): {
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -14671,7 +16276,8 @@ ${raw}
     const target = this.buildSubAgentWorkspaceTarget(
       conversationId,
       this.pickToolPath(input) || undefined,
-      false
+      false,
+      allowedRootsOverride
     )
     if ("error" in target) {
       return {
@@ -14749,7 +16355,8 @@ ${raw}
 
   private async executeInlineSubAgentListDirectory(
     conversationId: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    allowedRootsOverride?: string[]
   ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -14758,7 +16365,8 @@ ${raw}
     const target = this.buildSubAgentWorkspaceTarget(
       conversationId,
       this.pickToolPath(input) || ".",
-      true
+      true,
+      allowedRootsOverride
     )
     if ("error" in target) {
       return {
@@ -15774,12 +17382,14 @@ ${raw}
       conversationId,
       requestedPath
     )
-    if (!this.isPathWithinWorkspaceRoot(conversationId, resolvedPath)) {
+    if (!this.isPathWithinAllowedWorkspaceRoots(conversationId, resolvedPath)) {
       return {
-        content: `[view_image error] Path must stay within the active workspace: ${requestedPath}`,
+        content:
+          `[view_image error] Path must stay within one of the allowed working directories: ${requestedPath}\n\n` +
+          `Allowed working directories:\n${this.formatAllowedWorkspaceRootsForError(conversationId)}`,
         state: {
           status: "permission_denied",
-          message: "path outside active workspace",
+          message: "path outside allowed working directories",
         },
       }
     }
@@ -16041,20 +17651,21 @@ ${raw}
       "AGENTS.md",
       ".agent/rules.md",
     ]
-    const rules: Array<{ path: string; content: string }> = []
+    const diskRules: Array<{
+      path: string
+      content: string
+      source: "workspace_disk"
+    }> = []
     for (const candidate of candidates) {
       const snippet = await this.readWorkspaceFileSnippet(
         rootPath,
         candidate,
         3_500
       )
-      if (snippet) rules.push(snippet)
+      if (snippet) {
+        diskRules.push({ ...snippet, source: "workspace_disk" })
+      }
     }
-
-    input.rules = rules
-    input.total_count = rules.length
-    input.totalCount = rules.length
-    input.path = rules[0]?.path || ""
 
     const skillPolicy = this.cursorSkillsManager.resolvePolicy({
       rules: session?.cursorRules,
@@ -16064,6 +17675,40 @@ ${raw}
       projectRoot: session?.projectContext?.rootPath,
       contextPaths: (session?.codeChunks || []).map((chunk) => chunk.path),
     })
+
+    // Surface every rule that is actually injected into the LLM system
+    // prompt — `skillPolicy.promptRules` is the same source of truth used
+    // by `resolveEffectiveRulesForPrompt`. Without this the agent's
+    // `fetch_rules` self-inspection returns `total=0` even when the IDE
+    // has injected `global` / `fileGlobbed` / `manuallyAttached` rules
+    // that are constraining behaviour.
+    const idePromptRules = (skillPolicy.promptRules || []).map((rule) => ({
+      path: rule.fullPath || "(IDE-injected rule)",
+      content: this.truncateText(rule.content || "", 3_500),
+      source: "ide_injected" as const,
+      type: rule.type?.type.case || "unknown",
+    }))
+
+    // Dedup by content so a rule that exists both on disk and in the
+    // IDE-injected list isn't double-counted.
+    const seenContent = new Set<string>()
+    const allRules: Array<{
+      path: string
+      content: string
+      source: "workspace_disk" | "ide_injected"
+      type?: string
+    }> = []
+    for (const rule of [...diskRules, ...idePromptRules]) {
+      const key = rule.content.trim()
+      if (!key || seenContent.has(key)) continue
+      seenContent.add(key)
+      allRules.push(rule)
+    }
+
+    input.rules = allRules
+    input.total_count = allRules.length
+    input.totalCount = allRules.length
+    input.path = allRules[0]?.path || ""
 
     // 当 LLM 提供 query/description 时，用 minisearch 给 Skill 列表打分排序，
     // 把最相关的 Skill 排在最前面，缓解「不知道自己不知道」的问题。
@@ -16100,9 +17745,15 @@ ${raw}
     }
 
     const preview =
-      rules.length > 0
-        ? rules
-            .map((rule) => `Path: ${rule.path}\n${rule.content}`)
+      allRules.length > 0
+        ? allRules
+            .map((rule) => {
+              const header =
+                rule.source === "ide_injected"
+                  ? `[ide_injected${rule.type ? ` type=${rule.type}` : ""}] Path: ${rule.path}`
+                  : `[workspace_disk] Path: ${rule.path}`
+              return `${header}\n${rule.content}`
+            })
             .join("\n\n---\n\n")
         : "- (no rules found)"
     const skillPreview =
@@ -16119,7 +17770,7 @@ ${raw}
 
     return {
       content:
-        `[fetch_rules success] total=${rules.length}\n${preview}` +
+        `[fetch_rules success] total=${allRules.length}\n${preview}` +
         (skillPreview ? `\n\n${skillPreview}` : "") +
         searchPreview +
         (skillPolicy.availableSkills.length > 0
@@ -16206,7 +17857,8 @@ ${raw}
   }
 
   private async executeInlineFetchPullRequest(
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
   ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -16226,7 +17878,7 @@ ${raw}
       }
     }
     try {
-      const doc = await this.fetchUrlDocument(url)
+      const doc = await this.fetchUrlDocument(url, options?.abortSignal)
       const snippet =
         doc.content.length > 5_500
           ? `${doc.content.slice(0, 5_500)}\n...[truncated]`
@@ -16854,7 +18506,8 @@ ${raw}
     conversationId: string,
     family: DeferredToolFamily,
     toolName: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
   ): Promise<{
     content: string
     state: { status: ToolResultStatus; message?: string }
@@ -16877,13 +18530,13 @@ ${raw}
       )
     }
     if (family === "web_search" || family === "web_fetch") {
-      return this.executeInlineWebTool(conversationId, toolName, input)
+      return this.executeInlineWebTool(conversationId, toolName, input, options)
     }
     if (family === "list_mcp_resource_templates") {
       return Promise.resolve(this.executeInlineListMcpResourceTemplates(input))
     }
     if (family === "read_url_content") {
-      return this.executeInlineReadUrlContent(conversationId, input)
+      return this.executeInlineReadUrlContent(conversationId, input, options)
     }
     if (family === "view_content_chunk") {
       return this.executeInlineViewContentChunk(conversationId, input)
@@ -16892,7 +18545,7 @@ ${raw}
       return Promise.resolve(this.executeInlineViewImage(conversationId, input))
     }
     if (family === "fetch") {
-      return this.executeInlineFetch(input)
+      return this.executeInlineFetch(input, options)
     }
     if (family === "record_screen") {
       return Promise.resolve(this.executeInlineRecordScreen(input))
@@ -16901,10 +18554,10 @@ ${raw}
       return Promise.resolve(this.executeInlineComputerUse(input))
     }
     if (family === "exa_search") {
-      return this.executeInlineExaSearch(conversationId, input)
+      return this.executeInlineExaSearch(conversationId, input, options)
     }
     if (family === "exa_fetch") {
-      return this.executeInlineExaFetch(input)
+      return this.executeInlineExaFetch(input, options)
     }
     if (family === "get_mcp_tools") {
       return Promise.resolve(
@@ -16978,7 +18631,7 @@ ${raw}
       return this.executeInlineKnowledgeBase(conversationId, input)
     }
     if (family === "fetch_pull_request") {
-      return this.executeInlineFetchPullRequest(input)
+      return this.executeInlineFetchPullRequest(input, options)
     }
     if (family === "create_diagram") {
       return this.executeInlineCreateDiagram(input)
@@ -18226,8 +19879,17 @@ ${raw}
     // lifecycle envelope on bridge side and let read_todos run inline so
     // the assistant text stream stays clean. The model still receives the
     // tool result through the normal inline_tool_result path.
+    //
+    // `generate_image` also needs both channels. The InteractionQuery only
+    // carries the approval response; the actual image preview is rendered from
+    // the GenerateImageToolCall result emitted in toolCallCompleted.
     const UI_CARD_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
-      new Set<DeferredToolFamily>(["update_todos", "create_plan", "task"])
+      new Set<DeferredToolFamily>([
+        "update_todos",
+        "create_plan",
+        "task",
+        "generate_image",
+      ])
     if (family && UI_CARD_TOOL_FAMILIES.has(family)) {
       return undefined
     }
@@ -18375,7 +20037,13 @@ ${raw}
     )
     const canonicalToolName = canonicalInvocation.toolName
     const input = canonicalInvocation.input
-    const validationErrorMessage = canonicalInvocation.validationErrorMessage
+    const registeredValidatorError = this.runRegisteredToolInputValidator(
+      session,
+      canonicalToolName,
+      input
+    )
+    const validationErrorMessage =
+      canonicalInvocation.validationErrorMessage || registeredValidatorError
     const execDispatchResolution = validationErrorMessage
       ? { target: null, errorMessage: validationErrorMessage }
       : this.resolveExecDispatchTarget(session, canonicalToolName, input)
@@ -19422,11 +21090,14 @@ ${raw}
       {
         maxTokens: budget.maxTokens,
         systemPromptTokens: budget.systemPromptTokens,
+        autoCompactTokenLimit: budget.autoCompactTokenLimit,
       },
       {
         contextLabel: `tool continuation preflight: ${conversationId}`,
+        model: route.model,
         pendingToolUseIds,
         strategy: "reactive",
+        dryRun: true,
       }
     )
     return {
@@ -21297,12 +22968,6 @@ ${raw}
       webSearchEnabled: parsed.useWeb,
       webFetchEnabled: parsed.useWeb,
     })
-    toolsToUse = this.filterImageGenerationToolsForTurn(
-      route.backend,
-      toolsToUse,
-      session,
-      `initial chat ${conversationId}`
-    )
 
     const mcpToolDefs =
       parsed.mcpToolDefs && parsed.mcpToolDefs.length > 0
@@ -21337,7 +23002,9 @@ ${raw}
     // anyway.
     const systemPrompt = useGoogleContextMessages
       ? this.buildGoogleSystemPrompt(parsed)
-      : this.buildSystemPrompt(parsed, apiToolsResult.deferred)
+      : route.backend === "codex"
+        ? this.buildCodexSystemPrompt(parsed, apiToolsResult.deferred)
+        : this.buildSystemPrompt(parsed, apiToolsResult.deferred)
 
     // Apply truncation to stay within token limits
     const budget = this.resolveMessageBudget(route.backend, {
@@ -21350,6 +23017,13 @@ ${raw}
       toolDefinitions: apiTools,
       model: session.model,
     })
+    await this.prepareContextWithCompactRunner(session, route, budget, {
+      contextLabel: `chat pre-send: ${conversationId}`,
+      model: route.model,
+      pendingToolUseIds,
+      toolDefinitions: apiTools,
+      strategy: "auto",
+    })
 
     const messages = this.truncateMessagesForBackend(
       session,
@@ -21357,9 +23031,12 @@ ${raw}
       {
         maxTokens: budget.maxTokens,
         systemPromptTokens: budget.systemPromptTokens,
+        autoCompactTokenLimit: budget.autoCompactTokenLimit,
+        predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
       },
       {
         contextLabel: `chat pre-send: ${conversationId}`,
+        model: route.model,
         pendingToolUseIds,
         strategy: "auto",
       }
@@ -21404,9 +23081,13 @@ ${raw}
             {
               maxTokens: routeBudget.maxTokens,
               systemPromptTokens: routeBudget.systemPromptTokens,
+              autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
+              predictiveCompactTokenLimit:
+                routeBudget.predictiveCompactTokenLimit,
             },
             {
               contextLabel: `chat pre-send: ${conversationId}`,
+              model: streamRoute.model,
               pendingToolUseIds,
               strategy: "auto",
             }
@@ -21434,9 +23115,13 @@ ${raw}
             {
               maxTokens: routeBudget.maxTokens,
               systemPromptTokens: routeBudget.systemPromptTokens,
+              autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
+              predictiveCompactTokenLimit:
+                routeBudget.predictiveCompactTokenLimit,
             },
             {
               contextLabel: `chat pre-send: ${conversationId}`,
+              model: streamRoute.model,
               pendingToolUseIds,
               strategy: "auto",
             }
@@ -21451,6 +23136,45 @@ ${raw}
       const stream = this.getBackendStream(route.model, {
         buildDtoForRoute: buildChatDtoForRoute,
         buildCodexRequestForRoute: buildChatCodexRequestForRoute,
+        prepareContextForRoute: async (streamRoute, hints) => {
+          const streamUseGoogleContextMessages = this.isCloudCodeBackend(
+            streamRoute.backend
+          )
+          const streamContextMessages =
+            streamUseGoogleContextMessages && conversationId
+              ? this.buildGoogleContextMessages(parsed, conversationId)
+              : []
+          const streamSystemPrompt = streamUseGoogleContextMessages
+            ? this.buildGoogleSystemPrompt(parsed)
+            : streamRoute.backend === "codex"
+              ? this.buildCodexSystemPrompt(parsed, apiToolsResult.deferred)
+              : this.buildSystemPrompt(parsed, apiToolsResult.deferred)
+          const streamBudget = this.resolveMessageBudget(streamRoute.backend, {
+            parsed,
+            session,
+            protectedContextTokens: streamContextMessages.length
+              ? this.tokenCounter.countMessages(
+                  streamContextMessages as UnifiedMessage[]
+                )
+              : 0,
+            systemPrompt: streamSystemPrompt,
+            toolDefinitions: apiTools,
+            model: session.model,
+            budgetOverride: hints?.budgetOverride,
+          })
+          await this.prepareContextWithCompactRunner(
+            session,
+            streamRoute,
+            streamBudget,
+            {
+              contextLabel: `chat pre-send: ${conversationId}`,
+              model: streamRoute.model,
+              pendingToolUseIds,
+              toolDefinitions: apiTools,
+              strategy: hints?.budgetOverride ? "reactive" : "auto",
+            }
+          )
+        },
         streamAbortBinding:
           streamId && conversationId
             ? {
@@ -22150,19 +23874,13 @@ ${raw}
           webFetchEnabled: activeSession.useWeb,
         }
       )
-      const filteredToolsToUse = this.filterImageGenerationToolsForTurn(
-        route.backend,
-        toolsToUse,
-        activeSession,
-        `shell continuation ${conversationId}`
-      )
-      if (filteredToolsToUse.length === 0) {
+      if (toolsToUse.length === 0) {
         this.logger.warn(
           "Tool-result continuation running with empty supportedTools (strict mode)"
         )
       }
 
-      const apiToolsResult = buildToolsForApiWithDefer(filteredToolsToUse, {
+      const apiToolsResult = buildToolsForApiWithDefer(toolsToUse, {
         mcpToolDefs: activeSession.mcpToolDefs,
         backend: route.backend,
         subagentDefinitions:
@@ -22213,9 +23931,13 @@ ${raw}
               {
                 maxTokens: routeBudget.maxTokens,
                 systemPromptTokens: routeBudget.systemPromptTokens,
+                autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
+                predictiveCompactTokenLimit:
+                  routeBudget.predictiveCompactTokenLimit,
               },
               {
                 contextLabel: `shell continuation: ${conversationId}`,
+                model: streamRoute.model,
                 pendingToolUseIds: remainingPendingToolUseIds,
                 strategy: "reactive",
               }
@@ -22243,9 +23965,13 @@ ${raw}
               {
                 maxTokens: routeBudget.maxTokens,
                 systemPromptTokens: routeBudget.systemPromptTokens,
+                autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
+                predictiveCompactTokenLimit:
+                  routeBudget.predictiveCompactTokenLimit,
               },
               {
                 contextLabel: `shell continuation: ${conversationId}`,
+                model: streamRoute.model,
                 pendingToolUseIds: remainingPendingToolUseIds,
                 strategy: "reactive",
               }
@@ -22258,6 +23984,52 @@ ${raw}
         const stream = this.getBackendStream(route.model, {
           buildDtoForRoute: buildShellContinuationDtoForRoute,
           buildCodexRequestForRoute: buildShellContinuationCodexRequestForRoute,
+          prepareContextForRoute: async (streamRoute, hints) => {
+            const useGoogleMessages = this.isCloudCodeBackend(
+              streamRoute.backend
+            )
+            const contextMessages = useGoogleMessages
+              ? this.buildGoogleContextMessages(activeSession, conversationId)
+              : []
+            const systemPrompt = useGoogleMessages
+              ? this.buildGoogleSystemPrompt(activeSession)
+              : streamRoute.backend === "codex"
+                ? this.buildCodexSystemPrompt(
+                    activeSession,
+                    activeSession.deferredToolCatalog
+                  )
+                : this.buildSystemPrompt(
+                    activeSession,
+                    activeSession.deferredToolCatalog
+                  )
+            const streamBudget = this.resolveMessageBudget(
+              streamRoute.backend,
+              {
+                session: activeSession,
+                protectedContextTokens: contextMessages.length
+                  ? this.tokenCounter.countMessages(
+                      contextMessages as UnifiedMessage[]
+                    )
+                  : 0,
+                systemPrompt,
+                toolDefinitions: apiTools,
+                model: activeSession.model,
+                budgetOverride: hints?.budgetOverride,
+              }
+            )
+            await this.prepareContextWithCompactRunner(
+              activeSession,
+              streamRoute,
+              streamBudget,
+              {
+                contextLabel: `shell continuation: ${conversationId}`,
+                model: streamRoute.model,
+                pendingToolUseIds: remainingPendingToolUseIds,
+                toolDefinitions: apiTools,
+                strategy: "reactive",
+              }
+            )
+          },
           streamAbortBinding: pendingToolCall.streamId
             ? {
                 conversationId,
@@ -23321,23 +25093,33 @@ ${raw}
               /server\s+"[^"]*"\s+not\s+found/i.test(errorMessage) ||
               /not\s+found/i.test(errorMessage)
             const session = this.sessionManager.getSession(conversationId)
-            const mountedProviders = new Set<string>(
-              (session?.mcpToolDefs || [])
-                .map((def) =>
-                  normalizeMcpToolIdentifier(def.providerIdentifier || "")
-                )
-                .filter((value) => value.length > 0)
-            )
+            // Mounted server set: each def's IDE-registry key (computed
+            // once at parse time in `cursor-request-parser.ts`).
+            // Falls back to the raw `providerIdentifier` when a def
+            // didn't yield a usable key. The set drives the degrade
+            // heuristic below so we only rewrite "not found" → empty
+            // success when the requested server actually IS mounted in
+            // this session (i.e. healthy tool-only server with no
+            // resource surface). Genuine "server unmounted" errors are
+            // preserved verbatim — mirrors claude-code's
+            // ListMcpResourcesTool contract of letting the model see
+            // the available-servers hint and self-correct.
+            const mountedProviders = new Set<string>()
+            for (const def of session?.mcpToolDefs || []) {
+              const key = (
+                def?.ideRegistryKey ||
+                def?.providerIdentifier ||
+                ""
+              ).trim()
+              if (!key) continue
+              const normalized = normalizeMcpToolIdentifier(key)
+              if (normalized) mountedProviders.add(normalized)
+            }
             const normalizedRequested =
               normalizeMcpToolIdentifier(requestedServer)
             const requestedServerIsMounted =
               normalizedRequested.length > 0 &&
-              (mountedProviders.has(normalizedRequested) ||
-                Array.from(mountedProviders).some(
-                  (mounted) =>
-                    mounted.includes(normalizedRequested) ||
-                    normalizedRequested.includes(mounted)
-                ))
+              mountedProviders.has(normalizedRequested)
 
             if (looksLikeNotFound && requestedServerIsMounted) {
               this.logger.debug(
@@ -23610,21 +25392,14 @@ ${raw}
           webFetchEnabled: activeSession.useWeb,
         }
       )
-      const filteredToolsForContinuation =
-        this.filterImageGenerationToolsForTurn(
-          route.backend,
-          toolsForContinuation,
-          activeSession,
-          `tool continuation ${conversationId}`
-        )
-      if (filteredToolsForContinuation.length === 0) {
+      if (toolsForContinuation.length === 0) {
         this.logger.warn(
           "Continuation generation running with empty supportedTools (strict mode)"
         )
       }
 
       const allContinuationToolsResult = buildToolsForApiWithDefer(
-        filteredToolsForContinuation,
+        toolsForContinuation,
         {
           mcpToolDefs: activeSession.mcpToolDefs,
           backend: route.backend,
@@ -23704,9 +25479,13 @@ ${raw}
               {
                 maxTokens: routeBudget.maxTokens,
                 systemPromptTokens: routeBudget.systemPromptTokens,
+                autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
+                predictiveCompactTokenLimit:
+                  routeBudget.predictiveCompactTokenLimit,
               },
               {
                 contextLabel: `tool continuation: ${conversationId}`,
+                model: streamRoute.model,
                 pendingToolUseIds: remainingPendingToolUseIds,
                 strategy: "reactive",
               }
@@ -23735,9 +25514,13 @@ ${raw}
               {
                 maxTokens: routeBudget.maxTokens,
                 systemPromptTokens: routeBudget.systemPromptTokens,
+                autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
+                predictiveCompactTokenLimit:
+                  routeBudget.predictiveCompactTokenLimit,
               },
               {
                 contextLabel: `tool continuation: ${conversationId}`,
+                model: streamRoute.model,
                 pendingToolUseIds: remainingPendingToolUseIds,
                 strategy: "reactive",
               }
@@ -23750,6 +25533,54 @@ ${raw}
       const stream = this.getBackendStream(route.model, {
         buildDtoForRoute: buildContinuationDtoForRoute,
         buildCodexRequestForRoute: buildContinuationCodexRequestForRoute,
+        prepareContextForRoute: async (streamRoute, hints) => {
+          const useGoogleMessages = this.isCloudCodeBackend(streamRoute.backend)
+          const contextMessages = useGoogleMessages
+            ? this.buildGoogleContextMessages(activeSession, conversationId)
+            : []
+          const baseSystemPrompt = useGoogleMessages
+            ? this.buildGoogleSystemPrompt(activeSession)
+            : streamRoute.backend === "codex"
+              ? this.buildCodexSystemPrompt(
+                  activeSession,
+                  activeSession.deferredToolCatalog
+                )
+              : this.buildSystemPrompt(
+                  activeSession,
+                  activeSession.deferredToolCatalog
+                )
+          const systemPrompt = additionalSystemPrompt
+            ? [baseSystemPrompt, additionalSystemPrompt]
+                .filter(
+                  (part) => typeof part === "string" && part.trim().length > 0
+                )
+                .join("\n\n")
+            : baseSystemPrompt
+          const streamBudget = this.resolveMessageBudget(streamRoute.backend, {
+            session: activeSession,
+            protectedContextTokens: contextMessages.length
+              ? this.tokenCounter.countMessages(
+                  contextMessages as UnifiedMessage[]
+                )
+              : 0,
+            systemPrompt,
+            toolDefinitions: continuationTools,
+            model: activeSession.model,
+            budgetOverride: hints?.budgetOverride,
+          })
+          await this.prepareContextWithCompactRunner(
+            activeSession,
+            streamRoute,
+            streamBudget,
+            {
+              contextLabel: `tool continuation: ${conversationId}`,
+              model: streamRoute.model,
+              pendingToolUseIds: remainingPendingToolUseIds,
+              toolDefinitions: continuationTools,
+              strategy: "reactive",
+            }
+          )
+        },
         streamAbortBinding: options.streamId
           ? {
               conversationId,
@@ -23784,6 +25615,60 @@ ${raw}
           const retryStream = this.getBackendStream(route.model, {
             buildDtoForRoute: buildContinuationDtoForRoute,
             buildCodexRequestForRoute: buildContinuationCodexRequestForRoute,
+            prepareContextForRoute: async (streamRoute, hints) => {
+              const useGoogleMessages = this.isCloudCodeBackend(
+                streamRoute.backend
+              )
+              const contextMessages = useGoogleMessages
+                ? this.buildGoogleContextMessages(activeSession, conversationId)
+                : []
+              const baseSystemPrompt = useGoogleMessages
+                ? this.buildGoogleSystemPrompt(activeSession)
+                : streamRoute.backend === "codex"
+                  ? this.buildCodexSystemPrompt(
+                      activeSession,
+                      activeSession.deferredToolCatalog
+                    )
+                  : this.buildSystemPrompt(
+                      activeSession,
+                      activeSession.deferredToolCatalog
+                    )
+              const systemPrompt = additionalSystemPrompt
+                ? [baseSystemPrompt, additionalSystemPrompt]
+                    .filter(
+                      (part) =>
+                        typeof part === "string" && part.trim().length > 0
+                    )
+                    .join("\n\n")
+                : baseSystemPrompt
+              const streamBudget = this.resolveMessageBudget(
+                streamRoute.backend,
+                {
+                  session: activeSession,
+                  protectedContextTokens: contextMessages.length
+                    ? this.tokenCounter.countMessages(
+                        contextMessages as UnifiedMessage[]
+                      )
+                    : 0,
+                  systemPrompt,
+                  toolDefinitions: continuationTools,
+                  model: activeSession.model,
+                  budgetOverride: hints?.budgetOverride,
+                }
+              )
+              await this.prepareContextWithCompactRunner(
+                activeSession,
+                streamRoute,
+                streamBudget,
+                {
+                  contextLabel: `tool continuation retry: ${conversationId}`,
+                  model: streamRoute.model,
+                  pendingToolUseIds: remainingPendingToolUseIds,
+                  toolDefinitions: continuationTools,
+                  strategy: "reactive",
+                }
+              )
+            },
             streamAbortBinding: options.streamId
               ? {
                   conversationId,
@@ -25099,82 +26984,6 @@ ${raw}
     "- Exception: code comments and commit messages default to English unless the user specifies otherwise.",
   ].join("\n")
 
-  private static readonly INTENT_FAILURE_TERMS = [
-    "why",
-    "failed",
-    "failure",
-    "error",
-    "unexpected",
-    "accidental",
-    "accidentally",
-    "triggered",
-    "debug",
-    "diagnose",
-    "investigate",
-    "log",
-    "为何",
-    "为什么",
-    "怎么回事",
-    "意外",
-    "触发",
-    "失败",
-    "报错",
-    "错误",
-    "故障",
-    "问题",
-    "排查",
-    "日志",
-    "总是",
-  ] as const
-
-  private static readonly REQUEST_PREFIX_TERMS = [
-    "please",
-    "can you",
-    "help me",
-    "帮我",
-    "请",
-    "直接",
-    "给我",
-    "为我",
-  ] as const
-
-  private static readonly IMAGE_TARGET_TERMS = [
-    "image",
-    "picture",
-    "photo",
-    "illustration",
-    "diagram",
-    "logo",
-    "icon",
-    "poster",
-    "mockup",
-    "visual",
-    "图片",
-    "图像",
-    "图标",
-    "示意图",
-    "插图",
-    "海报",
-    "头像",
-    "视觉",
-  ] as const
-
-  private static readonly IMAGE_ACTION_TERMS = [
-    "generate",
-    "create",
-    "draw",
-    "make",
-    "render",
-    "design",
-    "生成",
-    "创建",
-    "绘制",
-    "画",
-    "制作",
-    "做",
-    "设计",
-  ] as const
-
   /**
    * Build system prompt from context.
    *
@@ -25294,7 +27103,9 @@ ${raw}
         "in this list."
     )
     lines.push("")
-    for (const entry of deferredCatalog) {
+    for (const entry of [...deferredCatalog].sort((a, b) =>
+      a.name.localeCompare(b.name)
+    )) {
       const summary = entry.oneLineDescription || "(no description)"
       lines.push(`- ${entry.name}: ${summary}`)
     }
@@ -25302,7 +27113,10 @@ ${raw}
     return lines.join("\n")
   }
 
-  private buildCodexSystemPrompt(context: PromptContext): string {
+  private buildCodexSystemPrompt(
+    context: PromptContext,
+    deferredCatalog?: DeferredToolDescriptor[]
+  ): string {
     const parts: string[] = []
 
     if (context.customSystemPrompt) {
@@ -25357,6 +27171,11 @@ ${raw}
         return `--- ${chunk.path}${lineInfo} ---\n${chunk.content}`
       })
       parts.push("Code Context:\n" + chunkTexts.join("\n\n"))
+    }
+
+    const deferredSection = this.buildDeferredToolsSection(deferredCatalog)
+    if (deferredSection) {
+      parts.push(deferredSection)
     }
 
     parts.push(CursorConnectStreamService.LANGUAGE_INSTRUCTION)
@@ -25905,6 +27724,23 @@ ${raw}
     }
 
     return defaultServiceTier
+  }
+
+  private shouldSuppressThinkingSummaryForRoute(
+    backend: BackendType,
+    requestedModelParameters: Record<string, string> | undefined,
+    explicitSuppress?: boolean
+  ): boolean {
+    if (explicitSuppress === true) {
+      return true
+    }
+    if (backend !== "codex") {
+      return false
+    }
+    return (
+      this.resolveRequestedCodexServiceTier(requestedModelParameters) ===
+      "priority"
+    )
   }
 
   private normalizeRequestedReasoningEffort(

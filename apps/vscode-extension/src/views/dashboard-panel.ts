@@ -29,6 +29,7 @@ import { NetworkManager } from "../services/network-manager"
 import { startOAuthFlow } from "../services/oauth-service"
 import { detectCurrentAntigravityVersion } from "../utils/antigravity-version"
 import { detectCurrentCursorVersion } from "../utils/cursor-version"
+import { detectCurrentKiroVersion } from "../utils/kiro-version"
 import { logger } from "../utils/logger"
 import { getCursorProductMetadata } from "../utils/platform"
 
@@ -70,6 +71,7 @@ type DashboardOverviewPayload = {
 type DashboardVersionPayload = {
   extensionVersion: string
   currentAntigravityVersion: string
+  currentKiroVersion: string
   currentCursorVersion: string
   compatibleCursorVersion: string
 }
@@ -2495,12 +2497,14 @@ export class DashboardPanel {
           : "unknown"
       const currentAntigravityVersion =
         detectCurrentAntigravityVersion() || "unknown"
+      const currentKiroVersion = detectCurrentKiroVersion() || "unknown"
       const currentCursorVersion =
         detectCurrentCursorVersion() || compatibleCursorVersion
 
       return {
         extensionVersion,
         currentAntigravityVersion,
+        currentKiroVersion,
         currentCursorVersion,
         compatibleCursorVersion,
       }
@@ -2511,6 +2515,7 @@ export class DashboardPanel {
       return {
         extensionVersion: "unknown",
         currentAntigravityVersion: "unknown",
+        currentKiroVersion: "unknown",
         currentCursorVersion: "unknown",
         compatibleCursorVersion: "unknown",
       }

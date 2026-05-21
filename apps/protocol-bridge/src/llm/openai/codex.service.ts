@@ -56,6 +56,7 @@ import {
   type PersistedBackendAccountState,
 } from "../shared/backend-account-state-store"
 import { PersistenceService } from "../../persistence"
+import type { CodexReplacementHistoryItem } from "../../context"
 import {
   BackendPoolEntryState,
   BackendPoolStatus,
@@ -89,6 +90,7 @@ import {
   type CodexInputMessage,
   type CodexRequest,
 } from "./codex-request-builder"
+import { getCodexIncrementalInput } from "./codex-incremental"
 import { createCodexExecutionRequestFromClaude } from "./codex-request-translator"
 import {
   createStreamState,
@@ -1101,55 +1103,20 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     lastResponse: CodexLastResponse,
     allowEmptyDelta: boolean
   ): CodexInputItem[] | undefined {
-    const previousWithoutInput =
-      this.stripRequestInputForIncrementalCompare(previousRequest)
-    const requestWithoutInput =
-      this.stripRequestInputForIncrementalCompare(request)
-    if (
-      JSON.stringify(previousWithoutInput) !==
-      JSON.stringify(requestWithoutInput)
-    ) {
+    const result = getCodexIncrementalInput(
+      request,
+      previousRequest,
+      lastResponse,
+      allowEmptyDelta
+    )
+    if (!result.ok) {
+      this.logger.debug(
+        `[Codex][TurnContext] Incremental request unavailable: ${result.reason}`
+      )
       return undefined
     }
 
-    const previousInput = this.getCodexInputItems(previousRequest)
-    const requestInput = this.getCodexInputItems(request)
-    const baseline = [...previousInput, ...lastResponse.itemsAdded]
-    if (
-      requestInput.length < baseline.length ||
-      (!allowEmptyDelta && requestInput.length === baseline.length)
-    ) {
-      return undefined
-    }
-
-    for (let index = 0; index < baseline.length; index++) {
-      if (
-        JSON.stringify(requestInput[index]) !== JSON.stringify(baseline[index])
-      ) {
-        return undefined
-      }
-    }
-
-    return requestInput.slice(baseline.length)
-  }
-
-  private stripRequestInputForIncrementalCompare(
-    request: Record<string, unknown>
-  ): Record<string, unknown> {
-    const {
-      input: _input,
-      previous_response_id: _previousResponseId,
-      ...withoutInput
-    } = request
-    return withoutInput
-  }
-
-  private getCodexInputItems(
-    request: Record<string, unknown>
-  ): CodexInputItem[] {
-    return Array.isArray(request.input)
-      ? (request.input as CodexInputItem[])
-      : []
+    return result.input
   }
 
   private convertResponseOutputItemToInputItem(
@@ -1236,6 +1203,62 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
       context.lastResponse = undefined
       context.lastRequest = undefined
+    }
+  }
+
+  /**
+   * Reset Codex continuation state after the model-facing transcript was
+   * rewritten by compaction, snip, microcompact, or hard-fit projection.
+   *
+   * This mirrors Codex CLI's ModelClientSession.reset_websocket_session():
+   * once history is rewritten, the previous WebSocket response chain is no
+   * longer a valid baseline for previous_response_id deltas.
+   */
+  resetConversationContinuationState(
+    conversationId: string | undefined,
+    modelName?: string,
+    reason?: string
+  ): void {
+    const normalizedConversationId = conversationId?.trim()
+    if (!normalizedConversationId) {
+      return
+    }
+
+    let resetCount = 0
+    const activeContext = this.activeTurnContexts.get(normalizedConversationId)
+    if (activeContext) {
+      this.resetTurnContextResponseState(normalizedConversationId, reason)
+      this.wsService.closeSession(activeContext.wsSessionId)
+      activeContext.connectionReused = false
+      resetCount++
+    }
+
+    const normalizedModel = modelName?.trim()
+    if (normalizedModel) {
+      for (const slot of this.accounts) {
+        const cacheKey = this.getCachedWsKey(
+          slot,
+          normalizedModel,
+          normalizedConversationId
+        )
+        const cached = this.cachedWsSessions.get(cacheKey)
+        if (!cached) {
+          continue
+        }
+        this.wsService.closeSession(cached.wsSessionId)
+        this.cachedWsSessions.delete(cacheKey)
+        resetCount++
+      }
+    }
+
+    this.warmupPayloadCache.delete(normalizedConversationId)
+
+    if (resetCount > 0 || reason) {
+      this.logger.debug(
+        `[Codex][TurnContext] Reset continuation state for ${normalizedConversationId}` +
+          `${normalizedModel ? ` model=${normalizedModel}` : ""}` +
+          `${reason ? `: ${reason}` : ""}`
+      )
     }
   }
 
@@ -1390,31 +1413,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     this.warmupPayloadCache.delete(normalizedConversationId)
     this.warmupPayloadCache.set(normalizedConversationId, entry)
     return entry.payload
-  }
-
-  /**
-   * Compute a request signature from the codexRequest.
-   * Mirrors the official get_incremental_items() pre-check (client.rs:909-930):
-   * compare the full request minus `input` and `previous_response_id`.
-   * If any non-input field changes (model, instructions, tools, reasoning,
-   * service_tier, parallel_tool_calls, include, text, etc.), the signature
-   * will differ and previous_response_id will NOT be reused.
-   */
-  private computeRequestSignature(
-    codexRequest: Record<string, unknown>
-  ): string {
-    // Destructure away fields that are expected to change between requests
-    const {
-      input: _input,
-      previous_response_id: _prevId,
-      generate: _generate,
-      ...requestWithoutInput
-    } = codexRequest
-    return crypto
-      .createHash("sha256")
-      .update(JSON.stringify(requestWithoutInput))
-      .digest("hex")
-      .slice(0, 16)
   }
 
   private shouldRetrySessionWebSocketError(error: unknown): boolean {
@@ -3161,6 +3159,157 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     )
   }
 
+  async compactConversationHistory(
+    request: CodexExecutionRequest,
+    forwardHeaders?: CodexForwardHeaders
+  ): Promise<CodexReplacementHistoryItem[]> {
+    this.onLiveRequestStart()
+    try {
+      return await this.compactConversationHistoryWithRetry(
+        request,
+        forwardHeaders,
+        1
+      )
+    } finally {
+      this.onLiveRequestEnd()
+    }
+  }
+
+  private async compactConversationHistoryWithRetry(
+    request: CodexExecutionRequest,
+    forwardHeaders: CodexForwardHeaders | undefined,
+    attempt: number,
+    slot?: CodexAccountSlot
+  ): Promise<CodexReplacementHistoryItem[]> {
+    if (this.accounts.length === 0) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+    const modelName = request.model
+    const conversationId =
+      this.getConversationId(request) || `compact-${crypto.randomUUID()}`
+    const requestSlot =
+      slot ||
+      this.selectRequestSlot(modelName, conversationId, {
+        preferWarmPool: false,
+      })
+    const token = await this.getBearerToken(requestSlot)
+    if (!token) {
+      throw new Error(
+        "Codex backend not configured: no API key or access token"
+      )
+    }
+    this.bindConversationToSlot(conversationId, requestSlot)
+
+    const codexRequest = buildCodexRequest(
+      { ...request, conversationId },
+      modelName
+    )
+    const payload: Record<string, unknown> = {
+      model: codexRequest.model,
+      input: codexRequest.input,
+      instructions: codexRequest.instructions,
+      tools: codexRequest.tools || [],
+      parallel_tool_calls: codexRequest.parallel_tool_calls !== false,
+      reasoning: codexRequest.reasoning,
+      text: codexRequest.text,
+    }
+    const url = this.buildUrl(requestSlot, "responses/compact")
+    const headers = this.buildHeaders(requestSlot, token, false, undefined, {
+      conversationId,
+      forwardHeaders,
+    })
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(300_000),
+    }
+    const dispatcher = this.buildProxyDispatcher(requestSlot)
+    if (dispatcher) {
+      fetchOptions.dispatcher = dispatcher
+    }
+
+    const response = await fetch(url, fetchOptions)
+    try {
+      if (!response.ok) {
+        const errorBody = await response.text()
+        throw this.createCodexApiError(response.status, errorBody)
+      }
+      this.captureCodexRateLimitHeaders(
+        response.headers,
+        requestSlot,
+        modelName,
+        "request"
+      )
+      markAccountSuccess(requestSlot, modelName)
+
+      const parsed = (await response.json()) as { output?: unknown }
+      if (!Array.isArray(parsed.output)) {
+        throw new CodexApiError(
+          502,
+          "Codex compact response did not include output history."
+        )
+      }
+      return parsed.output.flatMap((item) =>
+        item && typeof item === "object"
+          ? [{ ...(item as Record<string, unknown>) }]
+          : []
+      )
+    } catch (error) {
+      if (error instanceof CodexApiError) {
+        const statusCode = error.getStatus()
+        if (
+          (statusCode === 401 || statusCode === 403) &&
+          attempt === 1 &&
+          !this.isApiKeyMode(requestSlot)
+        ) {
+          const newToken = await this.tryRefreshSlotToken(
+            requestSlot,
+            `${statusCode} compact`
+          )
+          if (newToken) {
+            return this.compactConversationHistoryWithRetry(
+              request,
+              forwardHeaders,
+              attempt + 1,
+              requestSlot
+            )
+          }
+        }
+
+        const retryAfterHeader = error.retryAfterSeconds?.toString()
+        markAccountCooldown(
+          requestSlot,
+          statusCode,
+          modelName,
+          retryAfterHeader,
+          this.getAccountLabel(requestSlot)
+        )
+
+        if (
+          (statusCode === 401 || statusCode === 403 || statusCode === 429) &&
+          attempt < this.accounts.length
+        ) {
+          const nextSlot = this.pickNextAvailableAccount(modelName)
+          if (nextSlot && nextSlot !== requestSlot) {
+            this.logger.log(
+              `[Codex] compact ${statusCode} on ${this.getAccountLabel(requestSlot)}, retrying with ${this.getAccountLabel(nextSlot)} (attempt ${attempt + 1}/${this.accounts.length})`
+            )
+            return this.compactConversationHistoryWithRetry(
+              request,
+              forwardHeaders,
+              attempt + 1,
+              nextSlot
+            )
+          }
+        }
+      }
+      throw error
+    }
+  }
+
   /**
    * Execute a one-shot web search via the Codex Responses API server-side
    * `web_search` tool. The model is asked a single user question that wraps
@@ -3173,6 +3322,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     query: string
     model?: string
     conversationId?: string
+    signal?: AbortSignal
   }): Promise<{
     text: string
     references: Array<{ title: string; url: string; chunk: string }>
@@ -3224,6 +3374,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             type: "web_search",
             name: "web_search",
             description: "Server-side web search backed by the Codex backend.",
+            external_web_access: true,
           },
         ],
         parallelToolCalls: false,
@@ -3240,7 +3391,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       method: "POST",
       headers,
       body: JSON.stringify(codexRequest),
-      signal: AbortSignal.timeout(120_000),
+      signal: input.signal
+        ? AbortSignal.any([input.signal, AbortSignal.timeout(300_000)])
+        : AbortSignal.timeout(300_000),
     }
     const dispatcher = this.buildProxyDispatcher(slot)
     if (dispatcher) {
@@ -3259,7 +3412,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       "request"
     )
 
-    const fullBody = await response.text()
+    if (!response.body) {
+      throw new Error("Codex response has no body")
+    }
+
     const summaryParts: string[] = []
     const references: Array<{ title: string; url: string; chunk: string }> = []
     const seenUrls = new Set<string>()
@@ -3336,10 +3492,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
     }
 
-    for (const line of fullBody.split("\n")) {
-      const payload = this.parseCodexSsePayload(line.trim())
-      if (!payload) continue
-
+    const processPayload = (payload: Record<string, unknown>): boolean => {
       if (payload.type === "response.output_item.done" && payload.item) {
         collectFromOutputItem(payload.item)
       }
@@ -3356,7 +3509,46 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             collectFromOutputItem(outputItem)
           }
         }
+        return true
       }
+
+      return false
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ""
+    let completed = false
+
+    try {
+      while (!completed) {
+        const { done, value } = await reader.read()
+        if (done) {
+          break
+        }
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          const payload = this.parseCodexSsePayload(line.trim())
+          if (payload && processPayload(payload)) {
+            completed = true
+            break
+          }
+        }
+      }
+
+      const tail = buffer.trim()
+      if (!completed && tail) {
+        const payload = this.parseCodexSsePayload(tail)
+        if (payload) {
+          processPayload(payload)
+        }
+      }
+    } finally {
+      reader.cancel().catch(() => undefined)
     }
 
     markAccountSuccess(slot, modelName)

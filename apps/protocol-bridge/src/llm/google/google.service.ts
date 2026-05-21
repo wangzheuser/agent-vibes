@@ -13,6 +13,7 @@ import {
   toOfficialAntigravityToolName as toOfficialAntigravityToolNameFromContract,
 } from "../../shared/official-antigravity-tools"
 import { UsageStatsService } from "../../usage"
+import type { ImageGenerationReference } from "../image-generation/image-generation.service"
 import {
   combineAbortSignals,
   UpstreamRequestAbortedError,
@@ -32,9 +33,12 @@ import {
   ProcessPoolService,
   WorkerPoolCooldownError,
 } from "./process-pool.service"
+import { detectCurrentAntigravityVersion } from "../../shared/protocol-bridge-paths"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
 
 const GOOGLE_WEB_SEARCH_MODEL = "gemini-2.5-flash"
+const GOOGLE_IMAGE_GENERATION_MODEL = "gemini-3.1-flash-image"
+const FALLBACK_ANTIGRAVITY_IDE_VERSION = "2.0.1"
 
 /**
  * Adapt the official Antigravity system prompt for the Cursor IDE environment.
@@ -140,7 +144,6 @@ import type {
 @Injectable()
 export class GoogleService implements ProviderAdapter {
   private readonly logger = new Logger(GoogleService.name)
-  private readonly ANTIGRAVITY_IDE_VERSION = "1.22.2"
 
   // System prompt injected into Cloud Code requests.
   // ANTIGRAVITY_SYSTEM_PROMPT=false → Cursor prompt (no Antigravity sections);
@@ -192,7 +195,6 @@ export class GoogleService implements ProviderAdapter {
   private readonly STREAM_STALL_COOLDOWN_MS = 10 * 1000
   private readonly STREAM_PROGRESS_WATCHDOG_ABORT_PREFIX =
     "Cloud Code stream watchdog"
-  private readonly MAX_PROMPT_SHRINK_RETRIES: number = 3
   // Official Antigravity Claude agent traffic uses a 64k output budget.
   private readonly CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: number = 64000
   private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS: number = 64000
@@ -218,6 +220,11 @@ export class GoogleService implements ProviderAdapter {
   private readonly TOOL_NAME_CACHE_MAX_SIZE = 4096
   private readonly CONVERSATION_METRIC_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000
   private readonly CONVERSATION_METRIC_CONTEXT_MAX_SIZE = 4096
+  private readonly IMAGE_GENERATION_MODEL_CACHE_TTL_MS = 60 * 60 * 1000
+  private imageGenerationModelCache: {
+    modelIds: string[]
+    expiresAt: number
+  } | null = null
 
   /**
    * Parse duration string like "1.203608125s" or "1h16m0.667923083s" to milliseconds
@@ -645,7 +652,8 @@ export class GoogleService implements ProviderAdapter {
       requestId: crypto.randomUUID(),
       metadata: {
         ideType: "ANTIGRAVITY",
-        ideVersion: this.ANTIGRAVITY_IDE_VERSION,
+        ideVersion:
+          detectCurrentAntigravityVersion() || FALLBACK_ANTIGRAVITY_IDE_VERSION,
         platform: this.getTelemetryPlatform(),
       },
       metrics: [
@@ -1107,7 +1115,7 @@ export class GoogleService implements ProviderAdapter {
     const normalized = this.extractCloudCodeErrorText(errorBody)
     const promptTooLong = this.parsePromptTooLongTokens(normalized)
     if (promptTooLong) {
-      return `Cloud Code request exceeds prompt limit: ${promptTooLong.actual} > ${promptTooLong.max} tokens`
+      return `Cloud Code prompt is too long: ${promptTooLong.actual} tokens > ${promptTooLong.max} maximum`
     }
     return `Cloud Code API invalid_request_error: ${normalized.slice(0, 500)}`
   }
@@ -1121,138 +1129,6 @@ export class GoogleService implements ProviderAdapter {
     )
   }
 
-  /**
-   * Adaptive fallback when Cloud Code reports prompt-too-long.
-   * Shrinks oldest request contents while preserving latest turns.
-   */
-  private tryShrinkPayloadContentsForPromptLimit(
-    payload: Record<string, unknown>,
-    promptLimit: { actual: number; max: number },
-    shrinkAttempt: number,
-    protectedPrefixCount: number = 0
-  ): {
-    dropped: number
-    remaining: number
-    removedFunctionResponses: number
-  } | null {
-    const request = payload.request
-    if (!request || typeof request !== "object") return null
-    const requestObj = request as Record<string, unknown>
-    const contentsValue = requestObj.contents
-    if (!Array.isArray(contentsValue)) return null
-
-    const originalContents = contentsValue as Array<Record<string, unknown>>
-    if (originalContents.length <= 1) return null
-
-    // Extend the protected prefix to also cover compaction boundary/summary
-    // messages that sit immediately after the Google context prefix.
-    // These messages contain the compressed context from earlier conversation
-    // turns and must survive the shrink pass to avoid losing archived context.
-    const effectiveProtectedCount =
-      protectedPrefixCount +
-      this.countCompactionPrefixMessages(originalContents, protectedPrefixCount)
-
-    const protectedPrefix = originalContents.slice(0, effectiveProtectedCount)
-    const shrinkableContents = originalContents.slice(effectiveProtectedCount)
-    if (
-      shrinkableContents.length === 0 ||
-      (protectedPrefix.length === 0 && shrinkableContents.length <= 1)
-    ) {
-      return null
-    }
-
-    // Reserve extra headroom because backend-side tokenization/wrapping is stricter.
-    const safetyHeadroom = 8192 + shrinkAttempt * 2048
-    const targetTokens = Math.max(1, promptLimit.max - safetyHeadroom)
-    const requiredRatio = Math.max(
-      0.08,
-      Math.min(
-        0.75,
-        (promptLimit.actual - targetTokens) / Math.max(promptLimit.actual, 1)
-      )
-    )
-
-    let dropCount = Math.ceil(shrinkableContents.length * requiredRatio)
-    const maxDroppable =
-      protectedPrefix.length > 0
-        ? shrinkableContents.length
-        : shrinkableContents.length - 1
-    if (maxDroppable <= 0) return null
-    dropCount = Math.max(1, Math.min(dropCount, maxDroppable))
-
-    const trimmed = [...protectedPrefix, ...shrinkableContents.slice(dropCount)]
-    if (trimmed.length <= 0) return null
-
-    const normalized = this.stripPromptShrinkMetadata(
-      this.normalizeContentsForPromptShrink(trimmed)
-    )
-    if (normalized.contents.length <= 0) return null
-
-    requestObj.contents = normalized.contents
-
-    return {
-      dropped: Math.max(
-        0,
-        originalContents.length - normalized.contents.length
-      ),
-      remaining: (requestObj.contents as unknown[]).length,
-      removedFunctionResponses: normalized.removedFunctionResponses,
-    }
-  }
-
-  /**
-   * Count the number of compaction boundary/summary messages that
-   * immediately follow the protected prefix in the contents array.
-   *
-   * These messages are generated by ContextProjectionService.project()
-   * and contain `[Context boundary ...]` / `[Context summary ...]`
-   * markers. They must be preserved during prompt shrink to avoid
-   * losing archived conversation context.
-   */
-  private countCompactionPrefixMessages(
-    contents: Array<Record<string, unknown>>,
-    startIndex: number
-  ): number {
-    let count = 0
-    for (let i = startIndex; i < contents.length; i++) {
-      const entry = contents[i]
-      if (entry && this.isCompactionPrefixMessage(entry)) {
-        count++
-      } else {
-        break
-      }
-    }
-    return count
-  }
-
-  /**
-   * Check whether a Google-format content entry is a compaction
-   * boundary or summary message produced by the projection service.
-   */
-  private isCompactionPrefixMessage(content: Record<string, unknown>): boolean {
-    const parts = content.parts
-    if (!Array.isArray(parts) || parts.length === 0) return false
-
-    const firstPart = parts[0] as Record<string, unknown> | undefined
-    if (!firstPart) return false
-
-    const text = firstPart.text
-    if (typeof text !== "string") return false
-
-    return (
-      text.startsWith("[Context boundary ") ||
-      text.startsWith("[Context summary ")
-    )
-  }
-
-  private normalizeProtectedContextPrefixCount(value: unknown): number {
-    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-      return 0
-    }
-
-    return Math.max(0, Math.floor(value))
-  }
-
   private sanitizeClaudeContentsForSend(
     contents: Array<Record<string, unknown>>
   ): {
@@ -1261,8 +1137,8 @@ export class GoogleService implements ProviderAdapter {
     removedInvalidThoughtParts: number
     droppedMessages: number
   } {
-    const normalized = this.stripPromptShrinkMetadata(
-      this.normalizeContentsForPromptShrink(contents)
+    const normalized = this.stripPayloadSanitizeMetadata(
+      this.normalizeContentsForSend(contents)
     )
 
     return {
@@ -1276,7 +1152,9 @@ export class GoogleService implements ProviderAdapter {
     }
   }
 
-  private stripPromptShrinkMetadata(contents: Array<Record<string, unknown>>): {
+  private stripPayloadSanitizeMetadata(
+    contents: Array<Record<string, unknown>>
+  ): {
     contents: Array<Record<string, unknown>>
     removedFunctionResponses: number
     removedInvalidThoughtParts: number
@@ -1374,7 +1252,7 @@ export class GoogleService implements ProviderAdapter {
     }
   }
 
-  private normalizeContentsForPromptShrink(
+  private normalizeContentsForSend(
     contents: Array<Record<string, unknown>>
   ): Array<Record<string, unknown>> {
     if (!Array.isArray(contents) || contents.length === 0) return []
@@ -1822,22 +1700,16 @@ export class GoogleService implements ProviderAdapter {
   }
 
   /**
-   * Enforce token budget on a complete Cloud Code payload before sending.
+   * Measure a complete Cloud Code payload before sending.
    *
-   * This is the **single source of truth** for ensuring payloads stay within
-   * the Cloud Code API hard limit. It operates on the final Google-format
-   * payload (after all conversions, system prompt injection, etc.) so
-   * nothing can slip through.
-   *
-   * If the estimated token count exceeds the limit, contents (conversation
-   * history) are trimmed from the oldest entries until the budget is met.
+   * The protocol layer owns context reduction. GoogleService only measures the
+   * final Google-format payload and raises a prompt-too-long error when the
+   * caller supplied an oversized request.
    */
-  private enforceTokenBudget(
+  private measureTokenBudget(
     payload: Record<string, unknown>,
-    hardLimit: number = this.CLOUD_CODE_HARD_TOKEN_LIMIT,
-    protectedPrefixCount: number = 0
+    hardLimit: number = this.CLOUD_CODE_HARD_TOKEN_LIMIT
   ): {
-    enforced: boolean
     originalTokens: number
     finalTokens: number
     withinLimit: boolean
@@ -1845,47 +1717,17 @@ export class GoogleService implements ProviderAdapter {
     const originalTokens = this.tokenCounter.countGooglePayloadTokens(
       payload as Parameters<TokenCounterService["countGooglePayloadTokens"]>[0]
     )
-    let finalTokens = originalTokens
-    const normalizedProtectedPrefixCount =
-      this.normalizeProtectedContextPrefixCount(protectedPrefixCount)
-
-    if (finalTokens > hardLimit) {
-      for (
-        let shrinkAttempt = 0;
-        shrinkAttempt < this.MAX_PROMPT_SHRINK_RETRIES &&
-        finalTokens > hardLimit;
-        shrinkAttempt++
-      ) {
-        const shrinkResult = this.tryShrinkPayloadContentsForPromptLimit(
-          payload,
-          { actual: finalTokens, max: hardLimit },
-          shrinkAttempt,
-          normalizedProtectedPrefixCount
-        )
-        if (!shrinkResult) {
-          break
-        }
-
-        finalTokens = this.tokenCounter.countGooglePayloadTokens(
-          payload as Parameters<
-            TokenCounterService["countGooglePayloadTokens"]
-          >[0]
-        )
-      }
-    }
 
     return {
-      enforced: originalTokens > hardLimit,
       originalTokens,
-      finalTokens,
-      withinLimit: finalTokens <= hardLimit,
+      finalTokens: originalTokens,
+      withinLimit: originalTokens <= hardLimit,
     }
   }
 
   private assertTokenBudgetWithinLimit(
     operation: "sendClaudeMessage" | "sendClaudeMessageStream",
     budgetResult: {
-      enforced: boolean
       originalTokens: number
       finalTokens: number
       withinLimit: boolean
@@ -1897,7 +1739,7 @@ export class GoogleService implements ProviderAdapter {
     }
 
     throw new BackendApiError(
-      `Cloud Code ${operation} payload exceeds prompt limit after payload compaction (${budgetResult.finalTokens} > ${hardLimit})`,
+      `Cloud Code ${operation} prompt is too long: ${budgetResult.finalTokens} tokens > ${hardLimit} maximum`,
       {
         backend: "google",
         statusCode: 400,
@@ -2008,6 +1850,371 @@ export class GoogleService implements ProviderAdapter {
     throw new Error(
       `web_search failed: ${lastError?.message || "request failed"}`
     )
+  }
+
+  async generateImage(input: {
+    prompt: string
+    model?: string
+    conversationId?: string
+    outputFormat?: string
+    referenceImages?: ImageGenerationReference[]
+  }): Promise<{
+    imageData: string
+    revisedPrompt?: string
+    status?: string
+    mimeType?: string
+  }> {
+    const prompt = input.prompt.trim()
+    if (!prompt) {
+      throw new Error("Image generation prompt is required")
+    }
+    if (!this.processPool.isConfigured()) {
+      throw new Error(
+        "Google Cloud Code API not configured for image generation"
+      )
+    }
+
+    const resolvedModel = await this.resolveImageGenerationModel(input.model)
+    const payload = this.buildImageGenerationPayload({
+      prompt,
+      model: resolvedModel,
+      conversationId: input.conversationId,
+      referenceImages: input.referenceImages || [],
+    })
+    const maxWorkerAttempts = Math.max(
+      this.processPool.workerCount,
+      this.MAX_RETRIES
+    )
+    const excludedWorkerEmails = new Set<string>()
+    let lastError: Error | null = null
+    let consecutiveAuthErrors = 0
+    const maxAuthRetries = Math.max(this.processPool.workerCount, 2)
+
+    for (let attempt = 0; attempt < maxWorkerAttempts; attempt++) {
+      try {
+        const data = (await this.processPool.generate(payload, resolvedModel, {
+          excludedWorkerEmails,
+        })) as Record<string, unknown>
+        const responseData = this.unwrapCloudCodeResponse(data)
+        const image = this.extractGenerateContentImage(responseData)
+        if (!image) {
+          throw new Error(
+            "Cloud Code image generation completed without image data"
+          )
+        }
+        this.processPool.markSuccessForModel(resolvedModel)
+        return {
+          ...image,
+          revisedPrompt: this.extractGenerateContentText(responseData).trim(),
+          status: "completed",
+        }
+      } catch (error) {
+        if (error instanceof WorkerPoolCooldownError) {
+          throw new Error(
+            this.buildCloudCodeTemporaryUnavailableMessage(
+              resolvedModel,
+              error.waitMs
+            )
+          )
+        }
+
+        const errMsg = error instanceof Error ? error.message : String(error)
+        lastError = error instanceof Error ? error : new Error(errMsg)
+
+        if (errMsg.includes("401") || errMsg.includes("Token refresh failed")) {
+          consecutiveAuthErrors++
+          const authReason = errMsg.includes("Token refresh failed")
+            ? "token refresh failed"
+            : "authentication failed"
+          this.markCurrentWorkerAttempted(excludedWorkerEmails)
+          this.processPool.disableLastWorker(authReason)
+          if (
+            consecutiveAuthErrors > maxAuthRetries ||
+            !this.processPool.hasEligibleWorker({ excludedWorkerEmails })
+          ) {
+            throw new Error("All Cloud Code image generation accounts failed")
+          }
+          continue
+        }
+        consecutiveAuthErrors = 0
+
+        if (errMsg.includes("429")) {
+          this.recordGoogleAccountError(
+            this.processPool.getLastWorkerEmail(),
+            resolvedModel,
+            429
+          )
+          const retryDelayMs = this.parseRetryDelayMs(errMsg)
+          const exhausted = this.isQuotaExhausted(errMsg)
+          const failedWorkerEmail =
+            this.markCurrentWorkerAttempted(excludedWorkerEmails)
+          const cooldownMs = exhausted
+            ? this.resolveQuotaExhaustedCooldownMs(
+                resolvedModel,
+                errMsg,
+                failedWorkerEmail
+              )
+            : Math.min(retryDelayMs ?? 60_000, this.MAX_429_WAIT_MS)
+
+          this.processPool.setModelCooldownForLastWorker(
+            resolvedModel,
+            cooldownMs,
+            exhausted ? "quota_exhausted" : "rate_limited"
+          )
+
+          if (
+            this.hasAnotherWorkerAvailable(resolvedModel, excludedWorkerEmails)
+          ) {
+            continue
+          }
+
+          throw new Error(
+            this.buildCloudCodeRateLimitMessage(resolvedModel, cooldownMs)
+          )
+        }
+
+        if (this.isRetryableWorkerFailure(errMsg)) {
+          const isModelCapacityExhausted = this.isModelCapacityExhausted(errMsg)
+          const cooldownMs = isModelCapacityExhausted
+            ? this.MODEL_CAPACITY_EXHAUSTED_COOLDOWN_MS
+            : this.getRetryableWorkerFailureCooldownMs(errMsg)
+
+          if (isModelCapacityExhausted) {
+            this.recordGoogleAccountError(
+              this.processPool.getLastWorkerEmail(),
+              resolvedModel,
+              503
+            )
+            this.processPool.setPoolModelCooldown(
+              resolvedModel,
+              cooldownMs,
+              "capacity_exhausted"
+            )
+          } else {
+            this.processPool.setCooldownForLastWorker(cooldownMs, "transient")
+          }
+
+          this.markCurrentWorkerAttempted(excludedWorkerEmails)
+          if (
+            this.hasAnotherWorkerAvailable(resolvedModel, excludedWorkerEmails)
+          ) {
+            continue
+          }
+
+          throw new Error(
+            this.buildCloudCodeTemporaryUnavailableMessage(
+              resolvedModel,
+              cooldownMs
+            )
+          )
+        }
+
+        if (attempt < maxWorkerAttempts - 1) {
+          const delay =
+            this.PRIME_RETRY_DELAYS[attempt] ??
+            this.PRIME_RETRY_DELAYS[this.PRIME_RETRY_DELAYS.length - 1] ??
+            this.BASE_RETRY_DELAY
+          await this.sleep(delay)
+        }
+      }
+    }
+
+    throw new Error(
+      `Cloud Code image generation failed: ${lastError?.message || "request failed"}`
+    )
+  }
+
+  private async resolveImageGenerationModel(model?: string): Promise<string> {
+    const envOverride = process.env.GOOGLE_IMAGE_GENERATION_MODEL?.trim()
+    if (envOverride) {
+      return envOverride
+    }
+
+    const requested = model?.trim()
+    if (requested) {
+      const resolved = this.resolveClaudeModel(requested)
+      const normalized = resolved.toLowerCase()
+      if (normalized.includes("gemini") && normalized.includes("image")) {
+        return resolved
+      }
+    }
+
+    const antigravityModels = await this.getAntigravityImageGenerationModelIds()
+    if (antigravityModels.length > 0) {
+      return antigravityModels[0]!
+    }
+
+    return GOOGLE_IMAGE_GENERATION_MODEL
+  }
+
+  private async getAntigravityImageGenerationModelIds(): Promise<string[]> {
+    const now = Date.now()
+    if (
+      this.imageGenerationModelCache &&
+      this.imageGenerationModelCache.expiresAt > now
+    ) {
+      return this.imageGenerationModelCache.modelIds
+    }
+
+    try {
+      const result = (await this.processPool.fetchAvailableModels()) as Record<
+        string,
+        unknown
+      >
+      const explicit = this.findStringArrayByKeys(result, [
+        "imageGenerationModelIds",
+        "image_generation_model_ids",
+      ])
+      const fromModels = this.findImageModelIdsInModelsMap(result)
+      const modelIds = [...new Set([...explicit, ...fromModels])].filter(
+        (modelId) => modelId.toLowerCase().includes("gemini")
+      )
+      this.imageGenerationModelCache = {
+        modelIds,
+        expiresAt: now + this.IMAGE_GENERATION_MODEL_CACHE_TTL_MS,
+      }
+      return modelIds
+    } catch (error) {
+      this.logger.warn(
+        `Failed to load Antigravity image generation model IDs: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      this.imageGenerationModelCache = {
+        modelIds: [],
+        expiresAt: now + 60_000,
+      }
+      return []
+    }
+  }
+
+  private findStringArrayByKeys(
+    value: unknown,
+    keys: string[],
+    seen = new Set<unknown>()
+  ): string[] {
+    if (!value || typeof value !== "object" || seen.has(value)) {
+      return []
+    }
+    seen.add(value)
+
+    const record = value as Record<string, unknown>
+    for (const key of keys) {
+      const candidate = record[key]
+      if (Array.isArray(candidate)) {
+        const strings = candidate
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter((item) => item.length > 0)
+        if (strings.length > 0) {
+          return strings
+        }
+      }
+    }
+
+    for (const child of Object.values(record)) {
+      const found = this.findStringArrayByKeys(child, keys, seen)
+      if (found.length > 0) {
+        return found
+      }
+    }
+    return []
+  }
+
+  private findImageModelIdsInModelsMap(
+    result: Record<string, unknown>
+  ): string[] {
+    const models = result.models
+    if (!models || typeof models !== "object" || Array.isArray(models)) {
+      return []
+    }
+
+    return Object.entries(models as Record<string, unknown>)
+      .map(([modelId]) => modelId.trim())
+      .filter((modelId) => {
+        const normalized = modelId.toLowerCase()
+        return normalized.includes("gemini") && normalized.includes("image")
+      })
+  }
+
+  private buildImageGenerationPayload(input: {
+    prompt: string
+    model: string
+    conversationId?: string
+    referenceImages: ImageGenerationReference[]
+  }): Record<string, unknown> {
+    const parts: Array<Record<string, unknown>> = [{ text: input.prompt }]
+    for (const image of input.referenceImages.slice(0, 3)) {
+      parts.push({
+        inlineData: {
+          mimeType: image.mimeType,
+          data: image.data,
+        },
+      })
+    }
+
+    const session = this.getConversationSession(input.conversationId)
+    return {
+      project: "",
+      model: input.model,
+      request: {
+        contents: [
+          {
+            role: "user",
+            parts,
+          },
+        ],
+        generationConfig: {
+          candidateCount: 1,
+          responseModalities: ["TEXT", "IMAGE"],
+        },
+      },
+      userAgent: "antigravity",
+      requestType: "agent",
+      requestId: `agent/${Date.now()}/${session.uuid}/${++session.seq}`,
+      __workerConversationKey: session.uuid,
+    }
+  }
+
+  private extractGenerateContentImage(
+    response: Record<string, unknown>
+  ): { imageData: string; mimeType?: string } | null {
+    const candidatesValue = response.candidates
+    if (!Array.isArray(candidatesValue)) return null
+
+    for (const candidate of candidatesValue) {
+      if (!candidate || typeof candidate !== "object") continue
+      const content = (candidate as { content?: unknown }).content
+      if (!content || typeof content !== "object") continue
+
+      const parts = (content as { parts?: unknown }).parts
+      if (!Array.isArray(parts)) continue
+
+      for (const part of parts) {
+        if (!part || typeof part !== "object") continue
+        const record = part as Record<string, unknown>
+        const inlineData =
+          record.inlineData && typeof record.inlineData === "object"
+            ? (record.inlineData as Record<string, unknown>)
+            : record.inline_data && typeof record.inline_data === "object"
+              ? (record.inline_data as Record<string, unknown>)
+              : undefined
+        if (!inlineData) continue
+
+        const data =
+          typeof inlineData.data === "string" ? inlineData.data.trim() : ""
+        if (!data) continue
+
+        const mimeType =
+          typeof inlineData.mimeType === "string"
+            ? inlineData.mimeType.trim()
+            : typeof inlineData.mime_type === "string"
+              ? inlineData.mime_type.trim()
+              : undefined
+        return { imageData: data, mimeType }
+      }
+    }
+
+    return null
   }
 
   /**
@@ -4028,6 +4235,26 @@ export class GoogleService implements ProviderAdapter {
     return result
   }
 
+  private getConversationSession(conversationId?: string): {
+    uuid: string
+    seq: number
+  } {
+    const convId = conversationId?.trim()
+    if (!convId) {
+      return this.fallbackSession
+    }
+    if (!this.conversationSessions.has(convId)) {
+      this.conversationSessions.set(convId, {
+        uuid: crypto.randomUUID(),
+        seq: 0,
+      })
+      this.logger.debug(
+        `New conversation session: ${convId} -> uuid=${this.conversationSessions.get(convId)!.uuid}`
+      )
+    }
+    return this.conversationSessions.get(convId)!
+  }
+
   /**
    * Build Cloud Code request payload for Claude models
    */
@@ -4056,23 +4283,7 @@ export class GoogleService implements ProviderAdapter {
     // Resolve model name to Cloud Code format
     const model = this.resolveClaudeModel(dto.model)
 
-    // Get or create per-conversation session for requestId
-    const convId = dto._conversationId
-    let session: { uuid: string; seq: number }
-    if (convId) {
-      if (!this.conversationSessions.has(convId)) {
-        this.conversationSessions.set(convId, {
-          uuid: crypto.randomUUID(),
-          seq: 0,
-        })
-        this.logger.debug(
-          `New conversation session: ${convId} -> uuid=${this.conversationSessions.get(convId)!.uuid}`
-        )
-      }
-      session = this.conversationSessions.get(convId)!
-    } else {
-      session = this.fallbackSession
-    }
+    const session = this.getConversationSession(dto._conversationId)
 
     return {
       project: "",
@@ -4103,23 +4314,14 @@ export class GoogleService implements ProviderAdapter {
 
     const payload = this.buildClaudePayload(dto)
     const requestStartedAt = process.hrtime.bigint()
-    const protectedContextMessageCount =
-      this.normalizeProtectedContextPrefixCount(
-        dto._protectedContextMessageCount
-      )
 
-    // Enforce token budget before sending
-    // Use protocol-layer budget if available, otherwise fall back to hard limit
+    // Measure before sending; context reduction is owned by the protocol layer.
     const budgetLimit =
       dto._contextTokenBudget || this.CLOUD_CODE_HARD_TOKEN_LIMIT
-    const budgetResult = this.enforceTokenBudget(
-      payload,
-      budgetLimit,
-      protectedContextMessageCount
-    )
-    if (budgetResult.enforced) {
+    const budgetResult = this.measureTokenBudget(payload, budgetLimit)
+    if (!budgetResult.withinLimit) {
       this.logger.warn(
-        `[sendClaudeMessage] Token budget enforced: ${budgetResult.originalTokens} -> ${budgetResult.finalTokens}`
+        `[sendClaudeMessage] Token budget exceeded before send: ${budgetResult.originalTokens} > ${budgetLimit}`
       )
     }
     this.assertTokenBudgetWithinLimit(
@@ -4129,7 +4331,6 @@ export class GoogleService implements ProviderAdapter {
     )
 
     let lastError: Error | null = null
-    let promptShrinkRetries = 0
 
     let consecutiveAuthErrors = 0
     const maxAuthRetries = Math.max(this.processPool.workerCount, 2)
@@ -4322,29 +4523,9 @@ export class GoogleService implements ProviderAdapter {
           )
         }
 
-        // 400 — check for prompt-too-long
+        // 400 — deterministic request failures must propagate to the
+        // protocol-level reactive compaction path.
         if (errMsg.includes("400")) {
-          const normalizedError = this.extractCloudCodeErrorText(errMsg)
-          const promptTooLong = this.parsePromptTooLongTokens(normalizedError)
-          if (
-            promptTooLong &&
-            promptShrinkRetries < this.MAX_PROMPT_SHRINK_RETRIES
-          ) {
-            const shrinkResult = this.tryShrinkPayloadContentsForPromptLimit(
-              payload,
-              promptTooLong,
-              promptShrinkRetries,
-              protectedContextMessageCount
-            )
-            if (shrinkResult) {
-              promptShrinkRetries++
-              this.logger.warn(
-                `Prompt too long (${promptTooLong.actual} > ${promptTooLong.max}), ` +
-                  `shrinking (attempt ${promptShrinkRetries}/${this.MAX_PROMPT_SHRINK_RETRIES})`
-              )
-              continue
-            }
-          }
           if (this.isDeterministicInvalidRequest(errMsg)) {
             throw new FatalCloudCodeRequestError(
               this.buildInvalidRequestErrorMessage(errMsg)
@@ -4477,23 +4658,14 @@ export class GoogleService implements ProviderAdapter {
 
     const payload = this.buildClaudePayload(dto)
     const requestStartedAt = process.hrtime.bigint()
-    const protectedContextMessageCount =
-      this.normalizeProtectedContextPrefixCount(
-        dto._protectedContextMessageCount
-      )
 
-    // Enforce token budget before sending
-    // Use protocol-layer budget if available, otherwise fall back to hard limit
+    // Measure before sending; context reduction is owned by the protocol layer.
     const budgetLimit =
       dto._contextTokenBudget || this.CLOUD_CODE_HARD_TOKEN_LIMIT
-    const budgetResult = this.enforceTokenBudget(
-      payload,
-      budgetLimit,
-      protectedContextMessageCount
-    )
-    if (budgetResult.enforced) {
+    const budgetResult = this.measureTokenBudget(payload, budgetLimit)
+    if (!budgetResult.withinLimit) {
       this.logger.warn(
-        `[sendClaudeMessageStream] Token budget enforced: ${budgetResult.originalTokens} -> ${budgetResult.finalTokens}`
+        `[sendClaudeMessageStream] Token budget exceeded before send: ${budgetResult.originalTokens} > ${budgetLimit}`
       )
     }
     this.assertTokenBudgetWithinLimit(
@@ -4706,7 +4878,6 @@ export class GoogleService implements ProviderAdapter {
     // Worker rotation retry: try each available worker before giving up
     // ---------------------------------------------------------------------------
     const maxWorkerRetries = Math.max(this.processPool.workerCount, 2)
-    let promptShrinkRetries = 0
     const excludedWorkerEmails = new Set<string>()
     const recoveryState = { totalWaitedMs: 0 }
     let instantRetry429 = 0
@@ -4940,29 +5111,14 @@ export class GoogleService implements ProviderAdapter {
             )
           }
 
-          // 400 — prompt-too-long: shrink payload and retry
+          // 400 — deterministic request failures must propagate to the
+          // protocol-level reactive compaction path. Do not mutate the
+          // provider payload here.
           if (errMsg.includes("400")) {
-            const normalizedError = self.extractCloudCodeErrorText(errMsg)
-            const promptTooLong = self.parsePromptTooLongTokens(normalizedError)
-            if (
-              promptTooLong &&
-              promptShrinkRetries < self.MAX_PROMPT_SHRINK_RETRIES
-            ) {
-              const shrinkResult = self.tryShrinkPayloadContentsForPromptLimit(
-                payload,
-                promptTooLong,
-                promptShrinkRetries,
-                protectedContextMessageCount
+            if (self.isDeterministicInvalidRequest(errMsg)) {
+              throw new FatalCloudCodeRequestError(
+                self.buildInvalidRequestErrorMessage(errMsg)
               )
-              if (shrinkResult) {
-                promptShrinkRetries++
-                self.logger.warn(
-                  `[sendClaudeMessageStream] Prompt too long (${promptTooLong.actual} > ${promptTooLong.max}), ` +
-                    `shrinking (attempt ${promptShrinkRetries}/${self.MAX_PROMPT_SHRINK_RETRIES})`
-                )
-                lastAttemptError = null
-                continue
-              }
             }
             if (self.isCloudCodeToolProtocolError(errMsg)) {
               throw new FatalCloudCodeRequestError(errMsg)

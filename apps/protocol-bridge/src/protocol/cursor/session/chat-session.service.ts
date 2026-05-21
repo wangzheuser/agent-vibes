@@ -4,18 +4,34 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from "@nestjs/common"
+import * as fs from "fs"
 import * as path from "path"
 import { enforceToolProtocol } from "../../../context/tool-protocol-integrity"
+import {
+  normalizePathForBoundaryCheck,
+  resolveAllowedWorkspaceRoots,
+} from "./workspace-root-resolver"
 import type {
   ContextCompactionCommit,
   ContextConversationState,
+  CodexContextState,
   ContextInvestigationMemoryEntry,
+  ContextNativeCacheEditState,
+  ContextSessionMemoryEntry,
   ContextTranscriptRecord,
   ContextUsageLedgerState,
   ContextUsageSnapshot,
   InvestigationMemorySummaryLike,
   LooseMessageContent,
 } from "../../../context/types"
+import {
+  createCompactBoundaryRecord,
+  createCompactSummaryRecord,
+  deriveCompactionHistoryFromTranscript,
+  getActiveCompactCommitFromTranscript,
+  isMessageRecord,
+  stripInternalContextEvents,
+} from "../../../context/context-transcript-events"
 import type { BackendType } from "../../../llm/shared/model-router.service"
 import { PersistenceService } from "../../../persistence"
 import { ParsedCursorRequest } from "../tools/cursor-request-parser"
@@ -259,6 +275,24 @@ export interface SessionReadSnapshot {
   content: string
   capturedAt: number
   sourceToolName: string
+  /**
+   * Disk mtime (ms since epoch) of the underlying file at the moment the
+   * snapshot was captured. Set when `addReadSnapshot` was able to stat the
+   * absolute path on the bridge host; left undefined for paths the bridge
+   * cannot stat (relative paths without resolved cwd, virtual sources,
+   * stat errors).
+   *
+   * Used by `getLatestReadSnapshot` to detect external disk writes (e.g.
+   * shell scripts overwriting a smoke fixture between two `read_file` calls
+   * inside one chat session) and treat the snapshot as stale instead of
+   * reusing the in-memory copy that no longer matches disk. Without this
+   * guard the edit failure-projection (`latest_snapshot_source: read_file`
+   * + cached `current_text`) gives the model a phantom view of the file
+   * and the next edit_file_v2 round can apply on top of stale content.
+   */
+  diskMtimeMs?: number
+  /** Disk size (bytes) at capture time; co-checked with mtime. */
+  diskSizeBytes?: number
 }
 
 /**
@@ -288,6 +322,43 @@ export interface EditFailureContext extends EditFailureSelection {
     | "noop_identical"
     | "self_swallowing_replace"
   matchCountInFile?: number
+}
+
+/**
+ * A workspace root that was added to the session through a non-IDE
+ * channel (REST API or `.cursor/agent-vibes.json` config), used by
+ * the multi-root boundary check on top of IDE-supplied
+ * `projectContext.workspaceFolders`.
+ *
+ * Mirrors claude-code's `AdditionalWorkingDirectory` shape — same
+ * fields, same semantics — so future cross-pollination is cheap.
+ */
+export interface AdditionalWorkspaceRoot {
+  /**
+   * Resolved absolute path. After `realpathSync` + macOS
+   * `/private/var` normalization. Used as the dedup key in the
+   * `additionalRoots` map AND as the value the boundary check
+   * compares candidate paths against. Storing the resolved form
+   * up-front means we don't have to re-resolve on every read_file.
+   */
+  path: string
+  /**
+   * The path the user originally typed / configured, before any
+   * normalization. Surfaced in error messages ("the root you added
+   * via /add-dir was: ...") so users recognize their own input.
+   */
+  rawPath: string
+  /**
+   * Where this root came from — affects who can remove it.
+   *
+   *  - `'session'`: added at runtime via REST API. Removable by
+   *    REST DELETE.
+   *  - `'config'`: loaded from `.cursor/agent-vibes.json`.
+   *    Replayed every session start; runtime DELETE has no effect
+   *    until the config file is edited.
+   */
+  source: "session" | "config"
+  addedAt: number
 }
 
 /**
@@ -402,9 +473,40 @@ export interface ChatSession {
   customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
   explicitContext?: string
   contextTokenLimit?: number
+  contextMaxMode?: boolean
   usedContextTokens?: number
   requestedMaxOutputTokens?: number
   requestedModelParameters?: Record<string, string>
+
+  /**
+   * Additional workspace roots that ARE NOT pushed by the IDE through
+   * `projectContext.workspaceFolders`. They come from two non-IDE
+   * channels:
+   *
+   *   - `'session'`: runtime extension via the bridge REST API
+   *     (`POST /context/:conversationId/working-directories`). User
+   *     wants the agent to access a folder that is not in the
+   *     Cursor workspace — e.g. a sibling repo for cross-repo
+   *     research. Persisted with the session.
+   *
+   *   - `'config'`: bridge startup loads from the workspace's
+   *     `.cursor/agent-vibes.json` (`additionalWorkingDirectories`
+   *     array). Survives across sessions; meant for
+   *     project-level "always grant access to these paths" config.
+   *     Replayed into every new session at creation time.
+   *
+   * Keyed by **resolved absolute path** (after `realpathSync` and
+   * macOS `/private/var` ↔ `/var` normalization), so two different
+   * relative-path entries that resolve to the same dir dedup.
+   *
+   * IDE-pushed folders are NOT stored here — they live on
+   * `projectContext.workspaceFolders` and are refreshed on every
+   * request. The boundary check (`isPathWithinAllowedRoots`) unions
+   * both sources.
+   */
+  additionalRoots?: Map<string, AdditionalWorkspaceRoot>
+  /** True once `.cursor/agent-vibes.json` roots have been replayed for this session. */
+  configuredAdditionalRootsLoaded?: boolean
 
   // Checkpoint tracking for multi-turn conversations
   usedTokens: number
@@ -550,6 +652,7 @@ export interface ChatSessionAnalyticsEntry {
   linesAdded: number
   linesRemoved: number
   contextTokenLimit: number | null
+  contextMaxMode: boolean | null
   usedContextTokens: number | null
   contextUsagePct: number | null
   requestedMaxOutputTokens: number | null
@@ -637,6 +740,14 @@ export interface SubAgentContext {
    * accordion. Mirrors claude-code's per-turn step tracking. Stored as
    * unknown[] because the proto type is private to cursor-grpc.service. */
   conversationSteps: unknown[]
+
+  /**
+   * Snapshot of allowed workspace roots captured when this sub-agent
+   * was spawned. Used for prompt injection and restart persistence so
+   * in-flight sub-agents do not silently inherit parent-session root
+   * changes made after spawn.
+   */
+  allowedWorkspaceRoots?: string[]
 }
 
 export interface SubAgentToolResult {
@@ -713,6 +824,7 @@ interface PersistedSubAgentContext {
     input: Record<string, unknown>
   }>
   expectedToolCallIds: string[]
+  allowedWorkspaceRoots?: string[]
 }
 
 interface PersistedSessionRestartRecovery {
@@ -758,7 +870,7 @@ interface PersistedTopLevelAgentTurnState {
 }
 
 interface PersistedChatSessionV1 {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11
   conversationId: string
   messages: SessionMessage[]
   messageRecords?: ContextTranscriptRecord[]
@@ -792,9 +904,20 @@ interface PersistedChatSessionV1 {
   customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
   explicitContext?: string
   contextTokenLimit?: number
+  contextMaxMode?: boolean
   usedContextTokens?: number
   requestedMaxOutputTokens?: number
   requestedModelParameters?: Record<string, string>
+  /**
+   * Persisted form of `ChatSession.additionalRoots`. Stored as an
+   * array (Map doesn't round-trip through JSON) and rebuilt into a
+   * Map on load. Only `'session'` source entries actually survive
+   * the round-trip — `'config'` entries are re-derived from
+   * `.cursor/agent-vibes.json` at session start, so persisting them
+   * would cause stale config to silently linger after the file is
+   * edited.
+   */
+  additionalRoots?: AdditionalWorkspaceRoot[]
   usedTokens: number
   readPaths: string[]
   readSnapshots?: SessionReadSnapshot[]
@@ -1243,6 +1366,10 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       Number.isFinite(session.requestedMaxOutputTokens)
         ? Math.max(0, Math.round(session.requestedMaxOutputTokens))
         : null
+    const contextMaxMode =
+      typeof session.contextMaxMode === "boolean"
+        ? session.contextMaxMode
+        : null
     const contextUsagePct =
       contextTokenLimit && usedContextTokens != null && contextTokenLimit > 0
         ? Math.round((usedContextTokens / contextTokenLimit) * 1000) / 10
@@ -1276,6 +1403,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       linesAdded: lineStats.linesAdded,
       linesRemoved: lineStats.linesRemoved,
       contextTokenLimit,
+      contextMaxMode,
       usedContextTokens,
       contextUsagePct,
       requestedMaxOutputTokens,
@@ -1286,11 +1414,25 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
   private serializeSession(session: ChatSession): PersistedChatSessionV1 {
     return {
-      version: 10,
+      version: 11,
       conversationId: session.conversationId,
       messages: session.messages,
       messageRecords: session.messageRecords,
-      contextState: session.contextState,
+      contextState: {
+        ...session.contextState,
+        compactionHistory: deriveCompactionHistoryFromTranscript(
+          session.contextState.records
+        ),
+        activeCompactionId: getActiveCompactCommitFromTranscript(
+          session.contextState.records
+        )?.id,
+        nativeCacheEditState: {
+          toolOrder: [],
+          deletedToolUseIds: [],
+          pinnedEdits: [],
+          toolsSentToApi: false,
+        },
+      },
       topLevelAgentTurnState: {
         llmTurnCount: session.topLevelAgentTurnState.llmTurnCount,
         readOnlyBatchCount: session.topLevelAgentTurnState.readOnlyBatchCount,
@@ -1417,10 +1559,19 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       customSystemPrompt: session.customSystemPrompt,
       explicitContext: session.explicitContext,
       contextTokenLimit: session.contextTokenLimit,
+      contextMaxMode: session.contextMaxMode,
       usedContextTokens: session.usedContextTokens,
       requestedMaxOutputTokens: session.requestedMaxOutputTokens,
       requestedModelParameters: session.requestedModelParameters,
       usedTokens: session.usedTokens,
+      // Persist only `source='session'` additionalRoots — `'config'`
+      // entries get replayed from `.cursor/agent-vibes.json` on load
+      // so we don't want stale snapshots overriding fresh config.
+      additionalRoots: session.additionalRoots
+        ? Array.from(session.additionalRoots.values()).filter(
+            (r) => r.source === "session"
+          )
+        : undefined,
       readPaths: Array.from(session.readPaths),
       readSnapshots: session.readSnapshots.map((snapshot) => ({ ...snapshot })),
       fileStates: Array.from(session.fileStates.entries()).map(
@@ -1572,6 +1723,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     return {
       id: crypto.randomUUID(),
       role: message.role,
+      kind: "message",
       content: message.content,
       createdAt,
     }
@@ -1587,11 +1739,118 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       compactionEpoch: 0,
       lastAppliedCompaction: undefined,
       usageLedger: {},
+      codexContext: this.createCodexContextState(),
       toolResultReplacementState: {
         seenToolUseIds: [],
         replacementByToolUseId: {},
       },
+      nativeCacheEditState: {
+        toolOrder: [],
+        deletedToolUseIds: [],
+        pinnedEdits: [],
+        toolsSentToApi: false,
+      },
       investigationMemory: [],
+      sessionMemory: [],
+    }
+  }
+
+  private createCodexContextState(): CodexContextState {
+    return {
+      historyVersion: 0,
+      truncationPolicy: {
+        mode: "bytes",
+        limit: 10_000,
+      },
+    }
+  }
+
+  private normalizeCodexContextState(value: unknown): CodexContextState {
+    const input =
+      value && typeof value === "object"
+        ? (value as Partial<CodexContextState>)
+        : {}
+    const truncationPolicy =
+      input.truncationPolicy &&
+      typeof input.truncationPolicy === "object" &&
+      (input.truncationPolicy.mode === "bytes" ||
+        input.truncationPolicy.mode === "tokens") &&
+      typeof input.truncationPolicy.limit === "number" &&
+      Number.isFinite(input.truncationPolicy.limit) &&
+      input.truncationPolicy.limit > 0
+        ? {
+            mode: input.truncationPolicy.mode,
+            limit: Math.floor(input.truncationPolicy.limit),
+          }
+        : {
+            mode: "bytes" as const,
+            limit: 10_000,
+          }
+    return {
+      historyVersion:
+        typeof input.historyVersion === "number" && input.historyVersion >= 0
+          ? Math.floor(input.historyVersion)
+          : 0,
+      tokenInfo:
+        input.tokenInfo &&
+        typeof input.tokenInfo === "object" &&
+        typeof input.tokenInfo.totalTokens === "number"
+          ? {
+              totalTokens: Math.max(0, Math.floor(input.tokenInfo.totalTokens)),
+              modelContextWindow:
+                typeof input.tokenInfo.modelContextWindow === "number"
+                  ? Math.max(0, Math.floor(input.tokenInfo.modelContextWindow))
+                  : undefined,
+              updatedAt:
+                typeof input.tokenInfo.updatedAt === "number"
+                  ? input.tokenInfo.updatedAt
+                  : Date.now(),
+            }
+          : undefined,
+      referenceContextItem:
+        input.referenceContextItem &&
+        typeof input.referenceContextItem === "object"
+          ? {
+              ...input.referenceContextItem,
+              truncationPolicy,
+              updatedAt:
+                typeof input.referenceContextItem.updatedAt === "number"
+                  ? input.referenceContextItem.updatedAt
+                  : Date.now(),
+            }
+          : undefined,
+      replacementHistory:
+        input.replacementHistory &&
+        typeof input.replacementHistory === "object" &&
+        typeof input.replacementHistory.compactionId === "string" &&
+        Array.isArray(input.replacementHistory.items)
+          ? {
+              ...input.replacementHistory,
+              anchorRecordCount:
+                typeof input.replacementHistory.anchorRecordCount === "number"
+                  ? Math.max(
+                      0,
+                      Math.floor(input.replacementHistory.anchorRecordCount)
+                    )
+                  : 0,
+              createdAt:
+                typeof input.replacementHistory.createdAt === "number"
+                  ? input.replacementHistory.createdAt
+                  : Date.now(),
+              injectionMode:
+                input.replacementHistory.injectionMode === "mid_turn"
+                  ? "mid_turn"
+                  : "pre_turn",
+              summary:
+                typeof input.replacementHistory.summary === "string"
+                  ? input.replacementHistory.summary
+                  : "",
+              items: input.replacementHistory.items.flatMap((item) =>
+                item && typeof item === "object" ? [{ ...item }] : []
+              ),
+            }
+          : undefined,
+      truncationPolicy,
     }
   }
 
@@ -1625,6 +1884,119 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
           ? entry.createdAt
           : Date.now(),
+    }
+  }
+
+  private normalizeSessionMemoryEntry(
+    value: unknown
+  ): ContextSessionMemoryEntry {
+    const entry =
+      value && typeof value === "object"
+        ? (value as Partial<ContextSessionMemoryEntry>)
+        : {}
+    const kind =
+      entry.kind === "objective" ||
+      entry.kind === "decision" ||
+      entry.kind === "progress" ||
+      entry.kind === "file" ||
+      entry.kind === "constraint" ||
+      entry.kind === "verification" ||
+      entry.kind === "risk" ||
+      entry.kind === "command" ||
+      entry.kind === "sub_agent" ||
+      entry.kind === "open_item"
+        ? entry.kind
+        : "progress"
+
+    return {
+      id:
+        typeof entry.id === "string" && entry.id.trim().length > 0
+          ? entry.id.trim()
+          : `recovered_${crypto.randomUUID()}`,
+      kind,
+      text: typeof entry.text === "string" ? entry.text : "",
+      sourceCompactionId:
+        typeof entry.sourceCompactionId === "string"
+          ? entry.sourceCompactionId
+          : "",
+      sourceRecordId:
+        typeof entry.sourceRecordId === "string"
+          ? entry.sourceRecordId
+          : undefined,
+      createdAt:
+        typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
+          ? entry.createdAt
+          : Date.now(),
+      weight:
+        typeof entry.weight === "number" && Number.isFinite(entry.weight)
+          ? Math.max(0, Math.floor(entry.weight))
+          : 1,
+    }
+  }
+
+  private normalizeNativeCacheEditState(
+    value: unknown
+  ): ContextNativeCacheEditState {
+    const state =
+      value && typeof value === "object"
+        ? (value as Partial<ContextNativeCacheEditState>)
+        : {}
+    return {
+      toolOrder: Array.isArray(state.toolOrder)
+        ? state.toolOrder.filter(
+            (toolUseId): toolUseId is string =>
+              typeof toolUseId === "string" && toolUseId.trim().length > 0
+          )
+        : [],
+      deletedToolUseIds: Array.isArray(state.deletedToolUseIds)
+        ? state.deletedToolUseIds.filter(
+            (toolUseId): toolUseId is string =>
+              typeof toolUseId === "string" && toolUseId.trim().length > 0
+          )
+        : [],
+      pinnedEdits: Array.isArray(state.pinnedEdits)
+        ? state.pinnedEdits.flatMap((pin) => {
+            if (!pin || typeof pin !== "object") return []
+            const candidate = pin
+            const edits = Array.isArray(candidate.block?.edits)
+              ? candidate.block.edits.filter(
+                  (
+                    edit
+                  ): edit is {
+                    type: "delete"
+                    cache_reference: string
+                  } =>
+                    edit?.type === "delete" &&
+                    typeof edit.cache_reference === "string" &&
+                    edit.cache_reference.trim().length > 0
+                )
+              : []
+            if (edits.length === 0) return []
+            return [
+              {
+                targetRecordId:
+                  typeof candidate.targetRecordId === "string"
+                    ? candidate.targetRecordId
+                    : undefined,
+                targetMessageIndex:
+                  typeof candidate.targetMessageIndex === "number" &&
+                  Number.isFinite(candidate.targetMessageIndex)
+                    ? Math.max(0, Math.floor(candidate.targetMessageIndex))
+                    : 0,
+                block: {
+                  type: "cache_edits" as const,
+                  edits,
+                },
+                createdAt:
+                  typeof candidate.createdAt === "number" &&
+                  Number.isFinite(candidate.createdAt)
+                    ? candidate.createdAt
+                    : Date.now(),
+              },
+            ]
+          })
+        : [],
+      toolsSentToApi: state.toolsSentToApi === true,
     }
   }
 
@@ -1679,10 +2051,61 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         }
   }
 
+  private hasContextEventRecords(
+    records: readonly ContextTranscriptRecord[] | undefined
+  ): boolean {
+    return records != null && records.some((record) => !isMessageRecord(record))
+  }
+
+  private normalizeTranscriptRecords(
+    records: readonly ContextTranscriptRecord[]
+  ): ContextTranscriptRecord[] {
+    return records.flatMap((record) => {
+      if (!record || typeof record !== "object") return []
+      if (!record.kind) {
+        return [{ ...record, kind: "message" as const }]
+      }
+      return [{ ...record }]
+    })
+  }
+
+  private migrateCompactionStateToTranscript(
+    rawContextState: ContextConversationState,
+    messageRecords: ContextTranscriptRecord[],
+    normalizedCompactionState:
+      | {
+          compactionHistory: ContextCompactionCommit[]
+          activeCompactionId?: string
+        }
+      | undefined
+  ): ContextTranscriptRecord[] {
+    const rawRecords = this.normalizeTranscriptRecords(rawContextState.records)
+    if (this.hasContextEventRecords(rawRecords)) {
+      return rawRecords
+    }
+
+    const activeCommit = normalizedCompactionState?.activeCompactionId
+      ? normalizedCompactionState.compactionHistory.find(
+          (commit) => commit.id === normalizedCompactionState.activeCompactionId
+        )
+      : undefined
+    if (!activeCommit) {
+      return messageRecords
+    }
+
+    const retainedRecords = stripInternalContextEvents(rawRecords)
+    const createdAt = activeCommit.createdAt || Date.now()
+    return [
+      createCompactBoundaryRecord(activeCommit, createdAt),
+      createCompactSummaryRecord(activeCommit, createdAt + 1),
+      ...retainedRecords,
+    ]
+  }
+
   private syncMessagesFromRecords(
     records: ContextTranscriptRecord[]
   ): SessionMessage[] {
-    return records.map((record) => ({
+    return records.filter(isMessageRecord).map((record) => ({
       role: record.role,
       content: record.content,
     }))
@@ -1708,7 +2131,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     )
   }
 
-  private hasStableRecordPrefix(
+  private hasStableRecordProjection(
     previousRecords: ContextTranscriptRecord[],
     nextRecords: ContextTranscriptRecord[],
     throughRecordId: string
@@ -1719,17 +2142,81 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     const nextIndex = nextRecords.findIndex(
       (record) => record.id === throughRecordId
     )
-    if (previousIndex < 0 || nextIndex < 0 || previousIndex !== nextIndex) {
+    if (previousIndex < 0 || nextIndex < 0) {
       return false
     }
 
-    for (let index = 0; index <= previousIndex; index++) {
-      if (previousRecords[index]?.id !== nextRecords[index]?.id) {
+    const previousSuffix = previousRecords.slice(previousIndex)
+    const nextSuffix = nextRecords.slice(
+      nextIndex,
+      nextIndex + previousSuffix.length
+    )
+    if (previousSuffix.length !== nextSuffix.length) {
+      return false
+    }
+
+    for (let index = 0; index < previousSuffix.length; index++) {
+      if (previousSuffix[index]?.id !== nextSuffix[index]?.id) {
         return false
       }
     }
 
     return true
+  }
+
+  private syncContextRecordsFromMessageRecords(
+    state: ContextConversationState,
+    messageRecords: ContextTranscriptRecord[]
+  ): void {
+    const activeCommit = getActiveCompactCommitFromTranscript(state.records)
+    if (!activeCommit) {
+      state.records = messageRecords.map((record) => ({
+        ...record,
+        kind: record.kind || "message",
+      }))
+      state.compactionHistory = []
+      state.activeCompactionId = undefined
+      state.codexContext = {
+        ...(state.codexContext || this.createCodexContextState()),
+        historyVersion: (state.codexContext?.historyVersion || 0) + 1,
+        replacementHistory: undefined,
+      }
+      return
+    }
+
+    const visibleById = new Map(
+      messageRecords.map((record) => [record.id, record])
+    )
+    const knownMessageIds = new Set<string>()
+    const synced = state.records.map((record) => {
+      if (!isMessageRecord(record)) return record
+      knownMessageIds.add(record.id)
+      const visible = visibleById.get(record.id)
+      return visible ? { ...visible, kind: "message" as const } : record
+    })
+    const lastStateMessage = [...state.records]
+      .reverse()
+      .find((record) => isMessageRecord(record))
+    const lastVisibleIndex = lastStateMessage
+      ? messageRecords.findIndex((record) => record.id === lastStateMessage.id)
+      : -1
+    const appended =
+      lastVisibleIndex >= 0
+        ? messageRecords
+            .slice(lastVisibleIndex + 1)
+            .filter((record) => !knownMessageIds.has(record.id))
+        : messageRecords.filter((record) => !knownMessageIds.has(record.id))
+    state.records = [
+      ...synced,
+      ...appended.map((record) => ({
+        ...record,
+        kind: "message" as const,
+      })),
+    ]
+    state.compactionHistory = deriveCompactionHistoryFromTranscript(
+      state.records
+    )
+    state.activeCompactionId = activeCommit.id
   }
 
   private reconcileMessageRecords(
@@ -1772,22 +2259,23 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     records: ContextTranscriptRecord[],
     previousRecords: ContextTranscriptRecord[] = state.records
   ): boolean {
-    if (
-      state.lastAppliedCompaction &&
-      state.lastAppliedCompaction.recordCount > previousRecords.length
-    ) {
-      return false
+    if (getActiveCompactCommitFromTranscript(state.records)) {
+      return true
     }
-    if (!state.activeCompactionId) return true
-    const active = state.compactionHistory.find(
-      (commit) => commit.id === state.activeCompactionId
-    )
-    if (!active) return false
+    if (
+      typeof state.activeCompactionId === "string" ||
+      (Array.isArray(state.compactionHistory) &&
+        state.compactionHistory.length > 0)
+    ) {
+      return true
+    }
 
-    return this.hasStableRecordPrefix(
-      previousRecords,
+    const stateMessageRecords = stripInternalContextEvents(previousRecords)
+    if (stateMessageRecords.length === 0) return true
+    return this.hasStableRecordProjection(
+      stateMessageRecords,
       records,
-      active.archivedThroughRecordId
+      stateMessageRecords[0]!.id
     )
   }
 
@@ -1798,8 +2286,15 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
   ): boolean {
     const anchorRecordId = state.usageLedger.anchorRecordId
     if (!anchorRecordId) return true
+    if (getActiveCompactCommitFromTranscript(state.records)) {
+      return records.some((record) => record.id === anchorRecordId)
+    }
 
-    return this.hasStableRecordPrefix(previousRecords, records, anchorRecordId)
+    return this.hasStableRecordProjection(
+      previousRecords,
+      records,
+      anchorRecordId
+    )
   }
 
   private deserializeSession(persisted: PersistedChatSessionV1): ChatSession {
@@ -1828,6 +2323,13 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     const normalizedCompactionState = rawContextState
       ? this.normalizeCompactionHistory(rawContextState, persisted.version)
       : undefined
+    const migratedContextRecords = rawContextState
+      ? this.migrateCompactionStateToTranscript(
+          rawContextState,
+          messageRecords,
+          normalizedCompactionState
+        )
+      : undefined
     const contextState =
       rawContextState &&
       Array.isArray(rawContextState.records) &&
@@ -1838,10 +2340,13 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       )
         ? {
             ...rawContextState,
-            records: messageRecords,
-            compactionHistory:
-              normalizedCompactionState?.compactionHistory || [],
-            activeCompactionId: normalizedCompactionState?.activeCompactionId,
+            records: migratedContextRecords || messageRecords,
+            compactionHistory: deriveCompactionHistoryFromTranscript(
+              migratedContextRecords || []
+            ),
+            activeCompactionId: getActiveCompactCommitFromTranscript(
+              migratedContextRecords || []
+            )?.id,
             compactionEpoch:
               typeof rawContextState.compactionEpoch === "number" &&
               rawContextState.compactionEpoch >= 0
@@ -1893,6 +2398,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
             )
               ? rawContextState.usageLedger
               : {},
+            codexContext: this.normalizeCodexContextState(
+              rawContextState.codexContext
+            ),
             toolResultReplacementState:
               rawContextState.toolResultReplacementState
                 ? {
@@ -1919,6 +2427,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
                     seenToolUseIds: [],
                     replacementByToolUseId: {},
                   },
+            nativeCacheEditState: this.normalizeNativeCacheEditState(
+              rawContextState.nativeCacheEditState
+            ),
             investigationMemory: Array.isArray(
               rawContextState.investigationMemory
             )
@@ -1926,8 +2437,20 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
                   this.normalizeInvestigationMemoryEntry(entry)
                 )
               : [],
+            sessionMemory: Array.isArray(rawContextState.sessionMemory)
+              ? rawContextState.sessionMemory.map((entry) =>
+                  this.normalizeSessionMemoryEntry(entry)
+                )
+              : [],
           }
         : this.createContextState(messageRecords)
+    this.syncContextRecordsFromMessageRecords(contextState, messageRecords)
+    if (contextState.lastAppliedCompaction) {
+      contextState.lastAppliedCompaction = {
+        ...contextState.lastAppliedCompaction,
+        recordCount: contextState.records.length,
+      }
+    }
 
     const topLevelAgentTurnState = persisted.topLevelAgentTurnState
       ? {
@@ -2248,9 +2771,27 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       customSystemPrompt: persisted.customSystemPrompt,
       explicitContext: persisted.explicitContext,
       contextTokenLimit: persisted.contextTokenLimit,
+      contextMaxMode: persisted.contextMaxMode,
       usedContextTokens: persisted.usedContextTokens,
       requestedMaxOutputTokens: persisted.requestedMaxOutputTokens,
       requestedModelParameters: persisted.requestedModelParameters,
+      // Rebuild the additionalRoots Map from the persisted array.
+      // Only `'session'` source entries are persisted, so we don't
+      // need to filter on read. `'config'` entries get re-injected
+      // by the bridge on session load (see Phase 4) — we still
+      // initialize the map here so that injection has a target.
+      additionalRoots: Array.isArray(persisted.additionalRoots)
+        ? new Map(
+            persisted.additionalRoots
+              .filter(
+                (root): root is AdditionalWorkspaceRoot =>
+                  !!root &&
+                  typeof root.path === "string" &&
+                  root.path.trim().length > 0
+              )
+              .map((root) => [root.path, root])
+          )
+        : new Map(),
       usedTokens:
         typeof persisted.usedTokens === "number" ? persisted.usedTokens : 0,
       readPaths: new Set(
@@ -2387,9 +2928,14 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       customSystemPrompt: initialRequest?.customSystemPrompt,
       explicitContext: initialRequest?.explicitContext,
       contextTokenLimit: initialRequest?.contextTokenLimit,
+      contextMaxMode: initialRequest?.contextMaxMode,
       usedContextTokens: initialRequest?.usedContextTokens,
       requestedMaxOutputTokens: initialRequest?.requestedMaxOutputTokens,
       requestedModelParameters: initialRequest?.requestedModelParameters,
+      // Brand-new session — no persisted additionalRoots yet. The
+      // `'config'` source entries get injected by the bridge after
+      // session creation (see Phase 4: loadConfiguredAdditionalRoots).
+      additionalRoots: new Map(),
       usedTokens: initialRequest?.usedContextTokens || 0,
       readPaths: new Set(),
       readSnapshots: [],
@@ -2499,6 +3045,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
 
     if (!session) {
       session = this.createFreshSession(conversationId, initialRequest)
+      this.loadConfiguredAdditionalRoots(session)
 
       this.sessions.set(conversationId, session)
       this.logger.log(
@@ -2547,6 +3094,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
       if (initialRequest?.contextTokenLimit !== undefined) {
         session.contextTokenLimit = initialRequest.contextTokenLimit
       }
+      if (initialRequest?.contextMaxMode !== undefined) {
+        session.contextMaxMode = initialRequest.contextMaxMode
+      }
       if (initialRequest?.usedContextTokens !== undefined) {
         session.usedContextTokens = initialRequest.usedContextTokens
         session.usedTokens = initialRequest.usedContextTokens
@@ -2559,6 +3109,7 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         session.requestedModelParameters =
           initialRequest.requestedModelParameters
       }
+      this.loadConfiguredAdditionalRoots(session)
 
       this.logger.log(
         `>>> Using existing session: ${conversationId} ` +
@@ -2605,7 +3156,10 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     session.messages.push(message)
     const record = this.createTranscriptRecord(message)
     session.messageRecords.push(record)
-    session.contextState.records = session.messageRecords
+    this.syncContextRecordsFromMessageRecords(
+      session.contextState,
+      session.messageRecords
+    )
     session.lastActivityAt = new Date()
 
     // Note: We do NOT run enforceToolProtocol here.
@@ -2743,6 +3297,22 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
           : "read_file",
     }
 
+    // Best-effort disk stat: capture mtime+size so getLatestReadSnapshot can
+    // detect external disk writes between two read_file calls in the same
+    // session (e.g. a shell script overwriting a smoke fixture). statSync
+    // is sync but cheap on a single file path; failures (relative paths,
+    // virtual sources, missing files) are silently dropped — the snapshot
+    // will simply skip the staleness check on the read side.
+    if (path.isAbsolute(filePath)) {
+      try {
+        const stat = fs.statSync(filePath)
+        nextSnapshot.diskMtimeMs = stat.mtimeMs
+        nextSnapshot.diskSizeBytes = stat.size
+      } catch {
+        // file not stat-able from bridge process; leave fields undefined.
+      }
+    }
+
     const withoutSameWindow = session.readSnapshots.filter((existing) => {
       return !(
         existing.filePath === nextSnapshot.filePath &&
@@ -2831,9 +3401,57 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         : undefined
     const requireCoverage = options?.requireCoverage !== false
 
+    // Cache the disk stat per call so multiple snapshot candidates for the
+    // same path don't re-stat the file.
+    let diskStatCached: { mtimeMs: number; size: number } | undefined
+    let diskStatProbed = false
+    const probeDiskStat = (): { mtimeMs: number; size: number } | undefined => {
+      if (diskStatProbed) return diskStatCached
+      diskStatProbed = true
+      if (!path.isAbsolute(normalizedPath)) return undefined
+      try {
+        const stat = fs.statSync(normalizedPath)
+        diskStatCached = {
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+        }
+      } catch {
+        diskStatCached = undefined
+      }
+      return diskStatCached
+    }
+
+    const isSnapshotStale = (snapshot: SessionReadSnapshot): boolean => {
+      // Snapshot has no captured disk state — bridge could not stat the
+      // path at capture time. Skip staleness check; the snapshot is the
+      // best evidence we have.
+      if (
+        typeof snapshot.diskMtimeMs !== "number" ||
+        typeof snapshot.diskSizeBytes !== "number"
+      ) {
+        return false
+      }
+      const stat = probeDiskStat()
+      // No current disk stat (file gone, or relative path): cannot prove
+      // staleness. Keep the snapshot.
+      if (!stat) return false
+      // mtime tolerance: 1ms slop to absorb FS rounding.
+      const mtimeDrift = Math.abs(stat.mtimeMs - snapshot.diskMtimeMs)
+      if (mtimeDrift > 1 || stat.size !== snapshot.diskSizeBytes) {
+        this.logger.debug(
+          `getLatestReadSnapshot: dropping stale snapshot for ${normalizedPath} ` +
+            `(captured mtime=${snapshot.diskMtimeMs} size=${snapshot.diskSizeBytes}, ` +
+            `current mtime=${stat.mtimeMs} size=${stat.size})`
+        )
+        return true
+      }
+      return false
+    }
+
     for (let index = session.readSnapshots.length - 1; index >= 0; index--) {
       const snapshot = session.readSnapshots[index]
       if (!snapshot || snapshot.filePath !== normalizedPath) continue
+      if (isSnapshotStale(snapshot)) continue
 
       if (requestedStart == null && requestedEnd == null) {
         return snapshot
@@ -4224,6 +4842,9 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         input: toolCall.input,
       })),
       expectedToolCallIds: Array.from(ctx.expectedToolCallIds),
+      allowedWorkspaceRoots: ctx.allowedWorkspaceRoots
+        ? [...ctx.allowedWorkspaceRoots]
+        : undefined,
     }
   }
 
@@ -4375,12 +4996,15 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
         previousContextRecords
       )
     ) {
-      session.contextState.records = reconciledRecords
+      this.syncContextRecordsFromMessageRecords(
+        session.contextState,
+        reconciledRecords
+      )
       const lastApplied = session.contextState.lastAppliedCompaction
       if (lastApplied) {
         session.contextState.lastAppliedCompaction = {
           ...lastApplied,
-          recordCount: reconciledRecords.length,
+          recordCount: session.contextState.records.length,
         }
       }
       if (
@@ -4415,8 +5039,190 @@ export class ChatSessionManager implements OnModuleInit, OnModuleDestroy {
     const session = this.getSession(conversationId)
     if (!session) return
     session.lastActivityAt = new Date()
-    session.contextState.records = session.messageRecords
+    this.syncContextRecordsFromMessageRecords(
+      session.contextState,
+      session.messageRecords
+    )
     this.schedulePersist(conversationId)
+  }
+
+  /**
+   * Add a workspace root to the session's `additionalRoots` map.
+   *
+   * Mirrors claude-code's `addDirectories` permission update — the
+   * IDE's `projectContext.workspaceFolders` are the primary source
+   * of truth, and this map carries roots that come in through other
+   * channels (REST API, `.cursor/agent-vibes.json` config). Once
+   * added, sub-agent inline tools can read/grep/list files inside
+   * the new root the same way they handle the IDE-pushed ones.
+   *
+   * Dedup key is the resolved absolute path (post `realpathSync` +
+   * macOS `/private` collapse), so two different relative paths
+   * pointing at the same dir merge into one entry. When an entry
+   * already exists, the higher-priority source wins:
+   * `'config'` > `'session'` (config is project-level intent;
+   * session is per-conversation user action). Equal-priority
+   * re-adds refresh `addedAt` and keep the original `rawPath`.
+   *
+   * Returns the resolved entry that's now in the map, or `null`
+   * when the input path could not be resolved (caller surfaces a
+   * 400 in the REST handler).
+   */
+  addAdditionalWorkspaceRoot(
+    conversationId: string,
+    rawPath: string,
+    source: "session" | "config"
+  ): AdditionalWorkspaceRoot | null {
+    const session = this.getSession(conversationId)
+    if (!session) return null
+    const trimmedRaw = (rawPath || "").trim()
+    if (!trimmedRaw) return null
+    const resolved = normalizePathForBoundaryCheck(trimmedRaw)
+    if (!resolved) return null
+
+    if (!session.additionalRoots) {
+      session.additionalRoots = new Map()
+    }
+    const existing = session.additionalRoots.get(resolved)
+    const priority: Record<"session" | "config", number> = {
+      session: 1,
+      config: 2,
+    }
+    if (existing && priority[existing.source] > priority[source]) {
+      return existing
+    }
+    const entry: AdditionalWorkspaceRoot = {
+      path: resolved,
+      rawPath: trimmedRaw,
+      source,
+      addedAt: Date.now(),
+    }
+    session.additionalRoots.set(resolved, entry)
+    this.markContextStateDirty(conversationId)
+    return entry
+  }
+
+  /**
+   * Remove a workspace root from the session's `additionalRoots`.
+   *
+   * `'config'` source entries CAN be removed at runtime — they will
+   * be re-added on the next session creation by the bridge config
+   * loader, so the runtime delete is effectively a session-scoped
+   * mute. The user can permanently remove a config root by editing
+   * `.cursor/agent-vibes.json`.
+   *
+   * Returns `true` when an entry was actually removed.
+   */
+  removeAdditionalWorkspaceRoot(
+    conversationId: string,
+    rawPath: string
+  ): boolean {
+    const session = this.getSession(conversationId)
+    if (!session?.additionalRoots) return false
+    const trimmedRaw = (rawPath || "").trim()
+    if (!trimmedRaw) return false
+    const resolved = normalizePathForBoundaryCheck(trimmedRaw)
+    if (!resolved) return false
+    const existed = session.additionalRoots.delete(resolved)
+    if (existed) {
+      this.markContextStateDirty(conversationId)
+    }
+    return existed
+  }
+
+  /**
+   * List the resolved set of allowed workspace roots for a session.
+   *
+   * Combines `projectContext.rootPath`, IDE-pushed
+   * `projectContext.workspaceFolders`, and `additionalRoots` into a
+   * single ordered, dedup'd list of absolute paths. The boundary
+   * check (`isPathWithinAllowedRoots`) and sub-agent system-prompt
+   * injection both consume this list — keeping the union centralized
+   * means the two stay in lockstep.
+   */
+  listAllowedWorkspaceRoots(conversationId: string): string[] {
+    const session = this.getSession(conversationId)
+    if (!session) return []
+    return resolveAllowedWorkspaceRoots({
+      rootPath: session.projectContext?.rootPath,
+      workspaceFolders: session.projectContext?.workspaceFolders,
+      additionalRoots: session.additionalRoots,
+    })
+  }
+
+  /**
+   * Inspect the additional-roots map directly. Used by REST
+   * handlers to render `{ session: [...], config: [...] }` for
+   * dashboards. Returns a plain array snapshot so callers can't
+   * mutate session state.
+   */
+  getAdditionalWorkspaceRoots(
+    conversationId: string
+  ): AdditionalWorkspaceRoot[] {
+    const session = this.getSession(conversationId)
+    if (!session?.additionalRoots) return []
+    return Array.from(session.additionalRoots.values())
+  }
+
+  /**
+   * Load project-level extra working directories from
+   * `.cursor/agent-vibes.json`. Supported keys:
+   * `additionalWorkingDirectories` (preferred) and `extraRoots`
+   * (legacy alias). Relative paths are resolved against the primary
+   * workspace root from the IDE-synced project context.
+   */
+  private loadConfiguredAdditionalRoots(session: ChatSession): void {
+    if (session.configuredAdditionalRootsLoaded) return
+    const workspaceRoot = session.projectContext?.rootPath
+    if (!workspaceRoot) return
+    session.configuredAdditionalRootsLoaded = true
+
+    const configPath = path.join(workspaceRoot, ".cursor", "agent-vibes.json")
+    if (!fs.existsSync(configPath)) return
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(fs.readFileSync(configPath, "utf8"))
+    } catch (error) {
+      this.logger.warn(
+        `Failed to parse ${configPath}: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return
+    }
+
+    const record =
+      parsed && typeof parsed === "object"
+        ? (parsed as Record<string, unknown>)
+        : {}
+    const configured = [
+      ...(Array.isArray(record.additionalWorkingDirectories)
+        ? (record.additionalWorkingDirectories as unknown[])
+        : []),
+      ...(Array.isArray(record.extraRoots)
+        ? (record.extraRoots as unknown[])
+        : []),
+    ]
+
+    for (const raw of configured) {
+      if (typeof raw !== "string" || raw.trim().length === 0) continue
+      const rawPath = raw.trim()
+      const absPath = path.isAbsolute(rawPath)
+        ? rawPath
+        : path.resolve(workspaceRoot, rawPath)
+      const resolved = normalizePathForBoundaryCheck(absPath)
+      if (!resolved) continue
+      if (!session.additionalRoots) {
+        session.additionalRoots = new Map()
+      }
+      const existing = session.additionalRoots.get(resolved)
+      if (existing?.source === "session") continue
+      session.additionalRoots.set(resolved, {
+        path: resolved,
+        rawPath,
+        source: "config",
+        addedAt: Date.now(),
+      })
+    }
   }
 
   getInvestigationMemory(

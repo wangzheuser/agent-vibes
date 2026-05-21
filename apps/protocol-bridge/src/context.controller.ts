@@ -1,14 +1,17 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpException,
   HttpStatus,
   Logger,
+  Param,
   Post,
 } from "@nestjs/common"
 import { ApiOperation, ApiTags } from "@nestjs/swagger"
-import { ContextManagerService, ContextTelemetryService } from "./context"
+import { ContextTelemetryService } from "./context"
+import { CursorConnectStreamService } from "./protocol/cursor/cursor-connect-stream.service"
 import { ChatSessionManager } from "./protocol/cursor/session/chat-session.service"
 
 interface ManualCompactRequestBody {
@@ -17,7 +20,7 @@ interface ManualCompactRequestBody {
   /**
    * Optional override for the synthetic budget pressure used to drive the
    * compaction planner.  Smaller values force more aggressive compaction.
-   * Falls back to a tight default that always produces a boundary commit
+   * Defaults to a tight value that produces a boundary commit
    * when the transcript has enough material.
    */
   maxTokens?: number
@@ -31,6 +34,13 @@ interface ManualCompactResponseBody {
   estimatedTokens?: number
   archivedMessageCount?: number
   summaryTokenCount?: number
+}
+
+interface WorkingDirectoriesRequestBody {
+  /** One path for convenience; `paths` is preferred for batch updates. */
+  path?: string
+  /** Absolute or workspace-relative directories to add/remove. */
+  paths?: string[]
 }
 
 /**
@@ -48,9 +58,9 @@ export class ContextController {
   private readonly logger = new Logger(ContextController.name)
 
   constructor(
-    private readonly contextManager: ContextManagerService,
     private readonly telemetry: ContextTelemetryService,
-    private readonly chatSessions: ChatSessionManager
+    private readonly chatSessions: ChatSessionManager,
+    private readonly cursorStream: CursorConnectStreamService
   ) {}
 
   @Get("telemetry")
@@ -86,14 +96,110 @@ export class ContextController {
     }
   }
 
+  @Get(":conversationId/working-directories")
+  @ApiOperation({
+    summary: "List allowed working directories for a Cursor chat session",
+  })
+  getWorkingDirectories(@Param("conversationId") conversationId: string) {
+    const session = this.chatSessions.getSession(conversationId)
+    if (!session) {
+      throw new HttpException(
+        `Session not found: ${conversationId}`,
+        HttpStatus.NOT_FOUND
+      )
+    }
+    return {
+      ok: true,
+      conversationId,
+      allowedRoots: this.chatSessions.listAllowedWorkspaceRoots(conversationId),
+      additionalRoots:
+        this.chatSessions.getAdditionalWorkspaceRoots(conversationId),
+    }
+  }
+
+  @Post(":conversationId/working-directories")
+  @ApiOperation({
+    summary: "Add additional working directories to a Cursor chat session",
+  })
+  addWorkingDirectories(
+    @Param("conversationId") conversationId: string,
+    @Body() body: WorkingDirectoriesRequestBody
+  ) {
+    const session = this.chatSessions.getSession(conversationId)
+    if (!session) {
+      throw new HttpException(
+        `Session not found: ${conversationId}`,
+        HttpStatus.NOT_FOUND
+      )
+    }
+    const paths = this.normalizeWorkingDirectoryPaths(body)
+    if (paths.length === 0) {
+      throw new HttpException("paths is required", HttpStatus.BAD_REQUEST)
+    }
+    const added = paths.map((rawPath) => {
+      const entry = this.chatSessions.addAdditionalWorkspaceRoot(
+        conversationId,
+        rawPath,
+        "session"
+      )
+      if (!entry) {
+        throw new HttpException(
+          `Invalid working directory: ${rawPath}`,
+          HttpStatus.BAD_REQUEST
+        )
+      }
+      return entry
+    })
+    return {
+      ok: true,
+      conversationId,
+      added,
+      allowedRoots: this.chatSessions.listAllowedWorkspaceRoots(conversationId),
+      additionalRoots:
+        this.chatSessions.getAdditionalWorkspaceRoots(conversationId),
+    }
+  }
+
+  @Delete(":conversationId/working-directories")
+  @ApiOperation({
+    summary: "Remove additional working directories from a Cursor chat session",
+  })
+  deleteWorkingDirectories(
+    @Param("conversationId") conversationId: string,
+    @Body() body: WorkingDirectoriesRequestBody
+  ) {
+    const session = this.chatSessions.getSession(conversationId)
+    if (!session) {
+      throw new HttpException(
+        `Session not found: ${conversationId}`,
+        HttpStatus.NOT_FOUND
+      )
+    }
+    const paths = this.normalizeWorkingDirectoryPaths(body)
+    if (paths.length === 0) {
+      throw new HttpException("paths is required", HttpStatus.BAD_REQUEST)
+    }
+    const removed = paths.filter((rawPath) =>
+      this.chatSessions.removeAdditionalWorkspaceRoot(conversationId, rawPath)
+    )
+    return {
+      ok: true,
+      conversationId,
+      removed,
+      allowedRoots: this.chatSessions.listAllowedWorkspaceRoots(conversationId),
+      additionalRoots:
+        this.chatSessions.getAdditionalWorkspaceRoots(conversationId),
+    }
+  }
+
   @Post("compact")
   @ApiOperation({
     summary:
       "Force a manual compaction commit on the given session's transcript",
   })
-  manualCompact(
+  async manualCompact(
     @Body() body: ManualCompactRequestBody
-  ): ManualCompactResponseBody {
+  ): Promise<ManualCompactResponseBody> {
     const conversationId =
       typeof body.conversationId === "string" ? body.conversationId.trim() : ""
     if (!conversationId) {
@@ -122,20 +228,12 @@ export class ContextController {
         ? Math.floor(body.maxTokens)
         : 4_000
 
-    const result = this.contextManager.manualCompact(
-      session.contextState,
-      this.buildEmptyAttachmentSnapshotForSession(),
-      {
-        maxTokens,
-        // We do not know the system-prompt budget here — the planner uses
-        // this only to sanity-clamp the budget, so passing 0 yields the
-        // most aggressive compaction.  That matches the "force a summary"
-        // intent of the manual entry point.
-        systemPromptTokens: 0,
-      }
+    const result = await this.cursorStream.compactConversationNow(
+      conversationId,
+      maxTokens
     )
 
-    if (!result.appliedCompaction) {
+    if (!result.applied) {
       return {
         ok: true,
         conversationId,
@@ -145,10 +243,9 @@ export class ContextController {
       }
     }
 
-    this.chatSessions.markContextStateDirty(conversationId)
     this.logger.warn(
-      `Manual compaction applied for ${conversationId}: ${result.appliedCompaction.commit.archivedMessageCount} records archived, ` +
-        `summary=${result.appliedCompaction.commit.summaryTokenCount} tokens`
+      `Manual compaction applied for ${conversationId}: ${result.archivedMessageCount} records archived, ` +
+        `summary=${result.summaryTokenCount} tokens`
     )
 
     return {
@@ -156,22 +253,26 @@ export class ContextController {
       conversationId,
       applied: true,
       estimatedTokens: result.estimatedTokens,
-      archivedMessageCount:
-        result.appliedCompaction.commit.archivedMessageCount,
-      summaryTokenCount: result.appliedCompaction.commit.summaryTokenCount,
+      archivedMessageCount: result.archivedMessageCount,
+      summaryTokenCount: result.summaryTokenCount,
     }
   }
 
-  private buildEmptyAttachmentSnapshotForSession() {
-    // The manual compaction path is intentionally session-data-only: the
-    // dashboard does not (today) carry the full attachment snapshot the
-    // streaming path can build.  Passing an empty snapshot is safe — the
-    // planner will simply skip the live attachments slot and base its
-    // boundary on the transcript alone.
-    return {
-      readPaths: [],
-      fileStates: [],
-      todos: [],
+  private normalizeWorkingDirectoryPaths(
+    body: WorkingDirectoriesRequestBody
+  ): string[] {
+    const raw = [
+      ...(Array.isArray(body.paths) ? body.paths : []),
+      ...(typeof body.path === "string" ? [body.path] : []),
+    ]
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const value of raw) {
+      const normalized = typeof value === "string" ? value.trim() : ""
+      if (!normalized || seen.has(normalized)) continue
+      seen.add(normalized)
+      out.push(normalized)
     }
+    return out
   }
 }

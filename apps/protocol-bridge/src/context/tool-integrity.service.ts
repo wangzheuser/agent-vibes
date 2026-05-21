@@ -414,7 +414,14 @@ export class ToolIntegrityService {
 
     while (truncationIndex < messages.length) {
       const retainedMessages = messages.slice(truncationIndex)
-      if (this.tokenCounter.countMessages(retainedMessages) <= targetTokens) {
+      const fitsBudget =
+        this.tokenCounter.countMessages(retainedMessages) <= targetTokens
+      const hasValidToolResults = this.retainedMessagesHaveValidToolResults(
+        retainedMessages,
+        mode
+      )
+
+      if (fitsBudget && hasValidToolResults) {
         return truncationIndex
       }
 
@@ -428,7 +435,7 @@ export class ToolIntegrityService {
       }
 
       this.logger.debug(
-        `Advancing truncation point from ${truncationIndex} to ${nextIndex} to satisfy token budget without breaking tool pairs`
+        `Advancing truncation point from ${truncationIndex} to ${nextIndex} to satisfy token budget and tool-result integrity`
       )
       truncationIndex = nextIndex
     }

@@ -8,13 +8,38 @@
 export * from "./types"
 
 // Context services
+export {
+  resolveAutoCompactTokenLimit,
+  type ContextAutoCompactInput,
+} from "./context-auto-compact-policy"
+export {
+  CodexContextAdapterService,
+  CODEX_SUMMARIZATION_PROMPT,
+  CODEX_SUMMARY_PREFIX,
+} from "./codex-context-adapter.service"
+export type {
+  CodexCompactReferenceInput,
+  CodexRemoteCompactProvider,
+  CodexRemoteCompactRequest,
+  CodexRemoteCompactResult,
+} from "./codex-context-adapter.service"
 export { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
 export type {
   ContextAttachmentSnapshot,
   SessionTodoAttachmentLike,
 } from "./context-attachment-builder.service"
+export { ContextCompactRunnerService } from "./context-compact-runner.service"
+export type {
+  ContextCompactRunnerHookProvider,
+  ContextCompactRunnerSummaryProvider,
+  ContextCompactRunnerSummaryRequest,
+  ContextCompactRunnerSummaryResult,
+} from "./context-compact-runner.service"
 export { ContextCompactionService } from "./context-compaction.service"
-export type { ContextCompactionResult } from "./context-compaction.service"
+export type {
+  ContextCompactionCandidate,
+  ContextCompactionResult,
+} from "./context-compaction.service"
 export {
   ContextHookExecutorService,
   type PreCompactHookPayload,
@@ -24,14 +49,51 @@ export type {
   ReactiveRecoveryOutcome,
   ReactiveRecoveryRequest,
 } from "./context-manager.service"
+export { ContextNativeCacheEditService } from "./context-native-cache-edit.service"
+export type { ContextNativeCacheEditApplyResult } from "./context-native-cache-edit.service"
+export { ContextNativeManagementService } from "./context-native-management.service"
+export type {
+  AnthropicNativeContextManagementInput,
+  ContextNativeEditStrategy,
+  ContextNativeManagementConfig,
+} from "./context-native-management.service"
 export { ContextProjectionService } from "./context-projection.service"
-export { ContextSummaryService } from "./context-summary.service"
+export { ContextRequestPlannerService } from "./context-request-planner.service"
+export type {
+  ContextProjectionOptions,
+  ContextProjectionBudget,
+  ContextRequestBudget,
+  ContextRequestBudgetInput,
+} from "./context-request-planner.service"
 export { ContextTelemetryService } from "./context-telemetry.service"
 export type {
   ContextTelemetryEvent,
   ContextTelemetryEventDetail,
 } from "./context-telemetry.service"
+export {
+  createCompactBoundaryRecord,
+  createCompactSummaryRecord,
+  createAttachmentRecord,
+  createHookResultRecord,
+  createMicrocompactBoundaryRecord,
+  createSnipBoundaryRecord,
+  deriveCompactionHistoryFromTranscript,
+  findLastCompactBoundaryIndex,
+  getActiveCompactCommitFromTranscript,
+  getRecordsAfterCompactBoundary,
+  isAttachmentRecord,
+  isCompactBoundaryRecord,
+  isCompactSummaryRecord,
+  isHookResultRecord,
+  isMessageRecord,
+  isMicrocompactBoundaryRecord,
+  isSnipBoundaryRecord,
+  projectSnippedView,
+  stripInternalContextEvents,
+} from "./context-transcript-events"
 export { ContextUsageLedgerService } from "./context-usage-ledger.service"
+export { SessionMemoryCompactionService } from "./session-memory-compaction.service"
+export type { SessionMemoryBuildOptions } from "./session-memory-compaction.service"
 export { TokenCounterService } from "./token-counter.service"
 export { ToolIntegrityService } from "./tool-integrity.service"
 export { assertIntegrity, enforceToolProtocol } from "./tool-protocol-integrity"
@@ -59,6 +121,18 @@ export {
 // Backend-agnostic prompt-too-long error inspection
 export { detectPromptTooLong } from "./prompt-too-long"
 export type { PromptTooLongDetection } from "./prompt-too-long"
+
+// Sub-agent session-memory formatting (shared by streaming service
+// and compaction-time extraction so the two entry shapes stay aligned)
+export {
+  buildSubAgentMemorySourceCompactionId,
+  formatSubAgentMemoryBody,
+  formatSubAgentMemoryEntry,
+} from "./sub-agent-memory-formatter"
+export type {
+  SubAgentMemoryFormatInput,
+  SubAgentMemoryFormatOptions,
+} from "./sub-agent-memory-formatter"
 
 // Modules
 export { ContextModule } from "./context.module"

@@ -2,6 +2,7 @@ import { Module } from "@nestjs/common"
 import { ContextModule } from "../../context/context.module"
 import { GoogleModule } from "../../llm/google/google.module"
 import { KiroModule } from "../../llm/aws/kiro.module"
+import { ImageGenerationModule } from "../../llm/image-generation/image-generation.module"
 import { CodexModule } from "../../llm/openai/codex.module"
 import { OpenaiCompatModule } from "../../llm/openai/openai-compat.module"
 import { ModelModule } from "../../llm/shared/model.module"
@@ -32,6 +33,7 @@ import { WebSearchAdapterFactory, WebSearchService } from "./web-search"
     AnthropicModule,
     CodexModule,
     GoogleModule,
+    ImageGenerationModule,
     KiroModule,
     ContextModule,
     ModelModule,

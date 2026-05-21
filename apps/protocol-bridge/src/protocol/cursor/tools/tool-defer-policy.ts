@@ -76,10 +76,18 @@ export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "grep_search",
   // ── Shell / execution ─────────────────────────────────────
   "run_terminal_command",
+  "exec_command",
+  "background_shell_spawn",
+  "write_shell_stdin",
+  "write_stdin",
+  "apply_patch",
   // ── Planning / todos ──────────────────────────────────────
   "create_plan",
+  "update_plan",
   "read_todos",
   "update_todos",
+  // ── User interaction ──────────────────────────────────────
+  "ask_question",
   // ── Sub-agent / await ─────────────────────────────────────
   "task",
   "await_task",

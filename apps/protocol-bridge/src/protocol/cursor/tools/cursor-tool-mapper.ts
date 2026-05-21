@@ -245,8 +245,8 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
       "Search the web for information. The bridge picks one adapter " +
       "per session (build-time selection) based on the active backend: " +
       "Google grounding for Gemini sessions, the Anthropic " +
-      "`web_search_20250305` server tool for Claude API sessions, the " +
-      "OpenAI Responses `web_search` server tool for Codex sessions, " +
+      "`web_search_20250305` server tool for Claude API sessions, " +
+      "Exa MCP for Codex sessions, " +
       "and a keyless chain (Brave LLM Context if API key configured, " +
       "else Exa MCP, else DuckDuckGo HTML scrape) for backends without " +
       "first-party search. There is no error-time fallback — if the " +
@@ -922,14 +922,16 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_DIAGNOSTICS: {
     name: "read_lints",
-    description: "Read lint/diagnostic warnings and errors for files",
+    description:
+      "Read lint/diagnostic warnings and errors for files. Paths must be inside the active workspace root — the IDE rejects paths outside the workspace with `path is outside workspace root`. Use absolute paths under the project, or workspace-relative paths (the bridge resolves them against the active project root). Use full file paths, not directories.",
     input_schema: {
       type: "object",
       properties: {
         paths: {
           type: "array",
           items: { type: "string" },
-          description: "File paths to check for diagnostics",
+          description:
+            "File paths to check for diagnostics. Must be inside the workspace root.",
         },
       },
       required: ["paths"],
@@ -938,14 +940,16 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_READ_LINTS: {
     name: "read_lints",
-    description: "Read lint/diagnostic warnings and errors for files",
+    description:
+      "Read lint/diagnostic warnings and errors for files. Paths must be inside the active workspace root — the IDE rejects paths outside the workspace with `path is outside workspace root`. Use absolute paths under the project, or workspace-relative paths (the bridge resolves them against the active project root). Use full file paths, not directories.",
     input_schema: {
       type: "object",
       properties: {
         paths: {
           type: "array",
           items: { type: "string" },
-          description: "File paths to check for diagnostics",
+          description:
+            "File paths to check for diagnostics. Must be inside the workspace root.",
         },
       },
       required: ["paths"],
@@ -1260,11 +1264,23 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN: {
     name: "background_shell_spawn",
-    description: "Spawn a long-running background process",
+    description:
+      "Spawn a long-running shell session that runs `command` inside a " +
+      "login shell (zsh on macOS, bash on Linux). The shell is what " +
+      "executes — `write_shell_stdin` writes to the shell's stdin, NOT " +
+      "to a child program's stdin. To feed stdin to a specific program, " +
+      "embed it in the command (e.g. `printf '%s\\n' input | program`) " +
+      "or use a heredoc inside `command`. Returns a shellId you can " +
+      "later use with `write_shell_stdin` and other shell-lifecycle tools.",
     input_schema: {
       type: "object",
       properties: {
-        command: { type: "string", description: "The command to run" },
+        command: {
+          type: "string",
+          description:
+            "Shell command line; runs via `shell -c <command>` so " +
+            "redirections, pipes, and heredocs work as in a normal shell.",
+        },
         cwd: { type: "string", description: "Working directory" },
       },
       required: ["command"],
@@ -1273,12 +1289,26 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
 
   CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN: {
     name: "write_shell_stdin",
-    description: "Write input to a running shell process",
+    description:
+      "Write data to the stdin of a shell session previously spawned by " +
+      "`background_shell_spawn`. Note: input is consumed by the shell " +
+      "process (zsh/bash), not directly by any inner program — use a " +
+      "pipe or heredoc in the original `command` if you need to feed " +
+      "stdin to a specific program.",
     input_schema: {
       type: "object",
       properties: {
-        shellId: { type: "number", description: "The shell process ID" },
-        data: { type: "string", description: "The data to write" },
+        shellId: {
+          type: "number",
+          description:
+            "The shell session id returned by background_shell_spawn.",
+        },
+        data: {
+          type: "string",
+          description:
+            "Data to write to the shell's stdin. Append a newline if " +
+            "you want the shell to evaluate the line immediately.",
+        },
       },
       required: ["shellId", "data"],
     },
@@ -3086,7 +3116,7 @@ export function buildToolsForApi(
     const split = applyDeferPolicy(tools, isBuiltInByName, options.defer)
     return split.tools
   }
-  return tools
+  return sortToolDefinitionsForPromptCache(tools)
 }
 
 /**
@@ -3096,23 +3126,15 @@ export function buildToolsForApi(
  * cursor-connect-stream layer renders it into the system prompt and the
  * `discover_tool` handler looks it up by name.
  *
- * For the codex backend, defer is currently a no-op (codex translator
- * has its own request-builder pipeline that doesn't use this catalog).
+ * Codex uses the same defer split as the other bridge-owned backends. The
+ * Codex request builder receives the already-trimmed tools array, and the
+ * cursor-connect-stream layer renders the deferred catalog into the Codex
+ * system prompt.
  */
 export function buildToolsForApiWithDefer(
   supportedTools: string[],
   options?: BuildToolsForApiOptions
 ): BuildToolsForApiResult {
-  // For codex we don't run the defer split — its request builder owns
-  // tool serialization separately.  Return the legacy shape with an
-  // empty deferred catalog so callers can use the same code path.
-  if (options?.backend === "codex") {
-    return {
-      tools: buildCodexToolsForApi(supportedTools, options),
-      deferred: [],
-    }
-  }
-
   // Re-run the main path but capture provenance so we can split.
   // Inlining the logic is cleaner than threading two return shapes
   // through `buildToolsForApi` itself.
@@ -3167,15 +3189,26 @@ function applyDeferPolicy(
     })
   }
 
+  const sortedCore = sortToolDefinitionsForPromptCache(core)
+
   // Inject the bridge-internal `discover_tool` so the model can pull
   // any deferred entry into core mid-session.  Only inject when there
   // is at least one deferred tool — empty catalogs would just waste
   // tokens on a useless tool.
   if (deferred.length > 0) {
-    core.push(DISCOVER_TOOL_DEFINITION)
+    sortedCore.push(DISCOVER_TOOL_DEFINITION)
   }
 
-  return { tools: core, deferred }
+  return {
+    tools: sortedCore,
+    deferred: deferred.sort((a, b) => a.name.localeCompare(b.name)),
+  }
+}
+
+function sortToolDefinitionsForPromptCache(
+  tools: ToolDefinition[]
+): ToolDefinition[] {
+  return [...tools].sort((a, b) => a.name.localeCompare(b.name))
 }
 
 /**

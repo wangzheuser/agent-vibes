@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common"
 import {
   applyDomainFilters,
   WebSearchAbortError,
+  WebSearchEmptyResultError,
   type WebSearchAdapter,
   type WebSearchAdapterName,
   type WebSearchOptions,
@@ -148,7 +149,11 @@ export class BraveLlmAdapter implements WebSearchAdapter {
       this.logger.warn(
         `[brave-llm] empty result (query="${query.slice(0, 80)}")`
       )
-      throw new Error("brave-llm returned no results")
+      throw new WebSearchEmptyResultError(
+        this.name,
+        query,
+        "brave-llm returned no results"
+      )
     }
 
     return trimmed

@@ -9,6 +9,7 @@ import {
   ValidateNested,
 } from "class-validator"
 import type { ThinkingIntent } from "../../../llm/shared/thinking-types"
+import type { ContextNativeManagementConfig } from "../../../context"
 
 class MessageContentDto {
   @ApiProperty()
@@ -202,6 +203,14 @@ export class CreateMessageDto {
   betas?: string[] | string
 
   @ApiPropertyOptional({
+    type: Object,
+    description:
+      "Optional Anthropic native context-management edits. Forwarded only to official Claude API routes.",
+  })
+  @IsOptional()
+  context_management?: ContextNativeManagementConfig
+
+  @ApiPropertyOptional({
     description:
       "Optional Anthropic service tier hint. Accepted for compatibility and may be ignored by the backend.",
   })
@@ -221,8 +230,8 @@ export class CreateMessageDto {
   /**
    * Internal context token budget (not part of Anthropic API).
    * Computed by CursorConnectStreamService.resolveMessageBudget() and passed
-   * to GoogleService.enforceTokenBudget() so both layers use a consistent
-   * soft limit instead of the raw 200k hard cap.
+   * to backend adapters as a request-size assertion. Context reduction is
+   * performed before provider dispatch.
    */
   @IsOptional()
   @IsNumber()
@@ -237,14 +246,6 @@ export class CreateMessageDto {
   @IsArray()
   @IsString({ each: true })
   _pendingToolUseIds?: string[]
-
-  /**
-   * Internal count of leading context messages that must survive any
-   * backend-side payload shrink pass.
-   */
-  @IsOptional()
-  @IsNumber()
-  _protectedContextMessageCount?: number
 
   /**
    * Internal backend-agnostic thinking intent.

@@ -17,4 +17,4 @@ export type {
   WebSearchResponse,
   WebSearchResult,
 } from "./types"
-export { WebSearchAbortError } from "./types"
+export { WebSearchAbortError, WebSearchEmptyResultError } from "./types"

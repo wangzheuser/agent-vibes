@@ -537,6 +537,18 @@ function buildVariantRichDisplayName(
   return `${baseDisplayName} <span style="color: var(--cursor-text-tertiary); font-size: 0.85em;">:icon-brain:${suffix}</span>`
 }
 
+function resolveCursorContextTokenLimits(model: CursorDisplayModel): {
+  normal: number
+  max: number
+} {
+  const normal =
+    model.contextTokenLimit || (model.family === "gemini" ? 1_000_000 : 200_000)
+  const max =
+    model.contextTokenLimitForMaxMode ||
+    (model.family === "claude" ? 1_000_000 : normal)
+  return { normal, max }
+}
+
 function buildVariant(
   modelName: string,
   effort: string | null,
@@ -957,8 +969,7 @@ function buildLegacySingleVariantModel(
     `reasoning=${toCursorReasoningValue(effort)}`,
     `fast=${fastMode ? "true" : "false"}`,
   ]
-  const contextTokenLimit =
-    model.contextTokenLimit || (model.family === "gemini" ? 1_000_000 : 200_000)
+  const contextTokenLimits = resolveCursorContextTokenLimits(model)
   const legacyAliases = Array.from(
     new Set([...(model.legacySlugs || []), model.name])
   )
@@ -977,9 +988,8 @@ function buildLegacySingleVariantModel(
     supportsImages: model.supportsImages ?? true,
     supportsMaxMode: capability.supportsMaxMode,
     supportsNonMaxMode: capability.supportsNonMaxMode,
-    contextTokenLimit,
-    contextTokenLimitForMaxMode:
-      model.contextTokenLimitForMaxMode || contextTokenLimit,
+    contextTokenLimit: contextTokenLimits.normal,
+    contextTokenLimitForMaxMode: contextTokenLimits.max,
     clientDisplayName,
     serverModelName: topLevelName,
     supportsPlanMode: model.supportsPlanMode ?? true,
@@ -1202,8 +1212,7 @@ export function buildCursorAvailableModel(
   }
 ): AvailableModelsResponse_AvailableModel {
   const capability = resolveAvailableModelMode(model)
-  const contextTokenLimit =
-    model.contextTokenLimit || (model.family === "gemini" ? 1_000_000 : 200_000)
+  const contextTokenLimits = resolveCursorContextTokenLimits(model)
   const includeParameterDefinitions =
     options?.includeParameterDefinitions ?? true
   const includeVariants = options?.includeVariants ?? true
@@ -1230,9 +1239,8 @@ export function buildCursorAvailableModel(
     supportsImages: model.supportsImages ?? true,
     supportsMaxMode: capability.supportsMaxMode,
     supportsNonMaxMode: capability.supportsNonMaxMode,
-    contextTokenLimit,
-    contextTokenLimitForMaxMode:
-      model.contextTokenLimitForMaxMode || contextTokenLimit,
+    contextTokenLimit: contextTokenLimits.normal,
+    contextTokenLimitForMaxMode: contextTokenLimits.max,
     clientDisplayName: model.displayName,
     serverModelName: model.name,
     supportsPlanMode: model.supportsPlanMode ?? true,

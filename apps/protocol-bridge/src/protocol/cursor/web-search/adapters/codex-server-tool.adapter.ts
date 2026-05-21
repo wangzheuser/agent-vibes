@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common"
 import { CodexService } from "../../../../llm/openai/codex.service"
 import {
   applyDomainFilters,
+  WebSearchEmptyResultError,
   type WebSearchAdapter,
   type WebSearchAdapterName,
   type WebSearchOptions,
@@ -44,6 +45,7 @@ export class CodexServerToolAdapter implements WebSearchAdapter {
       query,
       model: options.model,
       conversationId: options.conversationId,
+      signal: options.signal,
     })
 
     throwIfAborted(options.signal)
@@ -68,39 +70,19 @@ export class CodexServerToolAdapter implements WebSearchAdapter {
 
     const summaryText = grounded.text.trim()
 
-    if (trimmed.length === 0 && summaryText.length === 0) {
+    if (trimmed.length === 0) {
       this.logger.warn(
-        `[codex-server-tool] empty result (query="${query.slice(0, 80)}")`
+        `[codex-server-tool] no parseable sources ` +
+          `(summary=${summaryText.length > 0 ? "present" : "empty"}, ` +
+          `query="${query.slice(0, 80)}")`
       )
-      throw new Error(
-        "codex-server-tool returned no results (empty web_search_call response)"
+      throw new WebSearchEmptyResultError(
+        this.name,
+        query,
+        summaryText.length > 0
+          ? "codex-server-tool returned a text-only summary without sources"
+          : "codex-server-tool returned no results (empty web_search_call response)"
       )
-    }
-
-    // Codex's server-side web_search occasionally produces a useful
-    // assistant summary without emitting any url_citation annotations
-    // (typical of zero-state queries like "Cursor pricing 2026" where
-    // the model paraphrases known facts after the search call). The
-    // upstream WebSearchService treats `results.length === 0` as a
-    // hard failure and surfaces "no results" to the model, throwing
-    // away the summary text. Project the summary into a single
-    // synthetic result so the agent still receives the grounded
-    // answer; the synthetic URL stays inside the codex.com namespace
-    // so callers can attribute it to the adapter rather than confuse
-    // it with a real third-party citation.
-    if (trimmed.length === 0 && summaryText.length > 0) {
-      this.logger.debug(
-        `[codex-server-tool] synthesizing reference from text-only summary ` +
-          `(query="${query.slice(0, 80)}")`
-      )
-      return [
-        {
-          title: `Codex web_search summary: ${query.slice(0, 80)}`,
-          url: `https://codex/web_search?q=${encodeURIComponent(query)}`,
-          snippet: summaryText.slice(0, 1000),
-          chunk: summaryText,
-        },
-      ]
     }
 
     return trimmed

@@ -24,6 +24,7 @@ import { PersistenceService } from "../../persistence"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 import {
+  detectCurrentKiroVersion,
   getAccountConfigPathCandidates,
   resolveDefaultAccountConfigPath,
 } from "../../shared/protocol-bridge-paths"
@@ -110,6 +111,24 @@ interface KiroAccount extends CooldownableAccount {
   kiroApiKey?: string
   /** Promise guard so concurrent refreshes share one HTTP call. */
   refreshPromise?: Promise<void>
+  /** Runtime-only endpoint cooldowns, keyed by model + endpoint. */
+  endpointStates: Map<string, KiroEndpointCooldownState>
+}
+
+interface KiroEndpointCooldownState {
+  cooldownUntil: number
+  quotaExhausted: boolean
+  backoffLevel: number
+}
+
+function mergeKiroClientConfig(
+  entry: KiroAccountFileEntry
+): Partial<KiroClientConfig> {
+  return {
+    kiroVersion: entry.kiroVersion || detectCurrentKiroVersion() || undefined,
+    systemVersion: entry.systemVersion,
+    nodeVersion: entry.nodeVersion,
+  }
 }
 
 interface KiroAccountFileEntry {
@@ -160,6 +179,8 @@ export interface KiroQuotaSnapshot {
 
 const TOKEN_REFRESH_SKEW_SECONDS = 120
 const STREAM_REQUEST_TIMEOUT_MS = 5 * 60_000
+const ENDPOINT_QUOTA_BACKOFF_BASE_MS = 30_000
+const ENDPOINT_QUOTA_BACKOFF_MAX_MS = 15 * 60_000
 
 /** Fallback model IDs used when dynamic discovery has not yet completed. */
 const FALLBACK_KIRO_MODEL_IDS: string[] = [
@@ -272,22 +293,11 @@ export class KiroService implements OnModuleInit {
 
   supportsModel(model: string): boolean {
     if (!this.isAvailable()) return false
-    const normalizedModel = model.toLowerCase().trim()
-    // Check dynamic model list first (exact match on Kiro model IDs).
+    // Check dynamic model list first. Cursor-facing Claude aliases use
+    // hyphenated / thinking model IDs, while Kiro discovery reports dotted
+    // backend IDs such as "claude-opus-4.7".
     if (this.discoveredModels.length > 0) {
-      if (
-        this.discoveredModels.some(
-          (m) => m.modelId.toLowerCase() === normalizedModel
-        )
-      ) {
-        return true
-      }
-      // Also check after mapping through the Kiro model name translator
-      // (e.g. "claude-opus-4-7-thinking" -> "claude-opus-4.7").
-      const mapped = mapKiroModel(normalizedModel).toLowerCase()
-      if (
-        this.discoveredModels.some((m) => m.modelId.toLowerCase() === mapped)
-      ) {
+      if (this.findDiscoveredModel(model)) {
         return true
       }
     }
@@ -297,11 +307,11 @@ export class KiroService implements OnModuleInit {
 
   getConfiguredMaxContextTokens(model: string): number | undefined {
     if (!this.supportsModel(model)) return undefined
-    // Check discovered model token limits first.
-    const normalizedModel = model.toLowerCase().trim()
-    const discovered = this.discoveredModels.find(
-      (m) => m.modelId.toLowerCase() === normalizedModel
-    )
+    // Check discovered model token limits first. This must use the same alias
+    // mapping as supportsModel(); otherwise Cursor IDs like
+    // "claude-opus-4-7-thinking" miss Kiro's "claude-opus-4.7" metadata and
+    // incorrectly fall back to the generic Claude cap.
+    const discovered = this.findDiscoveredModel(model)
     if (discovered?.tokenLimits?.maxInputTokens) {
       return discovered.tokenLimits.maxInputTokens
     }
@@ -313,6 +323,15 @@ export class KiroService implements OnModuleInit {
       resolved = resolved === undefined ? limit : Math.min(resolved, limit)
     }
     return resolved
+  }
+
+  private findDiscoveredModel(model: string): KiroModelInfo | undefined {
+    const normalizedModel = model.toLowerCase().trim()
+    const mappedModel = mapKiroModel(normalizedModel).toLowerCase()
+    return this.discoveredModels.find((m) => {
+      const discoveredId = m.modelId.toLowerCase()
+      return discoveredId === normalizedModel || discoveredId === mappedModel
+    })
   }
 
   getPublicModelIds(): string[] {
@@ -353,11 +372,25 @@ export class KiroService implements OnModuleInit {
           backoffLevel: state.backoffLevel,
         }))
         .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
+      const endpointCooldowns = Array.from(account.endpointStates.entries())
+        .filter(([, state]) => state.cooldownUntil > now)
+        .map(([key, state]) => {
+          const [model = "", endpoint = ""] = key.split("\0")
+          return {
+            model,
+            endpoint,
+            cooldownUntil: state.cooldownUntil,
+            quotaExhausted: state.quotaExhausted,
+            backoffLevel: state.backoffLevel,
+          }
+        })
+        .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
 
       let state: BackendPoolEntryState = "ready"
       if (isAccountDisabled(account)) state = "disabled"
       else if (account.cooldownUntil > now) state = "cooldown"
       else if (modelCooldowns.length > 0) state = "model_cooldown"
+      else if (endpointCooldowns.length > 0) state = "degraded"
 
       return {
         id: account.stateKey,
@@ -372,6 +405,7 @@ export class KiroService implements OnModuleInit {
         maxContextTokens: account.maxContextTokens,
         priority: account.priority,
         modelCooldowns,
+        endpointCooldowns,
       }
     })
 
@@ -402,7 +436,9 @@ export class KiroService implements OnModuleInit {
   // ── Public entry points ─────────────────────────────────────────────────
 
   async sendClaudeMessage(dto: CreateMessageDto): Promise<AnthropicResponse> {
-    const account = this.pickAccountOrThrow(dto.model)
+    const account = this.pickAccountOrThrow(
+      this.resolveCooldownModel(dto.model)
+    )
     return this.executeNonStream(dto, account)
   }
 
@@ -410,7 +446,9 @@ export class KiroService implements OnModuleInit {
     dto: CreateMessageDto,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
-    const account = this.pickAccountOrThrow(dto.model)
+    const account = this.pickAccountOrThrow(
+      this.resolveCooldownModel(dto.model)
+    )
     yield* this.executeStream(dto, account, abortSignal)
   }
 
@@ -846,18 +884,19 @@ export class KiroService implements OnModuleInit {
           ? entry.preferredEndpoint
           : "auto",
       endpointFallback: entry.endpointFallback !== false,
-      client: {
-        kiroVersion: entry.kiroVersion,
-        systemVersion: entry.systemVersion,
-        nodeVersion: entry.nodeVersion,
-      },
+      client: mergeKiroClientConfig(entry),
       kiroApiKey: authMethod === "api_key" ? kiroApiKey : undefined,
       cooldownUntil: 0,
       modelStates: new Map(),
+      endpointStates: new Map(),
     }
   }
 
   // ── Account selection ──────────────────────────────────────────────────
+
+  private resolveCooldownModel(model: string | undefined): string {
+    return mapKiroModel(model || "")
+  }
 
   /**
    * Render a stable, human-friendly identifier for log lines: prefer the
@@ -888,11 +927,22 @@ export class KiroService implements OnModuleInit {
         (this.accountIndex + startOffset + offset) % this.accounts.length
       const account = this.accounts[idx]!
       if (exclude && exclude.has(account.stateKey)) continue
-      if (isAccountAvailableForModel(account, model, now)) {
+      if (
+        isAccountAvailableForModel(account, model, now) &&
+        this.hasAvailableEndpointForModel(account, model, now)
+      ) {
         return account
       }
     }
     return null
+  }
+
+  private hasAvailableEndpointForModel(
+    account: KiroAccount,
+    model: string,
+    now: number
+  ): boolean {
+    return this.getOrderedEndpoints(account, model, now).length > 0
   }
 
   private indexOfAccount(account: KiroAccount): number {
@@ -1088,7 +1138,7 @@ export class KiroService implements OnModuleInit {
 
   // ── Endpoint helpers ────────────────────────────────────────────────────
 
-  private getOrderedEndpoints(account: KiroAccount): KiroEndpoint[] {
+  private getBaseOrderedEndpoints(account: KiroAccount): KiroEndpoint[] {
     const fallback = account.endpointFallback
     let primary = 0
     switch (account.preferredEndpoint) {
@@ -1110,6 +1160,73 @@ export class KiroService implements OnModuleInit {
       ordered.push(KIRO_ENDPOINTS[i]!)
     }
     return ordered
+  }
+
+  private getOrderedEndpoints(
+    account: KiroAccount,
+    model?: string,
+    now: number = Date.now()
+  ): KiroEndpoint[] {
+    const endpoints = this.getBaseOrderedEndpoints(account)
+    if (!model) return endpoints
+    return endpoints.filter((endpoint) =>
+      this.isEndpointAvailableForModel(account, endpoint, model, now)
+    )
+  }
+
+  private endpointCooldownKey(endpoint: KiroEndpoint, model: string): string {
+    return `${model}\0${endpoint.name}`
+  }
+
+  private isEndpointAvailableForModel(
+    account: KiroAccount,
+    endpoint: KiroEndpoint,
+    model: string,
+    now: number = Date.now()
+  ): boolean {
+    const key = this.endpointCooldownKey(endpoint, model)
+    const state = account.endpointStates.get(key)
+    if (!state) return true
+    if (state.cooldownUntil > now) return false
+    account.endpointStates.delete(key)
+    return true
+  }
+
+  private markEndpointCooldown(
+    account: KiroAccount,
+    endpoint: KiroEndpoint,
+    model: string,
+    retryAfterHeader?: string
+  ): void {
+    const key = this.endpointCooldownKey(endpoint, model)
+    const existing = account.endpointStates.get(key)
+    const backoffLevel = existing?.backoffLevel ?? 0
+    const delayMs = retryAfterHeader
+      ? parseEndpointRetryAfterMs(
+          retryAfterHeader,
+          ENDPOINT_QUOTA_BACKOFF_BASE_MS
+        )
+      : nextEndpointQuotaCooldown(backoffLevel)
+
+    account.endpointStates.set(key, {
+      cooldownUntil: Date.now() + delayMs,
+      quotaExhausted: true,
+      backoffLevel: backoffLevel + 1,
+    })
+
+    this.logger.warn(
+      `[Kiro] Endpoint ${endpoint.name} 429 for ${this.accountTag(account)} ` +
+        `model=${model}; endpoint cooldown ${formatEndpointDuration(delayMs)} ` +
+        `(backoff L${backoffLevel + 1}); trying next endpoint`
+    )
+  }
+
+  private markEndpointSuccess(
+    account: KiroAccount,
+    endpoint: KiroEndpoint,
+    model: string
+  ): void {
+    account.endpointStates.delete(this.endpointCooldownKey(endpoint, model))
   }
 
   private buildProxyDispatcher(account: KiroAccount): unknown {
@@ -1149,6 +1266,48 @@ export class KiroService implements OnModuleInit {
     return /thinking/.test((dto.model || "").toLowerCase())
   }
 
+  private isNonRetryableRequestShapeError(
+    status: number,
+    responseText: string
+  ): boolean {
+    if (status !== 400) return false
+    return /toolconfig|tool_config_missing|tool config|schema|validation/i.test(
+      responseText
+    )
+  }
+
+  /**
+   * Detect whether an error is an AbortError thrown by fetch() when the
+   * AbortSignal fires. Node's undici throws a DOMException with name
+   * "AbortError", while older environments may throw a plain Error with
+   * "aborted" in the message.
+   */
+  private isAbortError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false
+    const e = error as { name?: string; code?: string; message?: string }
+    if (e.name === "AbortError") return true
+    if (e.code === "ABORT_ERR") return true
+    if (e.name === "TimeoutError") return true
+    if (/abort/i.test(e.message ?? "")) return true
+    return false
+  }
+
+  /**
+   * Extract a human-readable abort reason from the error or signal.
+   */
+  private extractAbortReason(
+    error: unknown,
+    abortSignal?: AbortSignal
+  ): string {
+    // AbortSignal.reason is the value passed to controller.abort(reason)
+    const signalReason: unknown = abortSignal?.reason
+    if (signalReason instanceof Error) return signalReason.message
+    if (typeof signalReason === "string") return signalReason
+    const errorMessage = (error as Error)?.message
+    if (errorMessage) return errorMessage
+    return "unknown abort reason"
+  }
+
   private buildKiroPayload(
     dto: CreateMessageDto,
     account: KiroAccount
@@ -1176,7 +1335,7 @@ export class KiroService implements OnModuleInit {
     await this.ensureProfileArn(account)
 
     let currentAccount = account
-    const model = mapKiroModel(dto.model || "")
+    const model = this.resolveCooldownModel(dto.model)
     let lastError: Error | null = null
     const MAX_RETRIES = 10
     const BASE_DELAY_MS = 3000
@@ -1209,7 +1368,15 @@ export class KiroService implements OnModuleInit {
           )
           await new Promise((resolve) => setTimeout(resolve, delay))
           if (abortSignal?.aborted) {
-            throw lastError || new Error("Kiro request aborted")
+            const reason = this.extractAbortReason(
+              abortSignal.reason,
+              abortSignal
+            )
+            throw new BackendApiError(`Kiro request aborted: ${reason}`, {
+              backend: "kiro",
+              statusCode: 499,
+              permanent: true,
+            })
           }
           // After waiting, cooldowns may have expired — try to pick a fresh account.
           const recovered = this.findAvailableAccount(model)
@@ -1222,7 +1389,14 @@ export class KiroService implements OnModuleInit {
       }
 
       const payload = this.buildKiroPayload(dto, currentAccount)
-      const orderedEndpoints = this.getOrderedEndpoints(currentAccount)
+      const orderedEndpoints = this.getOrderedEndpoints(currentAccount, model)
+      if (orderedEndpoints.length === 0) {
+        lastError = new BackendApiError(
+          `All Kiro endpoints are cooling down for ${this.accountTag(currentAccount)} model=${model}`,
+          { backend: "kiro", statusCode: 429 }
+        )
+        continue
+      }
 
       for (const endpoint of orderedEndpoints) {
         payload.conversationState.currentMessage.userInputMessage.origin =
@@ -1281,16 +1455,11 @@ export class KiroService implements OnModuleInit {
           })
 
           if (response.status === 429) {
-            markAccountCooldown(
+            this.markEndpointCooldown(
               currentAccount,
-              429,
+              endpoint,
               model,
-              response.headers.get("retry-after") || undefined,
-              this.accountTag(currentAccount)
-            )
-            this.persistAccountStates()
-            this.logger.warn(
-              `[Kiro] Endpoint ${endpoint.name} quota exhausted (429) for ${this.accountTag(currentAccount)}; trying next`
+              response.headers.get("retry-after") || undefined
             )
             lastError = new BackendApiError(
               `Kiro endpoint ${endpoint.name} returned 429`,
@@ -1393,6 +1562,7 @@ export class KiroService implements OnModuleInit {
                     this.logger.log(
                       `[Kiro] <- ${endpoint.name} stream completed after refresh (account=${this.accountTag(currentAccount)}, model=${model})`
                     )
+                    this.markEndpointSuccess(currentAccount, endpoint, model)
                     markAccountSuccess(currentAccount, model)
                     clearAccountDisablement(currentAccount)
                     this.persistAccountStates()
@@ -1434,10 +1604,14 @@ export class KiroService implements OnModuleInit {
             }
 
             // All other non-200: continue to next endpoint.
-            lastError = new BackendApiError(
+            const requestError = new BackendApiError(
               `Kiro endpoint ${endpoint.name} HTTP ${status}: ${text.slice(0, 200)}`,
               { backend: "kiro", statusCode: status }
             )
+            if (this.isNonRetryableRequestShapeError(status, text)) {
+              throw requestError
+            }
+            lastError = requestError
             response.body?.cancel().catch(() => undefined)
             continue
           }
@@ -1453,6 +1627,7 @@ export class KiroService implements OnModuleInit {
           this.logger.log(
             `[Kiro] <- ${endpoint.name} stream completed (account=${this.accountTag(currentAccount)}, model=${model})`
           )
+          this.markEndpointSuccess(currentAccount, endpoint, model)
           markAccountSuccess(currentAccount, model)
           clearAccountDisablement(currentAccount)
           this.persistAccountStates()
@@ -1463,10 +1638,30 @@ export class KiroService implements OnModuleInit {
           }
         } catch (error) {
           if (error instanceof BackendApiError) {
-            if (error.permanent) throw error
+            if (
+              error.permanent ||
+              this.isNonRetryableRequestShapeError(
+                error.statusCode ?? 0,
+                error.message
+              )
+            )
+              throw error
             lastError = error
             continue
           }
+
+          // Abort errors from stream supersession are non-retryable.
+          // The AbortController fires with reason containing "Superseded"
+          // when a new bidi stream replaces the current one.
+          if (this.isAbortError(error)) {
+            const reason = this.extractAbortReason(error, abortSignal)
+            throw new BackendApiError(`Kiro request aborted: ${reason}`, {
+              backend: "kiro",
+              statusCode: 499,
+              permanent: true,
+            })
+          }
+
           const message = (error as Error).message || String(error)
           this.logger.warn(
             `[Kiro] Endpoint ${endpoint.name} failed for ${this.accountTag(currentAccount)}: ${message}`
@@ -2520,4 +2715,25 @@ function parseSubscriptionType(raw: string): string {
   if (upper.includes("POWER")) return "POWER"
   if (upper.includes("PRO")) return "PRO"
   return "FREE"
+}
+
+function nextEndpointQuotaCooldown(backoffLevel: number): number {
+  const delay = ENDPOINT_QUOTA_BACKOFF_BASE_MS * Math.pow(2, backoffLevel)
+  return Math.min(delay, ENDPOINT_QUOTA_BACKOFF_MAX_MS)
+}
+
+function parseEndpointRetryAfterMs(
+  retryAfterHeader: string,
+  defaultMs: number
+): number {
+  const seconds = Number.parseFloat(retryAfterHeader)
+  if (!Number.isFinite(seconds) || seconds <= 0) return defaultMs
+  return Math.ceil(seconds * 1000)
+}
+
+function formatEndpointDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}min`
+  return `${(ms / 3_600_000).toFixed(1)}h`
 }

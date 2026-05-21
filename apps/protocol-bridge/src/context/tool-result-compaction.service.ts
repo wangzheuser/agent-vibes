@@ -46,6 +46,7 @@ export interface ToolResultCompactionResult {
   changed: boolean
   trigger: ToolResultCompactionOptions["trigger"]
   clearedToolResults: number
+  compactedToolIds: string[]
   compactedRounds: number
   keptRecentRounds: number
   estimatedTokens: number
@@ -153,6 +154,7 @@ export class ToolResultCompactionService {
         changed: false,
         trigger: options.trigger,
         clearedToolResults: 0,
+        compactedToolIds: [],
         compactedRounds: 0,
         keptRecentRounds: Math.max(
           1,
@@ -170,6 +172,7 @@ export class ToolResultCompactionService {
         changed: false,
         trigger: options.trigger,
         clearedToolResults: 0,
+        compactedToolIds: [],
         compactedRounds: 0,
         keptRecentRounds: Math.max(
           1,
@@ -215,6 +218,7 @@ export class ToolResultCompactionService {
         changed: false,
         trigger: options.trigger,
         clearedToolResults: 0,
+        compactedToolIds: [],
         compactedRounds: 0,
         keptRecentRounds: Math.min(keepRecentRounds, rounds.length),
         estimatedTokens,
@@ -296,6 +300,7 @@ export class ToolResultCompactionService {
         changed: false,
         trigger: options.trigger,
         clearedToolResults: 0,
+        compactedToolIds: [],
         compactedRounds: 0,
         keptRecentRounds: keepRecentRounds,
         estimatedTokens,
@@ -315,6 +320,7 @@ export class ToolResultCompactionService {
       changed: true,
       trigger: options.trigger,
       clearedToolResults: replacementTextByToolUseId.size,
+      compactedToolIds: Array.from(replacementTextByToolUseId.keys()),
       compactedRounds,
       keptRecentRounds: Math.min(keepRecentRounds, rounds.length),
       estimatedTokens: workingTokens,

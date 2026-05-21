@@ -12,7 +12,10 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 import * as readline from "readline"
-import { getAntigravityAccountsConfigPathCandidates } from "../../shared/protocol-bridge-paths"
+import {
+  detectCurrentAntigravityVersion,
+  getAntigravityAccountsConfigPathCandidates,
+} from "../../shared/protocol-bridge-paths"
 import { UsageStatsService } from "../../usage"
 import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 import {
@@ -34,6 +37,7 @@ export interface NativeAccount {
   isGcpTos?: boolean
   cloudCodeUrlOverride?: string
   proxyUrl?: string
+  ideVersion?: string
 }
 
 /**
@@ -286,6 +290,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   private googleQuotaSnapshotFetchedAt = 0
   /** Model to fallback to when all Claude workers are quota-exhausted (configured in antigravity-accounts.json) */
   private _quotaFallbackModel: string | null = null
+  private currentAntigravityVersion: string | null = null
 
   constructor(
     private readonly configService: ConfigService,
@@ -301,6 +306,16 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       return
     }
     this.antigravityGoBinary = goBinary
+    this.currentAntigravityVersion = detectCurrentAntigravityVersion()
+    if (this.currentAntigravityVersion) {
+      this.logger.log(
+        `Detected Antigravity IDE version: ${this.currentAntigravityVersion}`
+      )
+    } else {
+      this.logger.warn(
+        "Antigravity IDE version not detected; Go worker will use its built-in fallback"
+      )
+    }
     this.logger.log(`Using Go native worker backend: ${goBinary}`)
 
     // Load accounts and spawn workers
@@ -563,6 +578,9 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       projectId: rawQuotaProjectId ? rawProjectId : undefined,
       quotaProjectId: rawQuotaProjectId ?? rawProjectId,
       ...(proxyUrl ? { proxyUrl } : {}),
+      ...(this.currentAntigravityVersion
+        ? { ideVersion: this.currentAntigravityVersion }
+        : {}),
     }
   }
 
@@ -764,6 +782,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         isGcpTos: account.isGcpTos ?? false,
         cloudCodeUrlOverride: account.cloudCodeUrlOverride,
         proxyUrl: account.proxyUrl,
+        ideVersion: account.ideVersion,
       },
     })
 

@@ -5,6 +5,7 @@ import type { BackendType } from "../../../llm/shared/model-router.service"
 import { WebSearchAdapterFactory } from "./web-search.factory"
 import {
   WebSearchAbortError,
+  WebSearchEmptyResultError,
   type WebSearchAdapterName,
   type WebSearchOptions,
   type WebSearchResponse,
@@ -47,13 +48,25 @@ export class WebSearchService {
       throw new Error("web_search query is empty")
     }
 
+    // Compose the caller's abortSignal (e.g. background sub-agent
+    // kill_agent signal) with any pre-existing adapter signal, so a
+    // killed worker stops in-flight searches without having to wait
+    // for the adapter's internal timeout.
+    const composedSignal = this.composeAbortSignals(
+      options.signal,
+      options.abortSignal
+    )
+    const baseOptions: WebSearchOptions = {
+      ...options,
+      signal: composedSignal,
+      conversationId: options.conversationId,
+    }
+
     const adapter = this.factory.selectAdapter(backend)
+    let selectedAdapter = adapter
     let results: WebSearchResult[]
     try {
-      results = await adapter.search(trimmed, {
-        ...options,
-        conversationId: options.conversationId,
-      })
+      results = await selectedAdapter.search(trimmed, baseOptions)
     } catch (err) {
       if (err instanceof WebSearchAbortError) {
         // Caller aborted; surface the abort verbatim so connect-stream
@@ -61,26 +74,71 @@ export class WebSearchService {
         // a "search failed" frame.
         throw err
       }
-      const message = err instanceof Error ? err.message : String(err)
-      this.logger.warn(
-        `[web-search] adapter=${adapter.name} failed: ${message.slice(0, 240)}`
-      )
-      // Re-throw with a stable prefix so the connect-stream layer can
-      // attribute the failure to a specific provider in trace + UI.
-      throw new Error(`web_search via ${adapter.name} failed: ${message}`)
+      if (err instanceof WebSearchEmptyResultError) {
+        const recoveryAdapter = this.factory.selectRecoveryAdapter(err.adapter)
+        if (!recoveryAdapter) {
+          throw err
+        }
+        this.logger.warn(
+          `[web-search] adapter=${err.adapter} returned empty results; ` +
+            `retrying once with ${recoveryAdapter.name}`
+        )
+        selectedAdapter = recoveryAdapter
+        results = await selectedAdapter.search(trimmed, baseOptions)
+      } else {
+        const message = err instanceof Error ? err.message : String(err)
+        const isTimeout =
+          message.includes("timeout") || message.includes("aborted due to")
+        const recoveryAdapter = isTimeout
+          ? this.factory.selectRecoveryAdapter(adapter.name)
+          : undefined
+        if (recoveryAdapter) {
+          this.logger.warn(
+            `[web-search] adapter=${adapter.name} timed out; ` +
+              `retrying once with ${recoveryAdapter.name}`
+          )
+          selectedAdapter = recoveryAdapter
+          results = await selectedAdapter.search(trimmed, baseOptions)
+        } else {
+          this.logger.warn(
+            `[web-search] adapter=${adapter.name} failed: ${message.slice(0, 240)}`
+          )
+          // Re-throw with a stable prefix so the connect-stream layer can
+          // attribute the failure to a specific provider in trace + UI.
+          throw new Error(`web_search via ${adapter.name} failed: ${message}`)
+        }
+      }
     }
 
     if (results.length === 0) {
-      throw new Error(
-        `web_search via ${adapter.name} returned no results for query "${trimmed.slice(0, 80)}"`
+      throw new WebSearchEmptyResultError(
+        selectedAdapter.name,
+        trimmed,
+        `web_search via ${selectedAdapter.name} returned no results for query "${trimmed.slice(0, 80)}"`
       )
     }
 
     return {
-      adapter: adapter.name,
+      adapter: selectedAdapter.name,
       query: trimmed,
       results,
     }
+  }
+
+  /**
+   * Combine zero, one, or two `AbortSignal`s into a single signal that
+   * fires as soon as any input fires. Returns undefined when no
+   * signals are provided so the adapter sees the original "no
+   * cancellation" semantic.
+   */
+  private composeAbortSignals(
+    a: AbortSignal | undefined,
+    b: AbortSignal | undefined
+  ): AbortSignal | undefined {
+    if (!a && !b) return undefined
+    if (a && !b) return a
+    if (!a && b) return b
+    return AbortSignal.any([a as AbortSignal, b as AbortSignal])
   }
 
   /**

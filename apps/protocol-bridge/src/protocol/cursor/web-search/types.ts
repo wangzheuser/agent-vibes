@@ -48,6 +48,19 @@ export interface WebSearchOptions {
   blockedDomains?: string[]
   /** Cancellation signal; adapters MUST honour this. */
   signal?: AbortSignal
+  /**
+   * Optional caller abort signal (e.g. background sub-agent worker
+   * `AbortController.signal`). When provided it is composed with the
+   * adapter's internal timeouts via `AbortSignal.any([...])`, so a
+   * `kill_agent` raised mid-search unwinds without waiting for the
+   * adapter's own timeout to fire.
+   *
+   * Distinct from `signal` so adapters that already plumb their own
+   * `signal` through composing logic don't have to be rewritten — the
+   * service layer folds `abortSignal` into the final composed signal
+   * before calling `adapter.search`.
+   */
+  abortSignal?: AbortSignal
   /** Streaming progress callback (query echoes, result count, …). */
   onProgress?: (progress: WebSearchProgress) => void
   /** Soft cap on the number of results to return. Defaults to 8. */
@@ -151,6 +164,17 @@ export class WebSearchAbortError extends Error {
   constructor(message = "web_search aborted") {
     super(message)
     this.name = "WebSearchAbortError"
+  }
+}
+
+export class WebSearchEmptyResultError extends Error {
+  constructor(
+    readonly adapter: WebSearchAdapterName,
+    readonly query: string,
+    message = `${adapter} returned no results`
+  ) {
+    super(message)
+    this.name = "WebSearchEmptyResultError"
   }
 }
 

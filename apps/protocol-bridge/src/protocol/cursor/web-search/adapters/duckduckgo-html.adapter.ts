@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common"
 import {
   applyDomainFilters,
   WebSearchAbortError,
+  WebSearchEmptyResultError,
   type WebSearchAdapter,
   type WebSearchAdapterName,
   type WebSearchOptions,
@@ -174,7 +175,11 @@ export class DuckDuckGoHtmlAdapter implements WebSearchAdapter {
     })
 
     if (trimmed.length === 0) {
-      throw new Error("duckduckgo-html returned no parseable results")
+      throw new WebSearchEmptyResultError(
+        this.name,
+        query,
+        "duckduckgo-html returned no parseable results"
+      )
     }
 
     return trimmed

@@ -8,6 +8,7 @@
 
 import * as os from "os"
 import * as process from "process"
+import { detectCurrentKiroVersion } from "../../shared/protocol-bridge-paths"
 
 /** Streaming SDK version reported in User-Agent (抓包：1.0.39). */
 const KIRO_STREAMING_SDK_VERSION = "1.0.39"
@@ -48,7 +49,10 @@ export function getKiroClientConfig(
   override?: Partial<KiroClientConfig>
 ): KiroClientConfig {
   return {
-    kiroVersion: override?.kiroVersion?.trim() || DEFAULT_KIRO_VERSION,
+    kiroVersion:
+      override?.kiroVersion?.trim() ||
+      detectCurrentKiroVersion() ||
+      DEFAULT_KIRO_VERSION,
     systemVersion: override?.systemVersion?.trim() || defaultSystemVersion(),
     nodeVersion: override?.nodeVersion?.trim() || DEFAULT_NODE_VERSION,
   }

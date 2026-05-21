@@ -3,6 +3,7 @@ import { TokenCounterService } from "./token-counter.service"
 import type {
   ContextProjectionAttachment,
   InvestigationMemorySummaryLike,
+  SessionMemorySummaryLike,
 } from "./types"
 
 export interface SessionTodoAttachmentLike {
@@ -11,7 +12,10 @@ export interface SessionTodoAttachmentLike {
 }
 
 // Re-export for convenient import by downstream consumers.
-export type { InvestigationMemorySummaryLike } from "./types"
+export type {
+  InvestigationMemorySummaryLike,
+  SessionMemorySummaryLike,
+} from "./types"
 
 export interface ContextAttachmentSnapshot {
   readPaths: string[]
@@ -21,6 +25,7 @@ export interface ContextAttachmentSnapshot {
     afterContent: string
   }>
   todos: SessionTodoAttachmentLike[]
+  sessionMemory?: SessionMemorySummaryLike[]
   investigationSummaries?: InvestigationMemorySummaryLike[]
   /**
    * Snapshots of every foreground sub-agent currently running on the
@@ -64,11 +69,13 @@ export class ContextAttachmentBuilderService {
     )
     if (budget <= 0) return []
 
-    // Attachment priority: investigation memory is placed first because it
-    // captures distilled evidence from the current agent turn.  When the total
-    // attachment budget is tight, earlier candidates consume budget first and
-    // later ones are dropped — so ordering encodes importance.
+    // Attachment priority: session memory survives compaction boundaries and
+    // captures durable decisions/objectives. Investigation memory comes next
+    // because it captures distilled evidence from the current agent turn.
+    // When the total attachment budget is tight, earlier candidates consume
+    // budget first and later ones are dropped — so ordering encodes importance.
     const candidates: Array<ContextProjectionAttachment | null> = [
+      this.buildSessionMemoryAttachment(snapshot),
       this.buildInvestigationMemoryAttachment(snapshot),
       this.buildSubAgentAttachment(snapshot),
       this.buildTodosAttachment(snapshot),
@@ -89,6 +96,66 @@ export class ContextAttachmentBuilderService {
     }
 
     return attachments
+  }
+
+  private buildSessionMemoryAttachment(
+    snapshot: ContextAttachmentSnapshot
+  ): ContextProjectionAttachment | null {
+    const memories = snapshot.sessionMemory || []
+    if (memories.length === 0) return null
+
+    const selected = memories
+      .slice()
+      .sort((a, b) => {
+        const weightDelta = (b.weight || 0) - (a.weight || 0)
+        if (weightDelta !== 0) return weightDelta
+        return (b.createdAt || 0) - (a.createdAt || 0)
+      })
+      .slice(0, 16)
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+
+    const groupLabels: Record<string, string> = {
+      objective: "Objectives",
+      decision: "Decisions",
+      constraint: "Constraints",
+      verification: "Verification",
+      risk: "Risks",
+      command: "Commands",
+      sub_agent: "Sub-agent results",
+      progress: "Progress",
+      file: "Files",
+      open_item: "Open items",
+    }
+    const groupOrder = [
+      "objective",
+      "decision",
+      "constraint",
+      "verification",
+      "risk",
+      "command",
+      "sub_agent",
+      "progress",
+      "file",
+      "open_item",
+    ]
+    const lines: string[] = []
+    for (const kind of groupOrder) {
+      const group = selected.filter((memory) => memory.kind === kind)
+      if (group.length === 0) continue
+      lines.push(`${groupLabels[kind] || kind}:`)
+      for (const memory of group) {
+        lines.push(`- ${this.trimToBudget(memory.text, 120)}`)
+      }
+    }
+    const footer =
+      "Use this as durable session memory. Do not repeat old investigation unless a retained message contradicts it."
+
+    return this.buildAttachment(
+      "session_memory",
+      "Session Memory",
+      [...lines, "", footer].join("\n"),
+      1400
+    )
   }
 
   // Investigation memory is rendered as a stable attachment instead of being

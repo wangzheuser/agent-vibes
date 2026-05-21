@@ -82,9 +82,13 @@ export class ContextManagerService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      autoCompactTokenLimit?: number
+      predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
+      nativeCacheEdits?: boolean
       strategy?: "auto" | "manual" | "reactive"
+      dryRun?: boolean
     }
   ): ContextCompactionResult {
     return this.compaction.ensureWithinBudget(state, snapshot, options)
@@ -96,9 +100,13 @@ export class ContextManagerService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      autoCompactTokenLimit?: number
+      predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
+      nativeCacheEdits?: boolean
       strategy?: "auto" | "manual" | "reactive"
+      dryRun?: boolean
     }
   ): ContextCompactionResult {
     return this.buildBackendMessages(
@@ -184,8 +192,12 @@ export class ContextManagerService {
     previousOptions: {
       maxTokens: number
       systemPromptTokens: number
+      autoCompactTokenLimit?: number
+      predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
+      nativeCacheEdits?: boolean
+      dryRun?: boolean
     },
     request: ReactiveRecoveryRequest,
     recoveryKey: string
@@ -242,9 +254,12 @@ export class ContextManagerService {
     const result = this.compaction.ensureWithinBudget(state, snapshot, {
       maxTokens: nextMaxTokens,
       systemPromptTokens: previousOptions.systemPromptTokens,
+      autoCompactTokenLimit: previousOptions.autoCompactTokenLimit,
+      predictiveCompactTokenLimit: previousOptions.predictiveCompactTokenLimit,
       integrityMode: previousOptions.integrityMode,
       pendingToolUseIds: previousOptions.pendingToolUseIds,
       strategy: "reactive",
+      nativeCacheEdits: previousOptions.nativeCacheEdits,
     })
 
     if (
@@ -303,8 +318,12 @@ export class ContextManagerService {
     previousOptions: {
       maxTokens: number
       systemPromptTokens: number
+      autoCompactTokenLimit?: number
+      predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
+      nativeCacheEdits?: boolean
+      dryRun?: boolean
     },
     request: ReactiveRecoveryRequest,
     recoveryKey: string
@@ -325,33 +344,6 @@ export class ContextManagerService {
    */
   resetReactiveFailures(recoveryKey: string): void {
     this.reactiveFailures.delete(recoveryKey)
-  }
-
-  /**
-   * Manual compaction entry point — surfaced for command-palette / dashboard
-   * "compact now" actions and for diagnostics tooling.  Strategy is
-   * deliberately fixed to `"manual"` so the resulting commit can be
-   * distinguished from automatic ones in the compaction history.
-   *
-   * Behaviour mirrors `buildBackendMessages` but with a synthetic budget
-   * pressure: callers that simply want to force a summary regardless of
-   * the actual token count can pass a tiny `maxTokens` (e.g. 1024) and
-   * rely on the compaction planner picking up the squeeze.
-   */
-  manualCompact(
-    state: ContextConversationState,
-    snapshot: ContextAttachmentSnapshot,
-    options: {
-      maxTokens: number
-      systemPromptTokens: number
-      integrityMode?: "strict-adjacent" | "global"
-      pendingToolUseIds?: Iterable<string>
-    }
-  ): ContextCompactionResult {
-    return this.compaction.ensureWithinBudget(state, snapshot, {
-      ...options,
-      strategy: "manual",
-    })
   }
 
   private readonly MIN_REACTIVE_BUDGET = 256
@@ -412,11 +404,25 @@ export class ContextManagerService {
       compactionEpoch: 0,
       lastAppliedCompaction: undefined,
       usageLedger: {},
+      codexContext: {
+        historyVersion: 0,
+        truncationPolicy: {
+          mode: "bytes",
+          limit: 10_000,
+        },
+      },
       toolResultReplacementState: {
         seenToolUseIds: [],
         replacementByToolUseId: {},
       },
+      nativeCacheEditState: {
+        toolOrder: [],
+        deletedToolUseIds: [],
+        pinnedEdits: [],
+        toolsSentToApi: false,
+      },
       investigationMemory: [],
+      sessionMemory: [],
     }
   }
 }

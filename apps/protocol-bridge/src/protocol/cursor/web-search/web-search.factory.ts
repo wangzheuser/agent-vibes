@@ -14,12 +14,11 @@ import { GoogleGroundingAdapter } from "./adapters/google-grounding.adapter"
 import type { WebSearchAdapter, WebSearchAdapterName } from "./types"
 
 /**
- * Adapter selection follows claude-code's WebSearchTool model:
- * **build-time selection, not error-time fallback**. For a given
- * session we pick exactly one adapter and stick with it; if that
- * adapter throws at runtime, the tool fails and the model decides
- * what to do next (retry with different params, switch to web_fetch,
- * give up, …).
+ * Adapter selection follows claude-code's WebSearchTool model at the
+ * primary routing layer: pick one adapter from backend/env state, not
+ * from quota-error fingerprint matching. The service may still perform
+ * one bounded recovery retry for empty/timeout responses so transient
+ * search-provider gaps do not surface as model-visible failures.
  *
  * The factory is deterministic and side-effect free — its only
  * inputs are the active session's backend and the operator's env
@@ -34,7 +33,7 @@ import type { WebSearchAdapter, WebSearchAdapterName } from "./types"
  *  2. Backend-driven default:
  *       - `google` / `google-claude` → `google-grounding`
  *       - `claude-api`               → `anthropic-server-tool`
- *       - `codex` / `openai-compat`  → `codex-server-tool`
+ *       - `codex` / `openai-compat`  → `exa-mcp`
  *       - `kiro`                     → keyless fallback chain (Brave
  *                                       if key configured, else Exa
  *                                       MCP, else DuckDuckGo HTML)
@@ -42,8 +41,7 @@ import type { WebSearchAdapter, WebSearchAdapterName } from "./types"
  *  3. If the backend-default adapter reports `isAvailable() === false`
  *     (e.g. user routed to `claude-api` but no key is mounted), the
  *     factory falls through to the keyless chain rather than failing
- *     up-front. This is the only "fall through" allowed and it is
- *     resolved at selection time, not at error time.
+ *     up-front. This is resolved at selection time.
  *
  *  For posterity: the previous bridge implementation routed every
  *  backend without first-party search to Google grounding, which is
@@ -117,12 +115,12 @@ export class WebSearchAdapterFactory {
   }
 
   /**
-   * Internal: map BackendType → first-party adapter, or `undefined`
-   * if the backend has no first-party search surface. Backends that
-   * historically relied on Google grounding as a "default" (Kiro,
-   * generic openai-compat) intentionally return undefined here so
-   * that the caller falls through to the keyless chain rather than
-   * silently borrowing Google account quota.
+   * Internal: map BackendType → selected adapter, or `undefined`
+   * if the backend should use the generic keyless chain. Codex's
+   * native server-side web_search is still available through the
+   * WEB_SEARCH_ADAPTER override, but Exa MCP is the default because
+   * Codex's reverse endpoint frequently returns slow text-only
+   * summaries without parseable sources.
    */
   private preferredAdapterForBackend(
     backend: BackendType | undefined
@@ -135,7 +133,7 @@ export class WebSearchAdapterFactory {
         return this.anthropicAdapter
       case "codex":
       case "openai-compat":
-        return this.codexAdapter
+        return this.exaAdapter
       case "kiro":
         return undefined
       case undefined:
@@ -156,6 +154,18 @@ export class WebSearchAdapterFactory {
    * `duckduckgo-html.isAvailable()` always returns true, so this
    * function is total — it never throws "no adapter available".
    */
+  selectRecoveryAdapter(
+    failedAdapter: WebSearchAdapterName
+  ): WebSearchAdapter | undefined {
+    const candidates = [
+      this.braveAdapter,
+      this.exaAdapter,
+      this.duckduckgoAdapter,
+    ].filter((adapter) => adapter.name !== failedAdapter)
+
+    return candidates.find((adapter) => adapter.isAvailable())
+  }
+
   private firstAvailableKeylessAdapter(): WebSearchAdapter {
     if (this.braveAdapter.isAvailable()) return this.braveAdapter
     if (this.exaAdapter.isAvailable()) return this.exaAdapter

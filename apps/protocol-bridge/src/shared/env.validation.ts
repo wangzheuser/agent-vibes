@@ -10,7 +10,6 @@ const INTEGER_KEYS: Record<string, { min: number; max?: number }> = {
   CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: { min: 256, max: 128_000 },
   CLOUD_CODE_MAX_OUTPUT_TOKENS: { min: 256, max: 128_000 },
   CLOUD_CODE_MIN_OUTPUT_TOKENS: { min: 1, max: 65_536 },
-  MAX_PROMPT_SHRINK_RETRIES: { min: 0, max: 10 },
   CONVERSATION_SESSION_TTL_MS: { min: 60_000 },
   CONVERSATION_SESSION_MAX_SIZE: { min: 10, max: 100_000 },
 }

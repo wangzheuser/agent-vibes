@@ -1,4 +1,5 @@
 import {
+  CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
   normalizeToolProtocolMessages,
   type LooseMessageContent,
 } from "../../context"
@@ -24,6 +25,7 @@ export interface CodexConversationTool {
   input_schema?: Record<string, unknown>
   format?: Record<string, unknown>
   external_web_access?: boolean
+  search_context_size?: "low" | "medium" | "high"
   search_content_types?: string[]
   output_format?: string
 }
@@ -87,12 +89,18 @@ export interface CodexCustomToolCallOutput {
   output: string
 }
 
+export interface CodexCompactionInputItem {
+  type: "compaction"
+  encrypted_content: string
+}
+
 export type CodexInputItem =
   | CodexInputMessage
   | CodexFunctionCall
   | CodexCustomToolCall
   | CodexFunctionCallOutput
   | CodexCustomToolCallOutput
+  | CodexCompactionInputItem
 
 export interface CodexTool {
   type: "function" | "custom" | "web_search" | "image_generation"
@@ -102,6 +110,7 @@ export interface CodexTool {
   strict?: boolean
   format?: Record<string, unknown>
   external_web_access?: boolean
+  search_context_size?: "low" | "medium" | "high"
   search_content_types?: string[]
   output_format?: string
 }
@@ -304,6 +313,46 @@ function normalizeToolCallTypeHint(
   return undefined
 }
 
+function stableToolSortKey(tool: CodexTool): string {
+  return [tool.type || "", tool.name || "", stableJsonStringify(tool)].join(
+    "\u0000"
+  )
+}
+
+function stableJsonStringify(value: unknown): string {
+  return JSON.stringify(sortJsonValue(value))
+}
+
+function isCodexCompactionInputItem(
+  value: unknown
+): value is CodexCompactionInputItem {
+  if (!value || typeof value !== "object") return false
+  const record = value as Record<string, unknown>
+  return (
+    record.type === "compaction" && typeof record.encrypted_content === "string"
+  )
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sortJsonValue(item))
+  }
+  if (!value || typeof value !== "object") {
+    return value
+  }
+  const sorted: Record<string, unknown> = {}
+  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+    sorted[key] = sortJsonValue((value as Record<string, unknown>)[key])
+  }
+  return sorted
+}
+
+function sortCodexToolsForStableRequests(tools: CodexTool[]): CodexTool[] {
+  return [...tools].sort((a, b) =>
+    stableToolSortKey(a).localeCompare(stableToolSortKey(b))
+  )
+}
+
 export function buildCodexRequest(
   request: CodexExecutionRequest,
   modelName: string = request.model
@@ -370,6 +419,7 @@ export function buildCodexRequest(
       name?: string
       input?: unknown
       tool_use_id?: string
+      item?: unknown
       content?:
         | string
         | Array<{
@@ -505,6 +555,13 @@ export function buildCodexRequest(
           break
         }
 
+        case CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE:
+          flushMessage()
+          if (isCodexCompactionInputItem(block.item)) {
+            input.push({ ...block.item })
+          }
+          break
+
         default:
           if (block.text) {
             appendTextContent(block.text)
@@ -528,8 +585,12 @@ export function buildCodexRequest(
       if (tool.type === "web_search_20250305" || tool.type === "web_search") {
         codexTools.push({
           type: "web_search",
-          ...(typeof tool.external_web_access === "boolean"
-            ? { external_web_access: tool.external_web_access }
+          external_web_access:
+            typeof tool.external_web_access === "boolean"
+              ? tool.external_web_access
+              : true,
+          ...(tool.search_context_size
+            ? { search_context_size: tool.search_context_size }
             : {}),
           ...(Array.isArray(tool.search_content_types)
             ? { search_content_types: tool.search_content_types }
@@ -591,7 +652,7 @@ export function buildCodexRequest(
   }
 
   if (codexTools && codexTools.length > 0) {
-    codexRequest.tools = codexTools
+    codexRequest.tools = sortCodexToolsForStableRequests(codexTools)
     codexRequest.tool_choice = "auto"
   }
 

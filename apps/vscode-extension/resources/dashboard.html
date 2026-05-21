@@ -2568,6 +2568,12 @@
             value: normalizeVersionLabel(versions.currentAntigravityVersion),
           })
         }
+        if (versions.currentKiroVersion) {
+          metaCards.push({
+            label: L("ch.kiro"),
+            value: normalizeVersionLabel(versions.currentKiroVersion),
+          })
+        }
         if (versions.currentCursorVersion) {
           metaCards.push({
             label: L("meta.cursor"),

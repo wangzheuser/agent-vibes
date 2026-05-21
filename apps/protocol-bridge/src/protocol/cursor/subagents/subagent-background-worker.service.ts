@@ -101,11 +101,20 @@ export interface BackgroundWorkerHostDeps {
   logger: Logger
   /** Run a bridge-local / inline deferred tool exactly like the foreground sub-agent
    * does. Returns the formatted text content the worker writes back to
-   * its message history. */
+   * its message history.
+   *
+   * `abortSignal` is the worker's `AbortController.signal`. Inline
+   * tools that do network I/O (web_fetch, web_search, fetch, exa_*)
+   * compose this with their own timeouts via `AbortSignal.any([...])`,
+   * so a `kill_agent` raised mid-fetch unwinds quickly instead of
+   * having to wait for the full HTTP timeout (or the next turn
+   * boundary, which used to keep killed sub-agents running for tens of
+   * seconds while they finished a `web_fetch` loop). */
   runInlineDeferredTool(
     conversationId: string,
     toolName: string,
-    parsedInput: Record<string, unknown>
+    parsedInput: Record<string, unknown>,
+    options?: { abortSignal?: AbortSignal }
   ): Promise<{ content: string; status: "success" | "error" }>
   /** Run one LLM turn for the sub-agent and return the final assistant
    * text + tool calls. Worker drives the loop; host owns the actual
@@ -160,6 +169,8 @@ interface SpawnArgs {
   description: string
   agent: SubagentDefinition
   model: string
+  /** Snapshot of allowed workspace roots captured at spawn time. */
+  allowedWorkspaceRoots?: string[]
   host: BackgroundWorkerHostDeps
 }
 
@@ -240,7 +251,17 @@ export class SubagentBackgroundWorker {
     const { agent } = args
     const startedAt = Date.now()
 
-    const systemPrompt = getSubagentSystemPrompt(agent)
+    // Only inject roots that are genuinely "additional" — exclude the
+    // primary workspace root (first entry) since the sub-agent already
+    // uses it as cwd. This matches the foreground sub-agent behavior.
+    const additionalRoots = args.allowedWorkspaceRoots?.length
+      ? args.allowedWorkspaceRoots.slice(1)
+      : []
+    const workingDirectoriesPrompt =
+      additionalRoots.length > 0
+        ? `\n\nAdditional working directories (you may read/search/list files in these paths):\n${additionalRoots.map((root) => `- ${root}`).join("\n")}\n`
+        : ""
+    const systemPrompt = `${getSubagentSystemPrompt(agent)}${workingDirectoriesPrompt}`
     const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [
       {
         role: "user",
@@ -405,7 +426,8 @@ export class SubagentBackgroundWorker {
               const result = await args.host.runInlineDeferredTool(
                 args.parentConversationId,
                 tc.name,
-                parsedInput
+                parsedInput,
+                { abortSignal: abortController.signal }
               )
               resultContent = result.content
               resultStatus = result.status

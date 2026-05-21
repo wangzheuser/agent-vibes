@@ -20,6 +20,14 @@ export interface BackendPoolModelCooldownStatus {
   backoffLevel?: number
 }
 
+export interface BackendPoolEndpointCooldownStatus {
+  endpoint: string
+  model: string
+  cooldownUntil: number
+  quotaExhausted?: boolean
+  backoffLevel?: number
+}
+
 export type CodexRateLimitSource = "request" | "probe"
 
 export interface CodexRateLimitWindow {
@@ -73,6 +81,7 @@ export interface BackendPoolEntryStatus {
   pid?: number
   maxContextTokens?: number
   modelCooldowns: BackendPoolModelCooldownStatus[]
+  endpointCooldowns?: BackendPoolEndpointCooldownStatus[]
   rateLimits?: CodexRateLimitAccountSummary
 }
 

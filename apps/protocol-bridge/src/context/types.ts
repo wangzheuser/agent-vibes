@@ -11,6 +11,10 @@
 export interface TextBlock {
   type: "text"
   text: string
+  cache_control?: {
+    type: string
+    ttl?: string
+  }
 }
 
 /**
@@ -22,6 +26,10 @@ export interface ToolUseBlock {
   id: string
   name: string
   input: Record<string, unknown>
+  cache_control?: {
+    type: string
+    ttl?: string
+  }
 }
 
 /**
@@ -34,6 +42,11 @@ export interface ToolResultBlock {
   content: string | ContentBlock[]
   is_error?: boolean
   structuredContent?: Record<string, unknown>
+  cache_reference?: string
+  cache_control?: {
+    type: string
+    ttl?: string
+  }
 }
 
 /**
@@ -46,6 +59,10 @@ export interface ImageBlock {
     media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"
     data: string
   }
+  cache_control?: {
+    type: string
+    ttl?: string
+  }
 }
 
 /**
@@ -55,6 +72,18 @@ export interface ThinkingBlock {
   type: "thinking"
   thinking: string
   signature?: string
+  cache_control?: {
+    type: string
+    ttl?: string
+  }
+}
+
+export interface CacheEditsBlock {
+  type: "cache_edits"
+  edits: Array<{
+    type: "delete"
+    cache_reference: string
+  }>
 }
 
 /**
@@ -66,6 +95,7 @@ export type ContentBlock =
   | ToolResultBlock
   | ImageBlock
   | ThinkingBlock
+  | CacheEditsBlock
 
 /**
  * Function-call style tool call
@@ -127,10 +157,37 @@ export interface ContextTranscriptRecord {
   role: "user" | "assistant"
   content: LooseMessageContent
   createdAt: number
+  kind?:
+    | "message"
+    | "compact_boundary"
+    | "compact_summary"
+    | "snip_boundary"
+    | "microcompact_boundary"
+    | "attachment"
+    | "hook_result"
+  compactMetadata?: {
+    commit?: ContextCompactionCommit
+    summary?: string
+  }
+  attachmentMetadata?: ContextProjectionAttachment
+  hookMetadata?: {
+    trigger: "manual" | "auto" | "reactive"
+    compactionId: string
+  }
+  snipMetadata?: {
+    removedRecordIds: string[]
+  }
+  microcompactMetadata?: {
+    trigger: "auto" | "idle"
+    preTokens: number
+    tokensSaved: number
+    compactedToolIds: string[]
+  }
 }
 
 export interface ContextProjectionAttachment {
   kind:
+    | "session_memory"
     | "sub_agent"
     | "read_paths"
     | "file_states"
@@ -142,26 +199,7 @@ export interface ContextProjectionAttachment {
   tokenCount: number
 }
 
-/**
- * One entry in the compaction history chain.
- *
- * **Scope contract** (compared to claude-code):
- *
- *   claude-code distinguishes two boundary types in its message stream:
- *   `compact_boundary` (heavy summary compaction, like our commit) and
- *   `microcompact_boundary` (lightweight tool-result clearing, with
- *   `compactedToolIds[]` recorded on the boundary message).  This shape
- *   only models the heavy variant — microcompact in our pipeline rewrites
- *   tool_result blocks in place via `recordsOverride` and a persisted
- *   replacement dictionary, without producing a commit.
- *
- *   That split is intentional: heavy compaction is irreversible and
- *   needs a permanent audit trail; microcompact is a per-request
- *   rendering optimisation whose state lives in
- *   `ContextToolResultReplacementState`.  Both states are reset together
- *   when a heavy commit is applied (see
- *   `ContextCompactionService.pruneArchivedDerivedState`).
- */
+/** One compact summary event derived from transcript-native boundary records. */
 export interface ContextCompactionCommit {
   id: string
   strategy: "auto" | "manual" | "reactive"
@@ -172,11 +210,16 @@ export interface ContextCompactionCommit {
   projectionAnchorRecordId?: string
   archivedMessageCount: number
   sourceRecordCount?: number
+  retainedStartRecordId?: string
+  retainedRecordCount?: number
+  retainedTextRecordCount?: number
+  retainedTokenCount?: number
   attachmentFingerprint?: string
   sourceTokenCount: number
   summary: string
   summaryTokenCount: number
   projectedTokenCount: number
+  codexReplacementHistory?: CodexReplacementHistory
 }
 
 export interface ContextUsageLedgerState {
@@ -200,6 +243,70 @@ export interface ContextToolResultReplacementState {
   replacementByToolUseId: Record<string, string>
 }
 
+export interface ContextNativeCacheEditPin {
+  targetRecordId?: string
+  targetMessageIndex: number
+  block: CacheEditsBlock
+  createdAt: number
+}
+
+export interface ContextNativeCacheEditState {
+  toolOrder: string[]
+  deletedToolUseIds: string[]
+  pinnedEdits: ContextNativeCacheEditPin[]
+  toolsSentToApi?: boolean
+}
+
+export interface CodexTruncationPolicy {
+  mode: "bytes" | "tokens"
+  limit: number
+}
+
+export interface CodexContextTokenInfo {
+  totalTokens: number
+  modelContextWindow?: number
+  updatedAt: number
+}
+
+export interface CodexReferenceContextItem {
+  conversationId?: string
+  model?: string
+  systemPromptHash?: string
+  toolSpecHash?: string
+  contextTokenLimit?: number
+  serviceTier?: string
+  reasoningEffort?: string
+  truncationPolicy: CodexTruncationPolicy
+  updatedAt: number
+}
+
+export type CodexReplacementHistoryItem = Record<string, unknown>
+
+export const CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE = "codex_response_item"
+
+export interface CodexRawResponseItemBlock {
+  type: typeof CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
+  item: CodexReplacementHistoryItem
+}
+
+export interface CodexReplacementHistory {
+  compactionId: string
+  createdAt: number
+  injectionMode: "pre_turn" | "mid_turn"
+  anchorRecordId?: string
+  anchorRecordCount: number
+  summary: string
+  items: CodexReplacementHistoryItem[]
+}
+
+export interface CodexContextState {
+  historyVersion: number
+  tokenInfo?: CodexContextTokenInfo
+  referenceContextItem?: CodexReferenceContextItem
+  replacementHistory?: CodexReplacementHistory
+  truncationPolicy: CodexTruncationPolicy
+}
+
 export interface ContextInvestigationMemoryEntry {
   batchId: string
   label: string
@@ -216,6 +323,35 @@ export interface InvestigationMemorySummaryLike {
   toolCount?: number
   readOnly?: boolean
   createdAt?: number
+}
+
+export type ContextSessionMemoryKind =
+  | "objective"
+  | "decision"
+  | "progress"
+  | "file"
+  | "constraint"
+  | "verification"
+  | "risk"
+  | "command"
+  | "sub_agent"
+  | "open_item"
+
+export interface ContextSessionMemoryEntry {
+  id: string
+  kind: ContextSessionMemoryKind
+  text: string
+  sourceCompactionId: string
+  sourceRecordId?: string
+  createdAt: number
+  weight: number
+}
+
+export interface SessionMemorySummaryLike {
+  kind: ContextSessionMemoryKind
+  text: string
+  createdAt?: number
+  weight?: number
 }
 
 /**
@@ -256,14 +392,24 @@ export interface ContextConversationState {
   compactionEpoch?: number
   lastAppliedCompaction?: ContextCompactionBasis
   usageLedger: ContextUsageLedgerState
+  codexContext?: CodexContextState
   toolResultReplacementState?: ContextToolResultReplacementState
+  nativeCacheEditState?: ContextNativeCacheEditState
   investigationMemory: ContextInvestigationMemoryEntry[]
+  sessionMemory: ContextSessionMemoryEntry[]
 }
 
 export interface ProjectedContextMessage {
   role: "user" | "assistant"
   content: LooseMessageContent
-  source: "record" | "boundary" | "summary" | "attachment" | "snip"
+  source:
+    | "record"
+    | "boundary"
+    | "summary"
+    | "attachment"
+    | "snip"
+    | "microcompact"
+    | "hook"
   recordId?: string
   commitId?: string
   attachmentKind?: ContextProjectionAttachment["kind"]
@@ -314,6 +460,12 @@ export function isImageBlock(block: ContentBlock): block is ImageBlock {
  */
 export function isThinkingBlock(block: ContentBlock): block is ThinkingBlock {
   return block.type === "thinking"
+}
+
+export function isCacheEditsBlock(
+  block: ContentBlock
+): block is CacheEditsBlock {
+  return block.type === "cache_edits"
 }
 
 /**

@@ -220,6 +220,10 @@ const REQUIRED_BETA_FEATURES = [
   "context-management-2025-06-27",
   "prompt-caching-scope-2026-01-05",
 ] as const
+const CACHE_EDITING_BETA_HEADER =
+  process.env.ANTHROPIC_CACHE_EDITING_BETA_HEADER?.trim() ||
+  process.env.CACHE_EDITING_BETA_HEADER?.trim() ||
+  ""
 
 const MODEL_DISCOVERY_TIMEOUT_MS = 8_000
 const MODEL_DISCOVERY_MAX_PAGES = 5
@@ -2464,6 +2468,9 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       for (const required of REQUIRED_BETA_FEATURES) {
         betaSet.add(required)
       }
+      if (CACHE_EDITING_BETA_HEADER) {
+        betaSet.add(CACHE_EDITING_BETA_HEADER)
+      }
     }
 
     // Merge betas extracted from the request body
@@ -2562,6 +2569,13 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     if (account.stripThinking) {
       delete raw.thinking
       delete raw.output_config
+    }
+    if (!this.shouldApplyOfficialAnthropicOptimizations(account)) {
+      // Provider-native context edits are part of the official Anthropic
+      // messages surface.  Claude-compatible third-party providers commonly
+      // reject unknown request fields, so keep this optimization scoped to the
+      // official endpoint.
+      delete raw.context_management
     }
 
     if (

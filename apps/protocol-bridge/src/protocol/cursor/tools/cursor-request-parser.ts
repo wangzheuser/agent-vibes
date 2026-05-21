@@ -33,6 +33,7 @@ import {
   normalizePathForMatch,
 } from "../skills"
 import { KvStorageService } from "../kv-storage.service"
+import { extractWorkspaceFoldersWithPrimary } from "./workspace-folders"
 import { CursorProtocolTraceService } from "../cursor-protocol-trace.service"
 
 // GZIP 魔数
@@ -134,6 +135,63 @@ export interface McpToolDef {
   description: string
   /** JSON Schema 形式的 input_schema */
   inputSchema?: Record<string, unknown>
+  /**
+   * IDE-side MCP server registry key — the value the Cursor IDE actually
+   * uses to look up the server when bridge forwards `serverName` /
+   * `provider_identifier` on `ListMcpResourcesExecArgs`,
+   * `ReadMcpResourceExecArgs`, or `McpArgs`.
+   *
+   * Background: in current Cursor builds, the wire-level
+   * `McpToolDefinition.provider_identifier` is the short alias the user
+   * typed (e.g. `context7`), but the IDE's MCP registry keys servers
+   * with the prefixed form (e.g. `user-context7`). Forwarding the short
+   * alias verbatim makes the IDE answer
+   * `Server "context7" not found` even though the channel is healthy.
+   *
+   * Computed once here (`computeMcpIdeRegistryKey`) at parse time, then
+   * read by `resolveMountedMcpServer` at dispatch time. Empty string
+   * means "no usable key" (caller falls back to `providerIdentifier`).
+   *
+   * NOTE: when Cursor fixes the wire-level mismatch (i.e. ships a
+   * `McpToolDefinition.provider_identifier` that already equals the IDE
+   * registry key), this field will simply collapse onto
+   * `providerIdentifier` and the resolver becomes an identity function.
+   */
+  ideRegistryKey: string
+}
+
+/**
+ * Compute the canonical IDE-side MCP server registry key for a given
+ * tool definition. See `McpToolDef.ideRegistryKey` for background.
+ *
+ * Derivation (in order):
+ *   1. If `name` ends with `-${toolName}`, the prefix is the IDE
+ *      registry key (e.g. `user-context7-resolve-library-id` minus
+ *      `-resolve-library-id` → `user-context7`).
+ *   2. Otherwise fall back to `providerIdentifier`. This handles tool
+ *      definitions that arrived without a composed `name` (some
+ *      protocol variants only carry `toolName` + `providerIdentifier`),
+ *      and the future-proof case where Cursor stops mangling the
+ *      wire-level identifier.
+ *   3. If neither yields a non-empty value, return `""`. Callers must
+ *      treat that as "no candidate" and fall through.
+ */
+export function computeMcpIdeRegistryKey(input: {
+  name?: string | null
+  toolName?: string | null
+  providerIdentifier?: string | null
+}): string {
+  const name = (input.name || "").trim()
+  const toolName = (input.toolName || "").trim()
+  const provider = (input.providerIdentifier || "").trim()
+
+  if (name && toolName) {
+    const suffix = `-${toolName}`
+    if (name.length > suffix.length && name.endsWith(suffix)) {
+      return name.slice(0, name.length - suffix.length)
+    }
+  }
+  return provider
 }
 
 // Cursor 协议中附加的图片数据（从 SelectedImage 解析）
@@ -180,6 +238,36 @@ export interface ParsedCursorRequest {
     rootPath: string
     directories: string[]
     files: string[]
+    /**
+     * Multi-root workspace folders synced from the IDE.
+     *
+     * Cursor 协议层有三个数据源都会带 multi-root workspace 信息，按
+     * 完整度从高到低：
+     *   1. `StreamUnifiedChatRequest.workspace_folders` (field 81)
+     *      → `repeated WorkspaceFolder { uri, name }`，优先级最高（带显示名）
+     *   2. `ConversationMessage.workspace_uris` (field 87)
+     *      → `repeated string` (file:// URIs)
+     *   3. `ConversationMessage.workspace_project_dir` (field 84)
+     *      → `optional string`（单个主项目目录）
+     *
+     * 我们 parser 内部把三处统一成下面这个数组形状，让上层代码只
+     * 跟一个字段打交道。`uri` 保留协议原文（含 file:// 前缀），
+     * `path` 是解析后的本地绝对路径，`name` 优先取 IDE 显示名，
+     * 缺失时落到目录尾段。
+     *
+     * 当 IDE 是单 root 工作区时，这里通常只会有一个条目且和
+     * `rootPath` 重合 — 这是预期行为，去重交给 session 层 +
+     * isPathWithinAllowedRoots 处理（依赖路径归一化）。
+     *
+     * Optional 是为了兼容老的持久化 session（JSON on disk 里没有
+     * 这个字段时 load 后是 undefined），所有消费方都要能 fallback
+     * 到 `[{ path: rootPath, ... }]`。
+     */
+    workspaceFolders?: Array<{
+      uri: string
+      path: string
+      name: string
+    }>
   }
 
   // 附加代码块
@@ -203,6 +291,7 @@ export interface ParsedCursorRequest {
 
   // 协议中的 token 预算（用于严格跟随 Cursor 参数）
   contextTokenLimit?: number
+  contextMaxMode?: boolean
   usedContextTokens?: number
   requestedMaxOutputTokens?: number
   requestedModelParameters?: Record<string, string>
@@ -434,6 +523,7 @@ export class CursorRequestParser {
   private readonly logger = new Logger(CursorRequestParser.name)
 
   private readonly textDecoder = new TextDecoder()
+  private readonly normalStateContextTokenLimitCeiling = 250_000
 
   constructor(
     private readonly kvStorageService: KvStorageService = new KvStorageService()
@@ -1584,23 +1674,15 @@ export class CursorRequestParser {
     }
 
     const requestContext = action.requestContext
-    let rootPath = ""
-    const directories: string[] = []
-    if (requestContext?.repositoryInfo?.length) {
-      for (const repo of requestContext.repositoryInfo) {
-        if (!repo.workspaceUri) continue
-        const path = repo.workspaceUri.replace(/^file:\/\//, "")
-        if (!rootPath) rootPath = path
-        if (!directories.includes(path)) directories.push(path)
-      }
-    }
-    if (!rootPath && requestContext?.gitRepos?.length) {
-      for (const git of requestContext.gitRepos) {
-        if (!git.path) continue
-        if (!rootPath) rootPath = git.path
-        if (!directories.includes(git.path)) directories.push(git.path)
-      }
-    }
+    // Multi-root workspace extraction. See workspace-folders.ts for
+    // the data flow — this single helper supersedes the previous
+    // ad-hoc loops over repositoryInfo / gitRepos / previousWorkspaceUris
+    // that were duplicated across every parser entry point.
+    const { rootPath, workspaceFolders } = extractWorkspaceFoldersWithPrimary(
+      requestContext,
+      undefined
+    )
+    const directories = workspaceFolders.map((f) => f.path)
 
     const builtInToolCapabilityOptions = {
       webSearchEnabled: requestContext?.webSearchEnabled,
@@ -1616,7 +1698,7 @@ export class CursorRequestParser {
 
     this.logger.log(
       `conversationAction.userMessageAction: prompt="${prompt.substring(0, 100)}...", ` +
-        `workspace=${rootPath || "(none)"}, tools=${supportedTools.length}, useWeb=${useWeb}`
+        `workspace=${rootPath || "(none)"} folders=${workspaceFolders.length}, tools=${supportedTools.length}, useWeb=${useWeb}`
     )
 
     return {
@@ -1629,7 +1711,7 @@ export class CursorRequestParser {
       supportedTools,
       useWeb,
       projectContext: rootPath
-        ? { rootPath, directories, files: [] }
+        ? { rootPath, directories, files: [], workspaceFolders }
         : undefined,
       requestContextEnv: requestContext?.env
         ? {
@@ -1796,35 +1878,15 @@ export class CursorRequestParser {
         )
       }
     }
-    let rootPath = ""
-    const directories: string[] = []
-    if (requestContext?.repositoryInfo?.length) {
-      for (const repo of requestContext.repositoryInfo) {
-        if (repo.workspaceUri) {
-          // workspaceUri 格式为 "file:///path/to/project"
-          const path = repo.workspaceUri.replace(/^file:\/\//, "")
-          if (!rootPath) rootPath = path
-          directories.push(path)
-        }
-      }
-    }
-    // 兜底：从 conversationState.previousWorkspaceUris 提取
-    if (!rootPath && req.conversationState?.previousWorkspaceUris?.length) {
-      for (const uri of req.conversationState.previousWorkspaceUris) {
-        const path = uri.replace(/^file:\/\//, "")
-        if (!rootPath) rootPath = path
-        directories.push(path)
-      }
-    }
-    // 兜底2：从 gitRepos[].path 提取（这是最可靠的来源）
-    if (!rootPath && requestContext?.gitRepos?.length) {
-      for (const git of requestContext.gitRepos) {
-        if (git.path) {
-          if (!rootPath) rootPath = git.path
-          if (!directories.includes(git.path)) directories.push(git.path)
-        }
-      }
-    }
+    // Multi-root workspace extraction (parseRunRequest path).
+    // Same helper as the conversationAction.userMessageAction path,
+    // but with conversationState available so previousWorkspaceUris
+    // is consulted as a resume-time fallback. See workspace-folders.ts.
+    const { rootPath, workspaceFolders } = extractWorkspaceFoldersWithPrimary(
+      requestContext,
+      req.conversationState
+    )
+    const directories = workspaceFolders.map((f) => f.path)
 
     // 提取 Cursor Rules
     // 规则来自两个来源：
@@ -1926,6 +1988,11 @@ export class CursorRequestParser {
       variantRequestedModelParameters,
       explicitRequestedModelParameters
     )
+    const modelMaxMode = req.modelDetails?.maxMode === true
+    const requestedMaxMode = req.requestedModel?.maxMode === true
+    const requestedVariantMaxMode = requestedVariantSelection?.maxMode === true
+    const modelDetailsVariantMaxMode =
+      modelDetailsVariantSelection?.maxMode === true
     const requestedMaxOutputTokens = this.extractRequestedMaxOutputTokens(
       req.requestedModel?.parameters || []
     )
@@ -1937,18 +2004,46 @@ export class CursorRequestParser {
       req.conversationState.tokenDetails.usedTokens > 0
         ? req.conversationState.tokenDetails.usedTokens
         : undefined
-    const contextTokenLimitFromState =
+    const rawContextTokenLimitFromState =
       req.conversationState?.tokenDetails &&
       req.conversationState.tokenDetails.maxTokens > 0
         ? req.conversationState.tokenDetails.maxTokens
         : undefined
+    const explicitMaxContextMode =
+      modelMaxMode ||
+      requestedMaxMode ||
+      requestedVariantMaxMode ||
+      modelDetailsVariantMaxMode
+    const contextTokenLimitFromState =
+      rawContextTokenLimitFromState &&
+      !requestedContextTokenLimit &&
+      (explicitMaxContextMode ||
+        rawContextTokenLimitFromState <=
+          this.normalStateContextTokenLimitCeiling)
+        ? rawContextTokenLimitFromState
+        : undefined
+    if (
+      rawContextTokenLimitFromState &&
+      !requestedContextTokenLimit &&
+      !contextTokenLimitFromState
+    ) {
+      this.logger.debug(
+        `Ignoring conversationState.tokenDetails.maxTokens=${rawContextTokenLimitFromState} without explicit max-mode signal`
+      )
+    }
     const contextTokenLimit =
-      contextTokenLimitFromState || requestedContextTokenLimit
+      requestedContextTokenLimit ||
+      (explicitMaxContextMode ? undefined : contextTokenLimitFromState)
 
-    if (contextTokenLimit || requestedMaxOutputTokens) {
+    if (
+      contextTokenLimit ||
+      requestedMaxOutputTokens ||
+      explicitMaxContextMode
+    ) {
       this.logger.log(
         `Token budget from protocol: contextLimit=${contextTokenLimit || "(none)"}, ` +
-          `usedContext=${usedContextTokens || "(none)"}, maxOutput=${requestedMaxOutputTokens || "(none)"}`
+          `usedContext=${usedContextTokens || "(none)"}, maxOutput=${requestedMaxOutputTokens || "(none)"}, ` +
+          `maxMode=${explicitMaxContextMode}`
       )
     }
 
@@ -2061,6 +2156,11 @@ export class CursorRequestParser {
         toolName: tool.toolName || name,
         providerIdentifier: tool.providerIdentifier || "",
         description: tool.description || "",
+        ideRegistryKey: computeMcpIdeRegistryKey({
+          name,
+          toolName: tool.toolName || name,
+          providerIdentifier: tool.providerIdentifier || "",
+        }),
       }
       if (tool.inputSchema) {
         try {
@@ -2126,11 +2226,6 @@ export class CursorRequestParser {
     // 不再根据 model-registry 自动猜测 thinking：
     // Cursor 是否显式请求 think 应以协议字段为准，避免 bridge 擅自开启。
     const hasThinkingDetails = !!req.modelDetails?.thinkingDetails
-    const modelMaxMode = req.modelDetails?.maxMode === true
-    const requestedMaxMode = req.requestedModel?.maxMode === true
-    const requestedVariantMaxMode = requestedVariantSelection?.maxMode === true
-    const modelDetailsVariantMaxMode =
-      modelDetailsVariantSelection?.maxMode === true
     const requestedThinkingLevel = this.resolveRequestedThinkingLevel(
       requestedModelParameters
     )
@@ -2218,7 +2313,7 @@ export class CursorRequestParser {
           useWeb,
           conversationId,
           projectContext: rootPath
-            ? { rootPath, directories, files: [] }
+            ? { rootPath, directories, files: [], workspaceFolders }
             : undefined,
           cursorRules,
           selectedCursorRulePaths:
@@ -2233,6 +2328,7 @@ export class CursorRequestParser {
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
           contextTokenLimit,
+          contextMaxMode: explicitMaxContextMode,
           usedContextTokens,
           requestedMaxOutputTokens,
           requestedModelParameters,
@@ -2376,7 +2472,7 @@ export class CursorRequestParser {
           useWeb,
           conversationId,
           projectContext: rootPath
-            ? { rootPath, directories, files: [] }
+            ? { rootPath, directories, files: [], workspaceFolders }
             : undefined,
           cursorRules,
           selectedCursorRulePaths:
@@ -2391,6 +2487,7 @@ export class CursorRequestParser {
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
           contextTokenLimit,
+          contextMaxMode: explicitMaxContextMode,
           usedContextTokens,
           requestedMaxOutputTokens,
           requestedModelParameters,
@@ -2423,7 +2520,7 @@ export class CursorRequestParser {
           useWeb,
           conversationId,
           projectContext: rootPath
-            ? { rootPath, directories, files: [] }
+            ? { rootPath, directories, files: [], workspaceFolders }
             : undefined,
           cursorRules,
           selectedCursorRulePaths:
@@ -2438,6 +2535,7 @@ export class CursorRequestParser {
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
           contextTokenLimit,
+          contextMaxMode: explicitMaxContextMode,
           usedContextTokens,
           requestedMaxOutputTokens,
           requestedModelParameters,
@@ -2478,7 +2576,7 @@ export class CursorRequestParser {
       useWeb,
       conversationId,
       projectContext: rootPath
-        ? { rootPath, directories, files: [] }
+        ? { rootPath, directories, files: [], workspaceFolders }
         : undefined,
       cursorRules,
       selectedCursorRulePaths:
@@ -2492,6 +2590,7 @@ export class CursorRequestParser {
       cursorCommands: cursorCommands.length > 0 ? cursorCommands : undefined,
       customSystemPrompt: customSystemPrompt || undefined,
       contextTokenLimit,
+      contextMaxMode: explicitMaxContextMode,
       usedContextTokens,
       requestedMaxOutputTokens,
       requestedModelParameters,

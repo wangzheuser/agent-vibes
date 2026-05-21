@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common"
 import {
   applyDomainFilters,
   WebSearchAbortError,
+  WebSearchEmptyResultError,
   type WebSearchAdapter,
   type WebSearchAdapterName,
   type WebSearchOptions,
@@ -158,7 +159,11 @@ export class ExaMcpAdapter implements WebSearchAdapter {
     })
 
     if (trimmed.length === 0) {
-      throw new Error("exa-mcp returned no parseable results")
+      throw new WebSearchEmptyResultError(
+        this.name,
+        query,
+        "exa-mcp returned no parseable results"
+      )
     }
 
     return trimmed
