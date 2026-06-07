@@ -45,6 +45,7 @@ import {
 } from "../shared/abort-signal"
 import {
   type CooldownableAccount,
+  clearAccountDisablement,
   disableAccount,
   isAccountAvailableForModel,
   isAccountDisabled,
@@ -1148,12 +1149,48 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     this.pruneCodexRuntimeCaches()
     const cacheKey = this.getCachedWsKey(slot, modelName, conversationId)
-    const cached = this.cachedWsSessions.get(cacheKey)
+    let cached = this.cachedWsSessions.get(cacheKey)
+    let adoptedCacheKey = cacheKey
+
+    // Fallback: adopt a pristine startup-warmup connection.
+    //
+    // Startup / model-picker warmups (scheduleCodexWarmupForCursorModel) run
+    // before any conversationId exists, so prewarmSessionConnection() caches
+    // the connection under the `:global` scope. The first real request for a
+    // conversation looks up the `:conversation:<hash>` scope and misses,
+    // leaving that warm OPEN socket orphaned and forcing a fresh handshake on
+    // the very first turn of every session.
+    //
+    // When the conversation-scoped lookup misses, reclaim the global warm
+    // entry for the SAME (slot, model). This restores the official Codex CLI
+    // `prewarm_websocket()` semantics: conversationId rides per-request in the
+    // upgrade headers (see buildWebSocketHeaders), it does not bind the
+    // socket, so the first turn can reuse the prewarmed connection.
+    //
+    // Guard: only adopt a *pristine* entry (no lastResponse / lastRequest), so
+    // we never inherit a foreign previous_response_id chain — adopting a used
+    // connection would trip the strict incremental-extension check and corrupt
+    // turn state. Matching (slot, model) also guarantees the same wsUrl, so
+    // ensureSessionConnection() reuses the socket instead of reconnecting.
+    if (!cached) {
+      const globalCacheKey = this.getCachedWsKey(slot, modelName)
+      if (globalCacheKey !== cacheKey) {
+        const globalCached = this.cachedWsSessions.get(globalCacheKey)
+        if (
+          globalCached &&
+          !globalCached.lastResponse &&
+          !globalCached.lastRequest
+        ) {
+          cached = globalCached
+          adoptedCacheKey = globalCacheKey
+        }
+      }
+    }
 
     let context: CodexTurnContext
     if (cached) {
       // Reuse connection from cache (mirrors take_cached_websocket_session)
-      this.cachedWsSessions.delete(cacheKey)
+      this.cachedWsSessions.delete(adoptedCacheKey)
       context = {
         wsSessionId: cached.wsSessionId,
         turnKey,
@@ -1843,18 +1880,53 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   /**
+   * 生成账号当前凭据的指纹。
+   * OAuth 账号取 refreshToken，api-key 账号取 apiKey。
+   * 用于判断"被 disable 时的凭据"与"当前文件里的凭据"是否一致。
+   */
+  private computeCredentialFingerprint(slot: CodexAccountSlot): string {
+    const material = slot.refreshToken?.trim() || slot.apiKey?.trim() || ""
+    if (!material) return ""
+    return crypto
+      .createHash("sha256")
+      .update(material)
+      .digest("hex")
+      .slice(0, 16)
+  }
+
+  /**
    * 从 SQLite 恢复持久化的 disabled 状态。
    * 重启后已经被永久 disable 的账号直接跳过，不再做 warmup。
+   *
+   * 凭据指纹比对：如果当前文件里的凭据与被 disable 时记录的指纹不一致，
+   * 说明用户已经重新同步了新凭据（例如官方 CLI 抢先轮换 refresh token 导致
+   * 旧凭据失效后用户重新登录），原 disable 原因已不成立，跳过恢复并清除这条
+   * 过期记录。这样重新 sync 凭据 + 重启即可自愈，无需手动清库。
    */
   private restorePersistedAccountStates(): void {
     const persistedStates = this.accountStateStore.loadStates("codex")
     if (persistedStates.size === 0) return
+
+    let staleCleared = false
 
     for (const slot of this.accounts) {
       const state = persistedStates.get(slot.stateKey)
       if (!state) continue
 
       if (typeof state.disabledAt === "number" && state.disabledAt > 0) {
+        const currentFingerprint = this.computeCredentialFingerprint(slot)
+        if (
+          state.credentialFingerprint &&
+          currentFingerprint &&
+          state.credentialFingerprint !== currentFingerprint
+        ) {
+          staleCleared = true
+          this.logger.log(
+            `[Codex] 检测到凭据已更新，清除过期 disabled 状态: ${this.getAccountLabel(slot)} (reason=${state.disabledReason})`
+          )
+          continue
+        }
+
         slot.disabledAt = state.disabledAt
         slot.disabledReason = state.disabledReason
         slot.disabledStatusCode = state.disabledStatusCode
@@ -1865,6 +1937,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           `[Codex] 恢复已 disabled 账号: ${this.getAccountLabel(slot)} (reason=${state.disabledReason})`
         )
       }
+    }
+
+    // 有过期记录被清除时，把内存状态重新写回 DB，保证持久化层与内存对齐。
+    if (staleCleared) {
+      this.persistCodexAccountStates()
     }
   }
 
@@ -1883,6 +1960,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         disabledReason: slot.disabledReason,
         disabledStatusCode: slot.disabledStatusCode,
         disabledMessage: slot.disabledMessage,
+        credentialFingerprint: this.computeCredentialFingerprint(slot),
         updatedAt: Date.now(),
       })
     }
@@ -2046,6 +2124,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     fallbackBaseUrl: string,
     fallbackProxyUrl: string
   ): void {
+    // 捕获更新前的凭据指纹，用于热重载（如 Sync Codex CLI）时判断凭据是否已变更。
+    const wasDisabled = isAccountDisabled(slot)
+    const previousFingerprint = wasDisabled
+      ? this.computeCredentialFingerprint(slot)
+      : ""
+
     slot.label = record.label || record.email || undefined
     slot.apiKey = record.apiKey || undefined
     slot.accountId = record.accountId || undefined
@@ -2076,6 +2160,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           expire: record.expire || "",
         })
       )
+      this.clearDisablementIfCredentialChanged(
+        slot,
+        wasDisabled,
+        previousFingerprint
+      )
       return
     }
 
@@ -2083,6 +2172,33 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     slot.refreshToken = undefined
     slot.tokenData = null
     slot.refreshPromise = undefined
+    this.clearDisablementIfCredentialChanged(
+      slot,
+      wasDisabled,
+      previousFingerprint
+    )
+  }
+
+  /**
+   * 热重载时，如果账号此前被 disable，且更新后的凭据指纹与之前不同，
+   * 说明用户重新同步了新凭据（如官方 CLI 抢先轮换 refresh token 后重新登录），
+   * 原 disable 原因已不成立。清除内存中的 disabled 状态并同步落库。
+   */
+  private clearDisablementIfCredentialChanged(
+    slot: CodexAccountSlot,
+    wasDisabled: boolean,
+    previousFingerprint: string
+  ): void {
+    if (!wasDisabled) return
+    const currentFingerprint = this.computeCredentialFingerprint(slot)
+    if (!currentFingerprint || currentFingerprint === previousFingerprint) {
+      return
+    }
+    clearAccountDisablement(slot)
+    this.persistCodexAccountStates()
+    this.logger.log(
+      `[Hot-reload] 检测到凭据已更新，清除 disabled 状态: ${this.getAccountLabel(slot)}`
+    )
   }
 
   private pruneConversationBindingsForSlots(slots: CodexAccountSlot[]): void {

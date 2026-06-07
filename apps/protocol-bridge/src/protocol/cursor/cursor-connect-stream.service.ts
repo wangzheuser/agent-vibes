@@ -164,6 +164,7 @@ import {
   SubagentExecBridgeService,
   type SubagentExecResult,
 } from "./subagents/subagent-exec-bridge.service"
+import { buildSubAgentScopedConversationId } from "./subagents/subagent-conversation-scope"
 import { projectSubAgentFinalSynthesisMessages } from "./subagents/subagent-final-synthesis-projector"
 import {
   applySubagentOverride,
@@ -3892,10 +3893,34 @@ export class CursorConnectStreamService {
       systemAddendum: subAgentSystemAddendum,
     } = this.resolveSubAgentToolSurface(ctx.tools, forceFinalSynthesis)
 
+    // Scope the conversationId per sub-agent so the Codex incremental
+    // chain (previous_response_id + strict input extension) is keyed by
+    // (parentConversationId, subagentId) instead of the bare parent id.
+    //
+    // Why this matters: every sub-agent turn and every parent-agent turn
+    // used to share one conversationId, so they landed in the same
+    // CodexTurnContext. The parent's `instructions`/`tools` differ from
+    // the sub-agent's, so each alternating turn tripped
+    // `static_fields_changed`, invalidated the chain, and forced a full
+    // history resend (~38% of turns went out as non-incremental). Giving
+    // each sub-agent its own scoped key keeps both chains intact.
+    //
+    // This reuses the exact mechanism the `:compact` sub-request already
+    // relies on (see `${session.conversationId}:compact`): the scoped id
+    // rides through `dto._conversationId` and the Codex translator maps
+    // it straight onto `CodexRequest.conversationId`, which keys the
+    // per-conversation turn-context session. `ctx.subagentId` is stable
+    // across a sub-agent's turns, so its own incremental chain still
+    // works turn-to-turn.
+    const scopedConversationId = buildSubAgentScopedConversationId(
+      conversationId,
+      ctx.subagentId
+    )
+
     const dto = this.buildStreamingDtoForRoute(streamRoute, {
       model: ctx.model,
       promptContext: this.buildPromptContextFromSession(session),
-      conversationId,
+      conversationId: scopedConversationId,
       session,
       thinkingLevel: session.thinkingLevel,
       thinkingDetailsRequested: session.thinkingDetailsRequested,
@@ -17625,10 +17650,29 @@ ${raw}
         // `tool calls: 0` and answer "no tools are available".
         const { toolDefinitions, systemAddendum } =
           this.resolveSubAgentToolSurface(ctx.tools, false)
+        // Scope the conversationId per sub-agent, exactly as the Anthropic
+        // path does in buildSubAgentStreamingDtoForRoute. This is the
+        // Codex-backend twin of that fix and the one that actually fires
+        // for GPT-routed sub-agents: without it, every sub-agent turn and
+        // every parent-agent turn share one conversationId, land in the
+        // same CodexTurnContext, and each alternating turn trips
+        // `static_fields_changed` — forcing a full, non-incremental
+        // history resend (~100% of turns observed as
+        // `previous_response_id=none`). `ctx.subagentId` is stable across a
+        // sub-agent's turns, so its own incremental chain survives.
+        //
+        // The scoped id must be used BOTH for the request conversationId
+        // (which keys the Codex turn-context session) AND for the
+        // continuation-reset target below, or the reset would clear a
+        // different conversationId's chain than the request rides on.
+        const scopedConversationId = buildSubAgentScopedConversationId(
+          conversationId,
+          ctx.subagentId
+        )
         return this.buildCodexStreamingRequestForRoute(streamRoute, {
           model: ctx.model,
           promptContext: this.buildPromptContextFromSession(session),
-          conversationId,
+          conversationId: scopedConversationId,
           session,
           thinkingLevel: session.thinkingLevel,
           thinkingDetailsRequested: session.thinkingDetailsRequested,
@@ -17648,10 +17692,10 @@ ${raw}
             )
             this.resetCodexContinuationAfterProjectionRewrite(
               streamRoute.backend,
-              conversationId,
+              scopedConversationId,
               streamRoute.model,
               compacted,
-              `sub-agent: ${conversationId}:${ctx.subagentId}`
+              `sub-agent: ${scopedConversationId}`
             )
 
             return compacted.messages as CodexExecutionRequest["messages"]
@@ -18249,10 +18293,18 @@ ${raw}
           undefined,
           true
         )
+        // Same per-sub-agent scoping as the regular Codex turn builder
+        // above: the synthesis turn belongs to the same sub-agent, so it
+        // must continue on that sub-agent's own incremental chain rather
+        // than the shared parent conversationId.
+        const scopedConversationId = buildSubAgentScopedConversationId(
+          conversationId,
+          ctx.subagentId
+        )
         return this.buildCodexStreamingRequestForRoute(streamRoute, {
           model: ctx.model,
           promptContext: this.buildPromptContextFromSession(session),
-          conversationId,
+          conversationId: scopedConversationId,
           session,
           thinkingLevel: session.thinkingLevel,
           thinkingDetailsRequested: session.thinkingDetailsRequested,
@@ -18272,10 +18324,10 @@ ${raw}
             )
             this.resetCodexContinuationAfterProjectionRewrite(
               streamRoute.backend,
-              conversationId,
+              scopedConversationId,
               streamRoute.model,
               compacted,
-              `sub-agent synthesis: ${conversationId}:${ctx.subagentId}`
+              `sub-agent synthesis: ${scopedConversationId}`
             )
 
             return projectSubAgentFinalSynthesisMessages(
@@ -18499,10 +18551,20 @@ ${raw}
           tempCtx.tools,
           args.forceFinalSynthesis === true
         )
+      // Per-sub-agent conversationId scoping — the background-worker twin
+      // of the foreground fix. Background sub-agents on Codex previously
+      // shared the parent conversationId too, so their turns also collapsed
+      // the incremental chain. `args.subagentId` is stable across this
+      // sub-agent's turns; use the scoped id for both the request and the
+      // continuation-reset target so they stay on the same chain key.
+      const scopedConversationId = buildSubAgentScopedConversationId(
+        conversationId,
+        args.subagentId
+      )
       return this.buildCodexStreamingRequestForRoute(streamRoute, {
         model: args.model,
         promptContext: this.buildPromptContextFromSession(session),
-        conversationId,
+        conversationId: scopedConversationId,
         session,
         thinkingLevel: session.thinkingLevel,
         thinkingDetailsRequested: session.thinkingDetailsRequested,
@@ -18522,10 +18584,10 @@ ${raw}
           )
           this.resetCodexContinuationAfterProjectionRewrite(
             streamRoute.backend,
-            conversationId,
+            scopedConversationId,
             streamRoute.model,
             compacted,
-            `background sub-agent: ${conversationId}:${args.subagentId}`
+            `background sub-agent: ${scopedConversationId}`
           )
           if (args.forceFinalSynthesis === true) {
             return projectSubAgentFinalSynthesisMessages(

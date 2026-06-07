@@ -22,6 +22,13 @@ export interface PersistedBackendAccountState {
   disabledReason?: string
   disabledStatusCode?: number
   disabledMessage?: string
+  /**
+   * Fingerprint of the credential (refresh token / api key) that was in effect
+   * when the account was disabled. On restore, if the current credential
+   * fingerprint differs, the user has re-synced fresh credentials and the
+   * persisted disablement is considered stale and cleared automatically.
+   */
+  credentialFingerprint?: string
   updatedAt: number
 }
 
