@@ -260,7 +260,7 @@ export class ContextCompactRunnerService {
       "4. Errors and Fixes: All errors encountered, how they were resolved, and any user feedback on each.",
       "5. Problem Solving: Problems solved and ongoing troubleshooting threads.",
       "6. All User Messages: List every user message that is not a tool result, in order. These anchor the user's evolving intent and must not be summarized away.",
-      "7. Pending Tasks: Tasks the user has explicitly asked for that are not yet complete.",
+      "7. Pending Tasks (historical): Tasks the user asked for during THIS EARLIER segment that were not yet complete at the cut-off, listed in the order they were raised. Mark them as historical — by now they may be done, abandoned, or superseded by a later topic. Do NOT present this as the current to-do list and do NOT pick the current task from here; the current task is defined only by the preserved recent messages and the continuity guard that follow.",
       "8. Current Work (historical): What was being worked on at the END of THIS EARLIER segment, with file names and code snippets. Treat this as historical context — it may already be completed or superseded by the preserved recent messages that follow. Do NOT present it as the current task.",
       '9. Next Step: Do NOT infer or propose a next step from this earlier segment. The preserved recent messages that follow this summary are authoritative for the current task and the next step. Write exactly: "Current task and next step: defer to the preserved recent messages below — do not resume a task from this earlier summary unless the recent messages explicitly continue it."',
       "",

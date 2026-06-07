@@ -33,13 +33,9 @@ import {
   ContextTranscriptRecord,
   ProjectedContextMessage,
   ContextProjectionAttachment,
-  TextBlock,
-  ToolResultBlock,
-  isTextBlock,
-  isToolResultBlock,
-  isToolUseBlock,
   UnifiedMessage,
 } from "./types"
+import { repairOrphanedToolPairs } from "./orphan-tool-pair-repair"
 
 export class ContextProjectionBudgetExceededError extends Error {
   constructor(
@@ -109,12 +105,23 @@ export class ContextCompactionService {
    * exceeds it); retaining right up to it would leave the post-compaction
    * projection sitting at the trigger again, so the very next tool result
    * re-fires compaction — thrashing that regenerates the LLM summary every few
-   * K of growth and compounds summary loss (summary-of-summary). Retaining to
-   * a fraction below the trigger leaves growth headroom so compaction fires in
-   * larger, less frequent steps (cc compacts to below the threshold, not at
-   * it). Keeps ample recent context (e.g. ~100K of a ~131K budget).
+   * K of growth and compounds summary loss (summary-of-summary).
+   *
+   * 0.8 proved insufficient: it leaves only ~20% headroom, and a single
+   * autonomous turn's tool-result burst (cc budgets ~15K, large reads spike
+   * 20K+) refills it almost immediately. A live log showed two compactions
+   * 50s apart (+33K archived in between) — exactly this thrash, which is what
+   * compounds and flattens the summary across epochs. Claude Code avoids this
+   * structurally: it fires at ~93% then does a FULL compaction that drops to a
+   * SMALL post-compaction size, so it rarely re-compacts. The bridge keeps a
+   * large recent window verbatim, so it must instead leave a turn-burst-proof
+   * headroom: 0.6 keeps ~40% of the budget free (e.g. ~65K of a ~162K budget)
+   * so a normal turn cannot re-cross the trigger, making compaction rare (and
+   * therefore re-summarization, and therefore flattening, rare) like cc. It
+   * still retains a generous verbatim window (~0.6 of the budget, far more
+   * than cc keeps).
    */
-  private readonly COMPACTION_RETENTION_RATIO = 0.8
+  private readonly COMPACTION_RETENTION_RATIO = 0.6
   private readonly INVESTIGATION_MEMORY_ATTACHMENT_BONUS = 320
   private readonly SNIP_MIN_REMOVED_RECORDS = 2
   /**
@@ -1013,77 +1020,6 @@ export class ContextCompactionService {
     }
   }
 
-  /**
-   * Repair orphaned tool_result blocks in retained records — those whose
-   * tool_use was archived into the compaction boundary. Convert each to a text
-   * block (preserving the result content) so the retained recent window stays
-   * protocol-valid without its tool_use present. Used when an async /
-   * long-running tool pair spans the window and a clean integrity cut would
-   * otherwise archive everything, collapsing recent context.
-   */
-  /**
-   * Repair orphaned tool_result blocks at send time — those whose tool_use is
-   * not present in the projected message set (archived behind a compaction
-   * boundary; partial compaction keeps a recent window that can include a
-   * tool_result whose async/long-running tool_use was summarized). Convert
-   * each to a text block preserving the result content so the request stays
-   * protocol-valid without its tool_use. Applied on the projected/sanitized
-   * messages every send — NOT on stored records — so it survives Cursor
-   * re-sending the original transcript (replaceMessages reconcile overwrites
-   * stored records by id).
-   */
-  private repairOrphanedToolResults(
-    messages: UnifiedMessage[]
-  ): UnifiedMessage[] {
-    const toolUseIds = new Set<string>()
-    for (const message of messages) {
-      if (Array.isArray(message.content)) {
-        for (const block of message.content) {
-          if (isToolUseBlock(block)) {
-            toolUseIds.add(block.id)
-          }
-        }
-      }
-    }
-    let repairedCount = 0
-    const repaired = messages.map((message) => {
-      if (!Array.isArray(message.content)) return message
-      let changed = false
-      const content = message.content.map((block) => {
-        if (isToolResultBlock(block) && !toolUseIds.has(block.tool_use_id)) {
-          changed = true
-          repairedCount += 1
-          return {
-            type: "text",
-            text: this.renderOrphanedToolResultText(block),
-          } as TextBlock
-        }
-        return block
-      })
-      return changed ? { ...message, content } : message
-    })
-    if (repairedCount > 0) {
-      this.logger.debug(
-        `repairOrphanedToolResults: repaired ${repairedCount} orphaned tool_result(s) into text for send validity`
-      )
-    }
-    return repaired
-  }
-
-  private renderOrphanedToolResultText(block: ToolResultBlock): string {
-    const body =
-      typeof block.content === "string"
-        ? block.content
-        : block.content
-            .map((inner) => (isTextBlock(inner) ? inner.text : ""))
-            .filter((text) => text.length > 0)
-            .join("\n")
-    return (
-      `[Tool result for an earlier tool call now summarized into the ` +
-      `compaction summary above]\n${body}`
-    )
-  }
-
   private buildProjectedMessages(
     state: ContextConversationState,
     snapshot: ContextAttachmentSnapshot,
@@ -1121,7 +1057,7 @@ export class ContextCompactionService {
 
   private sanitizeProjectedMessages(
     projected: ProjectedContextMessage[],
-    _options?: {
+    options?: {
       pendingToolUseIds?: Iterable<string>
       integrityMode?: "strict-adjacent" | "global"
     }
@@ -1141,11 +1077,18 @@ export class ContextCompactionService {
       ...(message.isMeta ? { isMeta: true } : {}),
     })) as UnifiedMessage[]
     // Repair tool_result blocks orphaned by partial compaction (their
-    // tool_use was archived behind the boundary). Done here, at send time,
-    // rather than on stored records — replaceMessages reconcile overwrites
-    // stored records by id from Cursor's re-sent transcript, so a record
-    // rewrite would not survive; this projection transform runs every send.
-    return this.repairOrphanedToolResults(unified)
+    // tool_use was archived behind the boundary) AND tool_use blocks whose
+    // matching tool_result was archived/lost (which would otherwise reach
+    // the Kiro translator and be closed with a misleading status:"error"
+    // "context truncation" placeholder). Done here, at send time, rather
+    // than on stored records — replaceMessages reconcile overwrites stored
+    // records by id from Cursor's re-sent transcript, so a record rewrite
+    // would not survive; this projection transform runs every send. The
+    // pendingToolUseIds set protects genuinely in-flight tool_uses from
+    // being synthesised over.
+    return repairOrphanedToolPairs(unified, {
+      pendingToolUseIds: options?.pendingToolUseIds,
+    })
   }
 
   /**

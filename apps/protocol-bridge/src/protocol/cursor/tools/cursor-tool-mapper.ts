@@ -161,11 +161,15 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH: {
     name: "grep_search",
     description:
-      "Search file contents using ripgrep. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
+      "Search file contents. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. IMPORTANT: the query is matched as a LITERAL string by default — regex metacharacters (. | ^ $ [ ] ( ) { } * + ? \\) are treated as ordinary characters, not regex syntax. Do NOT write regex like `foo|bar` (alternation), `^foo` (anchor), or `fo.o` (wildcard); these match the literal characters and usually return zero results. To find multiple terms, issue separate searches per term. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
     input_schema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "The search query" },
+        query: {
+          type: "string",
+          description:
+            "Literal search string (NOT regex). Metacharacters like . | ^ $ [ ] are matched verbatim. Search one term at a time.",
+        },
         path: { type: "string", description: "The path to search in" },
         case_sensitive: {
           type: "boolean",
@@ -189,11 +193,15 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH: {
     name: "grep_search",
     description:
-      "Search file contents using ripgrep. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
+      "Search file contents. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. IMPORTANT: the query is matched as a LITERAL string by default — regex metacharacters (. | ^ $ [ ] ( ) { } * + ? \\) are treated as ordinary characters, not regex syntax. Do NOT write regex like `foo|bar` (alternation), `^foo` (anchor), or `fo.o` (wildcard); these match the literal characters and usually return zero results. To find multiple terms, issue separate searches per term. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
     input_schema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "The search query" },
+        query: {
+          type: "string",
+          description:
+            "Literal search string (NOT regex). Metacharacters like . | ^ $ [ ] are matched verbatim. Search one term at a time.",
+        },
         path: { type: "string", description: "The path to search in" },
         case_sensitive: {
           type: "boolean",

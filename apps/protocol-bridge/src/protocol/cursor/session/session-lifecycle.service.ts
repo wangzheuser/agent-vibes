@@ -4766,10 +4766,37 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     if (!session) {
       throw new Error(`beginTurn: no session ${conversationId}`)
     }
-    if (this.turnAnchors.has(conversationId)) {
-      throw new Error(
-        `beginTurn: conversation ${conversationId} already has an open turn`
+    const existingAnchor = this.turnAnchors.get(conversationId)
+    if (existingAnchor) {
+      if (existingAnchor.turnId === turnId) {
+        // Idempotent re-begin of the same turn. Should not happen, but
+        // throwing here would permanently lock the conversation, so we
+        // log and skip rather than fail the new turn.
+        this.logger.warn(
+          `beginTurn: conversation ${conversationId} already has turn ` +
+            `${existingAnchor.turnId} open; skipping redundant re-begin.`
+        )
+        return
+      }
+      // A stale anchor from a prior turn is still open while we open a
+      // new one. The supersede serializer in cursor-connect-stream is
+      // supposed to await the prior turn's terminal (via
+      // TurnLifecycle.cancelTurnAndAwait) and abort it before reaching
+      // here. If cancelTurnAndAwait threw and the turn-cleanup
+      // coordinator swallowed the error, the stale anchor leaks and we
+      // used to hard-throw — permanently locking the conversation (the
+      // "already has an open turn" production trace seen after a user
+      // stops a turn then immediately sends a new message). Mirror the
+      // commitTurn/abortTurn race policy: force-abort the leaked stale
+      // turn (rewinding its partial transcript) and proceed to open the
+      // new one rather than failing.
+      this.logger.warn(
+        `beginTurn: conversation ${conversationId} still has stale turn ` +
+          `${existingAnchor.turnId} open while opening ${turnId}; the ` +
+          `supersede serializer leaked it. Force-aborting stale turn and ` +
+          `continuing — investigate the supersede cleanup path.`
       )
+      this.abortTurn(conversationId, existingAnchor.turnId)
     }
     const ctx = this.contextState.getContextRecord(conversationId)!
     this.turnAnchors.set(conversationId, {

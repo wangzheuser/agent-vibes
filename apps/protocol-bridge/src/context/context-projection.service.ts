@@ -19,6 +19,7 @@ import {
   renderContextCollapseSummary,
 } from "./context-transcript-events"
 import { ContextCollapseService } from "./context-collapse.service"
+import { stripSubAgentUiOnlyPayload } from "./subagent-ui-payload"
 import {
   ContextCompactionCommit,
   ContextConversationState,
@@ -86,7 +87,16 @@ export class ContextProjectionService {
       return [
         {
           role: record.role,
-          content: record.content,
+          // Strip UI-only sub-agent payloads (the full child-session
+          // transcript carried in structuredContent.taskSuccess.
+          // conversationSteps) here, at the single authoritative
+          // state.records → backend-messages boundary. Token counting,
+          // truncation, and the final send all consume this projection,
+          // so removing the payload at the source keeps it out of the
+          // request budget entirely. The underlying record keeps the
+          // full payload for IDE transcript replay (which does not go
+          // through project()).
+          content: stripSubAgentUiOnlyPayload(record.content),
           source: "record",
           recordId: record.id,
           // Carry the Anthropic split-sibling key through compaction so

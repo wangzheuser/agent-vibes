@@ -13,6 +13,7 @@
 import { randomUUID } from "crypto"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import { appendLanguageDirectiveToText } from "../shared/language-directive"
+import { resolveCloudCodeModel } from "../shared/model-registry"
 import type {
   KiroAdditionalModelRequestFields,
   KiroHistoryMessage,
@@ -96,16 +97,26 @@ export interface ClaudeToKiroOptions {
 }
 
 export function mapKiroModel(model: string): string {
-  const lower = model.trim().toLowerCase()
-  for (const [pattern, target] of MODEL_MAP_ORDERED) {
-    if (lower.includes(pattern)) {
-      return target
+  const raw = model.trim()
+  // Normalize Cursor / Claude-CLI aliases to their Cloud Code canonical id
+  // first, then match. The model registry advertises reordered aliases such as
+  // "claude-4.6-opus-thinking" (digits-first) that MODEL_MAP_ORDERED — whose
+  // patterns are all canonical-order ("claude-opus-4-6") — would otherwise miss,
+  // letting the raw alias reach Kiro verbatim and fail with INVALID_MODEL_ID.
+  // resolveCloudCodeModel collapses every known alias to a canonical id
+  // (e.g. "claude-opus-4-6-thinking") that the patterns below do match, keeping
+  // the advertised model set and the Kiro-routable set in lock-step.
+  const canonical = resolveCloudCodeModel(raw)?.cloudCodeId
+  for (const candidate of [canonical, raw]) {
+    if (!candidate) continue
+    const lower = candidate.toLowerCase()
+    for (const [pattern, target] of MODEL_MAP_ORDERED) {
+      if (lower.includes(pattern)) {
+        return target
+      }
     }
   }
-  if (lower.startsWith("claude-")) {
-    return model.trim()
-  }
-  return model.trim()
+  return raw
 }
 
 /**

@@ -3,6 +3,12 @@ import { Logger } from "@nestjs/common"
 import * as zlib from "zlib"
 
 import {
+  buildBuiltInKarpathyRule,
+  buildBuiltInDisciplineRule,
+  isKarpathyRule,
+} from "./built-in-rules"
+
+import {
   AgentClientMessage,
   AgentClientMessageSchema,
   AgentRunRequest,
@@ -2030,8 +2036,9 @@ export class CursorRequestParser {
       }
     }
 
-    // 过滤自动注入的语言 rule 并生成最终列表
-    const cursorRules =
+    // 过滤自动注入的语言 rule；同时去掉客户端传来的 karpathy 副本，因为 bridge
+    // 会无条件注入自己的内置版本（见下），避免同一份准则在 prompt 里重复出现。
+    const filteredContextRules =
       contextRules.length > 0
         ? contextRules.filter((rule) => {
             const content = rule.content?.trim() || ""
@@ -2041,9 +2048,26 @@ export class CursorRequestParser {
               )
               return false
             }
+            if (isKarpathyRule(rule.content)) {
+              this.logger.log(
+                "Suppressed client-supplied karpathy ruleset; bridge injects its own built-in copy"
+              )
+              return false
+            }
             return true
           })
-        : undefined
+        : []
+
+    // 无条件 prepend bridge 内置的行为/工程准则，使其不再依赖客户端是否
+    // 碰巧打开了 ship 这些 rule 的 workspace。合成 CursorRule 复用现有
+    // `Cursor Rules:` 渲染管道，因此所有 backend 自动生效，无需逐后端改动。
+    //   1. karpathy —— 行为元原则（思考、简单、外科手术式改动、目标驱动）
+    //   2. engineering & UI discipline —— 编码与 UI 的具体禁令
+    const cursorRules: CursorRule[] = [
+      buildBuiltInKarpathyRule(),
+      buildBuiltInDisciplineRule(),
+      ...filteredContextRules,
+    ]
 
     // 提取 Cursor Commands (/ 命令)
     const cursorCommands: Array<{ name: string; content: string }> = []

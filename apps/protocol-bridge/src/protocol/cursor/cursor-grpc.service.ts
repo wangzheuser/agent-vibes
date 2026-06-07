@@ -468,10 +468,28 @@ function safeUint32(value: unknown, defaultValue = 0): number {
 }
 
 /**
+ * Default foreground shell-command timeout (ms) passed to Cursor's exec
+ * protocol when the caller does not specify one. The model-facing
+ * `run_terminal_command` exposes no timeout field, so this default applies to
+ * EVERY shell command — Cursor enforces it and aborts the command when it is
+ * exceeded. The previous 30s was far too short for real dev commands (commits
+ * with pre-commit hooks, `turbo`/monorepo builds, installs, test suites): they
+ * were aborted mid-run, the model received truncated output with an "aborted"
+ * status, and re-ran or fell back to `--no-verify`. We raise it to 10 minutes
+ * (Claude Code's max Bash timeout) so legitimately long commands run to
+ * completion; genuinely interactive / long-lived processes should still use
+ * `background_shell_spawn` rather than the foreground path.
+ */
+const DEFAULT_SHELL_TIMEOUT_MS = 600_000
+
+/**
  * Cursor exec protocol expects shell timeout in milliseconds.
  * We accept either seconds (small values) or milliseconds.
  */
-function normalizeShellTimeoutMs(value: unknown, defaultMs = 30_000): number {
+function normalizeShellTimeoutMs(
+  value: unknown,
+  defaultMs = DEFAULT_SHELL_TIMEOUT_MS
+): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     return defaultMs
   }
@@ -6095,7 +6113,10 @@ export class CursorGrpcService {
           value: create(ShellTimeoutSchema, {
             command,
             workingDirectory,
-            timeoutMs: normalizeShellTimeoutMs(args.timeout, 30_000),
+            timeoutMs: normalizeShellTimeoutMs(
+              args.timeout,
+              DEFAULT_SHELL_TIMEOUT_MS
+            ),
           }),
         }
       } else if (status === "rejected") {

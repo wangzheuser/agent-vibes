@@ -1,4 +1,10 @@
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
+import {
+  create,
+  fromBinary,
+  fromJson,
+  toBinary,
+  toJson,
+} from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
 import { AsyncLocalStorage } from "async_hooks"
 import { spawn, spawnSync } from "child_process"
@@ -38,6 +44,7 @@ import {
   type LooseMessageContent,
   type PreCompactHookPayload,
   ReasoningMemoryService,
+  stripSubAgentUiOnlyPayload,
   type SubAgentMemoryFormatInput,
   TokenCounterService,
   ToolIntegrityService,
@@ -6387,7 +6394,7 @@ export class CursorConnectStreamService {
     replacementState: ContextToolResultReplacementState | undefined,
     toolUseId: string,
     replacement: string,
-    reason: "empty" | "microcompact" = "empty"
+    reason: "empty" | "microcompact" | "snip" = "empty"
   ): void {
     if (!replacementState || !toolUseId) return
     const seen = new Set(replacementState.seenToolUseIds || [])
@@ -7890,17 +7897,20 @@ export class CursorConnectStreamService {
           return block
         }
 
+        // conversationSteps stripping is performed at the authoritative
+        // state.records → backend-projection boundary
+        // (ContextProjectionService.projectRecord via
+        // stripSubAgentUiOnlyPayload), which is what keeps the UI-only
+        // payload out of the request budget. The call below is a cheap,
+        // idempotent send-time backstop for any message that did not
+        // originate from that projection path; it shares the same pure
+        // function so there is a single implementation of the rule.
         let nextBlock: Record<string, unknown> = block
-        const structured = this.isLooseRecord(block.structuredContent)
-          ? block.structuredContent
-          : undefined
-        const strippedStructured =
-          this.stripTaskSuccessConversationSteps(structured)
-        if (strippedStructured !== structured) {
-          nextBlock = {
-            ...nextBlock,
-            structuredContent: strippedStructured,
-          }
+        const strippedContent = stripSubAgentUiOnlyPayload([
+          block,
+        ] as LooseMessageContent)
+        if (Array.isArray(strippedContent) && strippedContent[0] !== block) {
+          nextBlock = strippedContent[0] as Record<string, unknown>
           contentChanged = true
         }
 
@@ -7927,26 +7937,6 @@ export class CursorConnectStreamService {
     })
 
     return changed ? nextMessages : messages
-  }
-
-  private stripTaskSuccessConversationSteps(
-    structured: Record<string, unknown> | undefined
-  ): Record<string, unknown> | undefined {
-    if (!structured) return structured
-    const taskSuccess = structured.taskSuccess
-    if (
-      !this.isLooseRecord(taskSuccess) ||
-      !Array.isArray(taskSuccess.conversationSteps)
-    ) {
-      return structured
-    }
-
-    const { conversationSteps: _conversationSteps, ...taskSuccessRest } =
-      taskSuccess
-    return {
-      ...structured,
-      taskSuccess: taskSuccessRest,
-    }
   }
 
   private compactSubAgentReportForBackend(content: unknown): unknown {
@@ -18890,24 +18880,35 @@ ${raw}
           ),
         runSubAgentLlmTurn: (convId, llmArgs) =>
           this.runBackgroundSubAgentLlmTurn(convId, llmArgs),
-        // ConversationStep builders — wrap the grpc service helpers so
-        // the worker stays decoupled from the proto schema and only
-        // sees opaque step blobs.
+        // ConversationStep builders — wrap the grpc service helpers and
+        // serialize to protobuf-canonical JSON (toJson) so the worker only
+        // sees a JSON-safe opaque blob. This is required because the steps
+        // are persisted via JSON.stringify in the transcript store, and raw
+        // proto messages carry Uint8Array bytes fields (e.g.
+        // TruncatedToolCall.original_step_blob_id) that JSON.stringify mangles
+        // into `{}` — which then fail to re-encode on replay. toJson emits
+        // base64 for bytes so fromJson restores them exactly.
         buildAssistantStep: (text: string) =>
-          this.grpcService.buildAssistantConversationStep(text),
+          toJson(
+            ConversationStepSchema,
+            this.grpcService.buildAssistantConversationStep(text)
+          ),
         buildToolCallStep: ({ toolName, callId, parsedInput, resultContent }) =>
-          this.grpcService.buildToolCallConversationStep(
-            toolName,
-            callId,
-            parsedInput,
-            resultContent,
-            undefined,
-            // Session-aware family hint so MCP tool calls inside a
-            // background sub-agent project to mcpToolCall instead of
-            // the truncatedToolCall fallback (which the IDE renders as
-            // `[Tool: truncatedToolCall]` in the parent task bubble's
-            // detail panel).
-            this.classifyExecToolFamilyHint(toolName, session)
+          toJson(
+            ConversationStepSchema,
+            this.grpcService.buildToolCallConversationStep(
+              toolName,
+              callId,
+              parsedInput,
+              resultContent,
+              undefined,
+              // Session-aware family hint so MCP tool calls inside a
+              // background sub-agent project to mcpToolCall instead of
+              // the truncatedToolCall fallback (which the IDE renders as
+              // `[Tool: truncatedToolCall]` in the parent task bubble's
+              // detail panel).
+              this.classifyExecToolFamilyHint(toolName, session)
+            )
           ),
       },
     })
@@ -19446,9 +19447,21 @@ ${raw}
       if (!parentToolCallId) continue
 
       const conversationSteps = Array.isArray(metadata.conversationSteps)
-        ? metadata.conversationSteps.map((step) =>
-            create(ConversationStepSchema, step as never)
-          )
+        ? metadata.conversationSteps.flatMap((step) => {
+            try {
+              // Stored as protobuf-canonical JSON (toJson) so bytes fields
+              // round-trip as base64. fromJson restores them to Uint8Array;
+              // create() on raw JSON would leave mangled `{}` bytes that
+              // crash the later toBinary encode.
+              return [fromJson(ConversationStepSchema, step as never)]
+            } catch (error) {
+              this.logger.warn(
+                `[subagent] dropping unparsable conversation step for ` +
+                  `${metadata.agentId}: ${String(error)}`
+              )
+              return []
+            }
+          })
         : []
       if (conversationSteps.length === 0) {
         continue
@@ -24618,43 +24631,56 @@ ${raw}
         `[snip_messages] session=${conversationId} rejected: ${parsed.error}`
       )
     } else {
-      const targets = this.contextState.resolveSnipTargets(
-        conversationId,
-        parsed.keepRecent
-      )
-      if (targets.removedRecordIds.length === 0) {
+      const ctx = this.contextState.getContextRecord(conversationId)
+      const replacementState = ctx?.contextState.toolResultReplacementState
+      if (!ctx || !replacementState) {
         result = {
           status: "error",
-          error:
-            `Nothing to snip: only ${targets.totalCount} message record(s) tracked, ` +
-            `requested keep_recent=${parsed.keepRecent}.`,
+          error: "Failed to snip: session or context state missing.",
         }
       } else {
-        const boundary = this.contextState.registerSnipBoundary(
-          conversationId,
-          {
-            removedRecordIds: targets.removedRecordIds,
-            trigger: "model",
-            reason: parsed.reason,
+        const snippable = this.collectSnippableToolUseIds(ctx.messages)
+        const stub = parsed.reason
+          ? `[Tool output snipped to free context. Summary: ${parsed.reason}]`
+          : "[Tool output snipped to free context.]"
+        const applied: string[] = []
+        const notFound: string[] = []
+        for (const toolUseId of parsed.toolUseIds) {
+          if (snippable.has(toolUseId)) {
+            this.rememberToolResultReplacement(
+              replacementState,
+              toolUseId,
+              stub,
+              "snip"
+            )
+            applied.push(toolUseId)
+          } else {
+            notFound.push(toolUseId)
           }
-        )
-        if (!boundary) {
+        }
+        if (applied.length === 0) {
           result = {
             status: "error",
-            error: "Failed to register snip boundary (session missing).",
+            error:
+              `None of the ${parsed.toolUseIds.length} requested tool_use_id(s) ` +
+              "matched a tool output in this conversation. Reference the " +
+              "tooluse_... id shown on a tool call whose result you no longer " +
+              "need verbatim.",
           }
         } else {
+          this.logger.log(
+            `[snip_messages] session=${conversationId} snipped=${applied.length} not_found=${notFound.length}`
+          )
           result = {
             status: "success",
-            snipped_count: targets.removedRecordIds.length,
-            kept_count: targets.keptCount,
-            total_records: targets.totalCount,
+            snipped_count: applied.length,
+            requested_count: parsed.toolUseIds.length,
+            not_found: notFound,
             reason: parsed.reason,
-            boundary_id: boundary.id,
             next_step:
-              "Older messages are now hidden from your context. Continue the " +
-              "current task using the visible recent messages; the snipped " +
-              "history is gone for the rest of this conversation.",
+              "The snipped tool outputs are now replaced with your summary and " +
+              "no longer consume context. Continue the current task; the full " +
+              "outputs are gone for the rest of this conversation.",
           }
         }
       }
@@ -24673,6 +24699,35 @@ ${raw}
       undefined,
       options
     )
+  }
+
+  /**
+   * Collect the tool_use_ids that currently have a tool_result in the session
+   * history — i.e. the tool outputs that can be snipped. Scans the stored
+   * (un-normalized) messages so model-supplied ids are validated against real
+   * outputs before we register a replacement. Restricted to user-role messages
+   * to match `applyToolResultReplacementMap`, which only rewrites user-role
+   * tool_result blocks — so an id we report as snipped is one that will
+   * actually be replaced.
+   */
+  private collectSnippableToolUseIds(messages: SessionMessage[]): Set<string> {
+    const ids = new Set<string>()
+    for (const message of messages) {
+      if (message.message.role !== "user") continue
+      const content = message.message.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (
+          block &&
+          typeof block === "object" &&
+          (block as Record<string, unknown>).type === "tool_result"
+        ) {
+          const id = (block as Record<string, unknown>).tool_use_id
+          if (typeof id === "string" && id.length > 0) ids.add(id)
+        }
+      }
+    }
+    return ids
   }
 
   private async runDeferredToolIfNeeded(
@@ -31446,6 +31501,14 @@ ${raw}
         backgroundReason: backgroundEvent.reason,
       })
 
+      // The command is no longer a foreground in-flight dispatch — it now
+      // runs in the background (its continued output flows through
+      // handleBackgroundCommandShellStreamEvent). Release the serializer slot
+      // so queued execs are not starved for the background command's lifetime.
+      for (const execId of pendingToolCall.execIds) {
+        this.releaseExecDispatchSlot(conversationId, execId)
+      }
+
       const content =
         combinedOutput ||
         `Command running in background (CommandId: ${commandId})`
@@ -31538,6 +31601,16 @@ ${raw}
       if (!pendingToolCall) {
         this.logger.warn(`No pending tool call found for exit: ${toolCallId}`)
         return
+      }
+
+      // Shell command finished: release the serializer slot for this tool's
+      // exec id(s) now. `exit` is the streaming-shell completion signal;
+      // Cursor does not always follow it with an execStreamClose, and
+      // without releasing here the in-flight slot leaks and starves every
+      // queued exec on this conversation. Releasing on `exit` (not on
+      // intermediate stdout chunks) keeps the one-in-flight invariant intact.
+      for (const execId of pendingToolCall.execIds) {
+        this.releaseExecDispatchSlot(conversationId, execId)
       }
 
       const rawToolResultContent =
@@ -31712,6 +31785,21 @@ ${raw}
       if (handledBackgroundShellEvent) {
         return
       }
+    }
+
+    // Release the serializer slot when a NON-streaming tool result arrives
+    // (read_file / grep_search / etc.): that single result IS the command's
+    // completion, and Cursor does not always send a separate execStreamClose
+    // afterwards — without releasing here the in-flight ExecServerMessage slot
+    // leaks and starves every queued exec on this conversation until
+    // cancel/teardown. For streaming shell tools the completion signal is the
+    // `exit` event (or `backgrounded`), so their release happens in
+    // handleShellStreamEvent instead; releasing on an intermediate stdout
+    // chunk here would free the slot mid-command and let a concurrent exec
+    // dispatch (which Cursor drops). A later execStreamClose for the same id
+    // is a harmless no-op (release ignores a non-matching / already-freed id).
+    if (execNumericId && toolResult.resultCase !== "shell_stream") {
+      this.releaseExecDispatchSlot(conversationId, execNumericId)
     }
 
     if (!toolCallId) {
@@ -34386,38 +34474,47 @@ ${raw}
       parts.push(deferredSection)
     }
 
-    const snipNudge = this.buildSnipNudgeSection(options?.sessionMessageCount)
-    if (snipNudge) {
-      parts.push(snipNudge)
+    const contextHint = this.buildContextManagementHintSection(
+      options?.sessionMessageCount
+    )
+    if (contextHint) {
+      parts.push(contextHint)
     }
 
     return parts.join("\n\n")
   }
 
   /**
-   * Render a "consider snipping" nudge once the conversation has grown past
-   * a threshold. Mirrors Claude Code's `shouldNudgeForSnips` (threshold = 30
-   * messages) and its soft `SNIP_NUDGE_TEXT`: a generic "consider compressing
-   * older messages" hint, NOT a prescriptive instruction. Deliberately avoids
-   * suggesting a `keep_recent` value — the model must judge how much of the
-   * live task to retain, and an aggressive prescribed floor (e.g. 6-12) makes
-   * the model snip away its own task anchor and re-derive in a loop.
+   * Render a context-management hint once the conversation has grown past a
+   * threshold. Claude Code pairs its snip nudge with an "auto-compact is
+   * enabled / no need to rush / unlimited context" reminder
+   * (utils/messages.ts). That reassurance is what stops the model from
+   * panic-snipping: without it the model treats a high message count as
+   * context pressure and drops its own in-progress task, then resumes a stale
+   * one. Message count alone is a poor pressure signal — sub-agent tool calls
+   * inflate it while token usage stays low — so this hint leads with the
+   * auto-compaction guarantee. The `snip_messages` tool now only replaces
+   * tool OUTPUTS (by tool_use_id) with a summary, so it is structurally unable
+   * to drop the task anchor; the hint frames it as an optional space reclaim.
    *
    * Returns undefined below the threshold so the prompt cache stays stable
    * for short sessions.
    */
-  private static readonly SNIP_NUDGE_THRESHOLD = 30
+  private static readonly CONTEXT_HINT_MESSAGE_THRESHOLD = 30
 
-  private buildSnipNudgeSection(
+  private buildContextManagementHintSection(
     sessionMessageCount: number | undefined
   ): string | undefined {
     if (!sessionMessageCount) return undefined
-    if (sessionMessageCount < CursorConnectStreamService.SNIP_NUDGE_THRESHOLD) {
+    if (
+      sessionMessageCount <
+      CursorConnectStreamService.CONTEXT_HINT_MESSAGE_THRESHOLD
+    ) {
       return undefined
     }
     return [
       "<context_management_hint>",
-      "The conversation history is getting long. Consider using the `snip_messages` tool to compress older messages that are no longer relevant, freeing context window space for continued work. Keep the messages that anchor your current task.",
+      "Auto-compaction is enabled: when the context window is nearly full, older messages are automatically summarized so you can keep working seamlessly. You effectively have unlimited context, so there is no need to stop, rush, or drop history, and a high message count is not a reason to compress. If you do want to reclaim space, the `snip_messages` tool replaces specific large tool outputs (referenced by their `tooluse_...` id) with a short summary you provide; it only affects tool OUTPUTS you have already extracted what you need from, and can never remove your current task or the user's messages.",
       "</context_management_hint>",
     ].join("\n")
   }

@@ -331,7 +331,7 @@ export interface ContextToolResultReplacementRecord {
   toolUseId: string
   replacement: string
   documentId?: string
-  reason?: "per_tool" | "aggregate" | "empty" | "microcompact"
+  reason?: "per_tool" | "aggregate" | "empty" | "microcompact" | "snip"
   createdAt: number
 }
 

@@ -154,6 +154,13 @@ export {
   formatSubAgentMemoryBody,
   formatSubAgentMemoryEntry,
 } from "./sub-agent-memory-formatter"
+// Strips the UI-only sub-agent transcript payload
+// (structuredContent.taskSuccess.conversationSteps) at the
+// state.records → backend-projection boundary so it never enters the
+// request budget. Shared by ContextProjectionService and the send-time
+// backstop in cursor-connect-stream.
+export { stripSubAgentUiOnlyPayload } from "./subagent-ui-payload"
+
 export type {
   SubAgentMemoryFormatInput,
   SubAgentMemoryFormatOptions,
