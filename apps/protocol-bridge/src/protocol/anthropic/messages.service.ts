@@ -1270,7 +1270,14 @@ export class MessagesService implements OnModuleInit {
     })
 
     return {
-      data,
+      object: "list",
+      data: data.map((model) => ({
+        ...model,
+        // OpenAI SDK `Model` reads `created` (unix seconds); keep `created_at`
+        // for existing Anthropic-style clients. A single /v1/models endpoint
+        // thus satisfies both protocol surfaces.
+        created: model.created_at,
+      })),
       has_more: false,
       first_id: data[0]?.id || "",
       last_id: data[data.length - 1]?.id || "",

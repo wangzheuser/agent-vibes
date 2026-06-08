@@ -522,13 +522,52 @@ export class CodexWebSocketService implements OnModuleDestroy {
   /**
    * Send a request via WebSocket and collect the full response.
    * Returns the response.completed event data.
+   *
+   * The codex backend does not guarantee that `response.completed.response.output`
+   * carries the aggregated message/reasoning/tool items — for many models the
+   * final completed frame only contains usage + stop_reason, and the actual
+   * content arrives on the intermediate `response.output_item.done` events
+   * (the streaming translator rebuilds content from those, see
+   * codex-response-translator.ts). The non-stream caller only reads the
+   * completed frame, so without aggregation it would lose all text/tool output.
+   *
+   * We therefore accumulate every `response.output_item.done` item as the
+   * stream progresses and, when the completed frame's `output` is missing or
+   * empty, backfill it from the accumulated items before returning. This keeps
+   * non-stream parity with the streaming path for both the Anthropic and OpenAI
+   * inbound surfaces.
    */
   async sendViaWebSocket(
     ws: WebSocket,
     requestBody: Record<string, unknown>
   ): Promise<WebSocketMessage> {
+    const collectedItems: Array<Record<string, unknown>> = []
+
     for await (const msg of this.streamViaWebSocket(ws, requestBody)) {
+      if (msg.type === "response.output_item.done") {
+        const item = msg.item as Record<string, unknown> | undefined
+        if (item && typeof item === "object") {
+          collectedItems.push(item)
+        }
+        continue
+      }
+
       if (msg.type === "response.completed") {
+        const response = (msg.response as Record<string, unknown>) || {}
+        const existingOutput = response.output
+
+        const hasUsableOutput =
+          Array.isArray(existingOutput) && existingOutput.length > 0
+
+        if (!hasUsableOutput && collectedItems.length > 0) {
+          // Backfill the aggregated items so translateCodexToClaudeNonStream
+          // can extract message text, reasoning, and tool calls.
+          return {
+            ...msg,
+            response: { ...response, output: collectedItems },
+          }
+        }
+
         return msg
       }
     }

@@ -1,3 +1,5 @@
+import * as crypto from "crypto"
+
 export type CodexForwardHeaders = Record<string, string>
 
 /**
@@ -17,6 +19,8 @@ export interface CodexClientIdentity {
 }
 
 export const CODEX_WS_BETA_HEADER = "responses_websockets=2026-02-06"
+
+const MAX_CODEX_SESSION_ID_LENGTH = 64
 
 interface BuildCodexHttpHeadersParams {
   token: string
@@ -124,6 +128,34 @@ function sanitizeHeaders(
   )
 }
 
+function normalizeCodexSessionId(conversationId: string): string {
+  const trimmed = conversationId.trim()
+  if (!trimmed) return ""
+  if (trimmed.length <= MAX_CODEX_SESSION_ID_LENGTH) {
+    return trimmed
+  }
+
+  return crypto
+    .createHash("sha256")
+    .update(`agent-vibes:codex-session-id:${trimmed}`)
+    .digest("hex")
+}
+
+function ensureSessionIdHeader(
+  target: Record<string, string>,
+  source: CodexForwardHeaders | undefined,
+  defaultConversationId: string
+): void {
+  if (getExistingHeader(target, "session_id", "session-id")) {
+    return
+  }
+
+  const sourceSessionId = getForwardHeader(source, "session_id", "session-id")
+  target.session_id =
+    normalizeCodexSessionId(sourceSessionId || defaultConversationId) ||
+    crypto.randomUUID()
+}
+
 export function buildCodexHttpHeaders(
   params: BuildCodexHttpHeadersParams
 ): Record<string, string> {
@@ -168,12 +200,10 @@ export function buildCodexHttpHeaders(
     params.identity.userAgent,
     ["user-agent"]
   )
-  ensureHeader(
+  ensureSessionIdHeader(
     headers,
     params.forwardHeaders,
-    "session_id",
-    normalizedConversationId || crypto.randomUUID(),
-    ["session_id", "session-id"]
+    normalizedConversationId
   )
 
   if (!params.isApiKey) {
@@ -259,12 +289,10 @@ export function buildCodexWebSocketHeaders(
       ? openAiBeta
       : CODEX_WS_BETA_HEADER
 
-  ensureHeader(
+  ensureSessionIdHeader(
     headers,
     params.forwardHeaders,
-    "session_id",
-    normalizedConversationId || crypto.randomUUID(),
-    ["session_id", "session-id"]
+    normalizedConversationId
   )
   delete headers["User-Agent"]
 

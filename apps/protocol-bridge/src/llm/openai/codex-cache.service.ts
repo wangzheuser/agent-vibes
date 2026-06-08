@@ -33,6 +33,9 @@ export class CodexCacheService {
   /** Default TTL: 1 hour */
   private readonly DEFAULT_TTL_MS = 60 * 60 * 1000
 
+  /** Codex Responses API rejects prompt_cache_key values longer than 64 chars. */
+  private readonly MAX_PROMPT_CACHE_KEY_LENGTH = 64
+
   /** Cleanup interval: 10 minutes */
   private cleanupTimer: ReturnType<typeof setInterval> | null = null
 
@@ -126,18 +129,20 @@ export class CodexCacheService {
    * Returns headers to be added to the HTTP request.
    */
   buildHttpCacheHeaders(cacheId: string): Record<string, string> {
-    if (!cacheId) return {}
+    const promptCacheKey = this.normalizePromptCacheKey(cacheId)
+    if (!promptCacheKey) return {}
 
     return {
-      Session_id: cacheId,
+      Session_id: promptCacheKey,
     }
   }
 
   buildWebSocketCacheHeaders(cacheId: string): Record<string, string> {
-    if (!cacheId) return {}
+    const promptCacheKey = this.normalizePromptCacheKey(cacheId)
+    if (!promptCacheKey) return {}
 
     return {
-      Conversation_id: cacheId,
+      Conversation_id: promptCacheKey,
     }
   }
 
@@ -148,8 +153,21 @@ export class CodexCacheService {
     body: Record<string, unknown>,
     cacheId: string
   ): Record<string, unknown> {
-    if (!cacheId) return body
-    return { ...body, prompt_cache_key: cacheId }
+    const promptCacheKey = this.normalizePromptCacheKey(cacheId)
+    if (!promptCacheKey) return body
+    return { ...body, prompt_cache_key: promptCacheKey }
+  }
+
+  private normalizePromptCacheKey(cacheId: string): string {
+    const trimmed = cacheId.trim()
+    if (!trimmed) return ""
+    if (trimmed.length <= this.MAX_PROMPT_CACHE_KEY_LENGTH) {
+      return trimmed
+    }
+
+    return this.buildDeterministicCacheId(
+      `cli-proxy-api:codex:prompt-cache-key:${trimmed}`
+    )
   }
 
   /**

@@ -4914,18 +4914,25 @@
           actions: anthropicActions,
         })
 
-        // ── Codex CLI (OpenAI Responses) ──
-        var codexUrl = bridgeUrl + "/v1/responses"
+        // ── OpenAI API (Chat Completions) ──
+        // Standard OpenAI surface: /v1/chat/completions (+ /v1/completions,
+        // /v1/models). Any OpenAI SDK pointed at baseURL=<bridge>/v1 works
+        // unchanged; routing reuses the canonical MessagesService backend.
+        // No wire/unwire step — it's an open endpoint that tracks bridge
+        // liveness like the health probe.
+        var openaiUrl = bridgeUrl + "/v1/chat/completions"
         html += endpointRow({
           name: L("endpoints.openai.name", "OpenAI API"),
           desc: L(
-            "endpoints.codex.desc",
-            "OpenAI Responses API compatibility — planned."
+            "endpoints.openai.desc",
+            "Drop-in replacement for api.openai.com. Used by the OpenAI SDK and any OpenAI-compatible client (chat/completions, completions, models)."
           ),
-          url: codexUrl,
-          status: L("clients.status.comingSoon", "Coming soon"),
-          statusKind: "warn",
-          actions: copyBtn(codexUrl),
+          url: openaiUrl,
+          status: bridgeRunning
+            ? L("endpoints.status.online", "Online")
+            : L("endpoints.status.offline", "Offline"),
+          statusKind: bridgeRunning ? "good" : "",
+          actions: copyBtn(openaiUrl) + testBtn(openaiUrl),
         })
 
         // ── Gemini CLI ──

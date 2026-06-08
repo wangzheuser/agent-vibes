@@ -3174,6 +3174,13 @@ export class OpenaiCompatService implements OnModuleInit {
     const fullBody = await response.text()
     const lines = fullBody.split("\n")
 
+    // Aggregate output items: the Responses API backend may emit message/
+    // reasoning/tool content only on intermediate `response.output_item.done`
+    // events and leave `response.completed.response.output` empty. Collect
+    // them so the completed frame can be backfilled, otherwise non-stream
+    // responses would drop all content.
+    const collectedItems: Array<Record<string, unknown>> = []
+
     for (const line of lines) {
       const trimmed = line.trim()
       if (!trimmed.startsWith("data:")) continue
@@ -3183,8 +3190,30 @@ export class OpenaiCompatService implements OnModuleInit {
 
       try {
         const event = JSON.parse(jsonStr) as Record<string, unknown>
+        if (event.type === "response.output_item.done") {
+          const item = event.item as Record<string, unknown> | undefined
+          if (item && typeof item === "object") {
+            collectedItems.push(item)
+          }
+          continue
+        }
         if (event.type === "response.completed") {
-          const result = translateCodexToClaudeNonStream(event, reverseToolMap)
+          const completedResponse =
+            (event.response as Record<string, unknown>) || {}
+          const existingOutput = completedResponse.output
+          const hasUsableOutput =
+            Array.isArray(existingOutput) && existingOutput.length > 0
+          const completedEvent =
+            !hasUsableOutput && collectedItems.length > 0
+              ? {
+                  ...event,
+                  response: { ...completedResponse, output: collectedItems },
+                }
+              : event
+          const result = translateCodexToClaudeNonStream(
+            completedEvent,
+            reverseToolMap
+          )
           if (result) {
             this.markAccountHealthy(account, modelName)
             this.recordOpenAiCompatUsage(account, modelName, "responses", {

@@ -45,7 +45,8 @@ const UI_EN: Record<string, string> = {
   "endpoints.health.desc":
     "Liveness probe — returns bridge runtime status as JSON.",
   "endpoints.openai.name": "OpenAI API",
-  "endpoints.codex.desc": "OpenAI Responses API compatibility — planned.",
+  "endpoints.openai.desc":
+    "Drop-in replacement for api.openai.com. Used by the OpenAI SDK and any OpenAI-compatible client (chat/completions, completions, models).",
   "endpoints.google.name": "Google API",
   "endpoints.gemini.desc": "Google Gemini API compatibility — planned.",
   "tab.clients": "Clients",
@@ -432,7 +433,8 @@ const UI_ZH: Record<string, string> = {
   "endpoints.health.name": "健康检查",
   "endpoints.health.desc": "返回桥接运行状态的 JSON 探针。",
   "endpoints.openai.name": "OpenAI API",
-  "endpoints.codex.desc": "OpenAI Responses API 兼容 — 计划中。",
+  "endpoints.openai.desc":
+    "兼容 api.openai.com，可被 OpenAI SDK 及任意 OpenAI 兼容客户端直接使用（chat/completions、completions、models）。",
   "endpoints.google.name": "Google API",
   "endpoints.gemini.desc": "Google Gemini API 兼容 — 计划中。",
   "tab.clients": "客户端",
