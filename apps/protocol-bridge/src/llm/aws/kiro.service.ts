@@ -101,6 +101,7 @@ import {
   type KiroModelInfo,
 } from "./rest-api"
 import { claudeToKiro, mapKiroModel } from "./translator"
+import { buildTerseLanguageAnchor } from "../shared/language-directive"
 
 interface KiroAccount extends CooldownableAccount {
   label?: string
@@ -211,9 +212,37 @@ export interface KiroQuotaSnapshot {
 }
 
 const TOKEN_REFRESH_SKEW_SECONDS = 120
-const STREAM_REQUEST_TIMEOUT_MS = 5 * 60_000
+// Streaming generations are bounded by an inactivity (idle) watchdog plus a
+// first-event deadline rather than a single absolute deadline: a long Opus
+// turn (extended thinking + large output over a big context) can legitimately
+// stream for many minutes while events keep flowing, and an absolute cap would
+// abort it mid-stream. `STREAM_REQUEST_TIMEOUT_MS` is kept only as a generous
+// backstop ceiling against a truly runaway stream.
+const STREAM_REQUEST_TIMEOUT_MS = 30 * 60_000
+// First-event deadline kept at the legacy absolute value so a slow first
+// token (large context / server-side thinking, or a slow compaction summary)
+// is never killed earlier than before; the idle deadline then takes over once
+// events start flowing.
+const STREAM_FIRST_CHUNK_TIMEOUT_MS = 5 * 60_000
+const STREAM_IDLE_TIMEOUT_MS = 2 * 60_000
 const ENDPOINT_QUOTA_BACKOFF_BASE_MS = 30_000
 const ENDPOINT_QUOTA_BACKOFF_MAX_MS = 15 * 60_000
+
+/**
+ * Per-request abort handle for a streaming Kiro generation.
+ *
+ * `signal` is fed to both `fetch` and the event-stream parser. The watchdog
+ * behind it stays armed with the first-event deadline until the first upstream
+ * event arrives, after which `noteActivity()` resets it to the idle deadline
+ * on every subsequent event so an actively-streaming turn never times out.
+ * `describeTimeout()` renders which deadline tripped for the error message.
+ */
+interface KiroStreamRequestGuard {
+  signal: AbortSignal
+  noteActivity(): void
+  dispose(): void
+  describeTimeout(): string
+}
 
 /** Fallback model IDs used when dynamic discovery has not yet completed. */
 const FALLBACK_KIRO_MODEL_IDS: string[] = [
@@ -2042,30 +2071,96 @@ export class KiroService implements OnModuleInit {
     return false
   }
 
-  private resolveStreamRequestTimeoutMs(): number {
-    const raw = (process.env.KIRO_STREAM_REQUEST_TIMEOUT_MS || "").trim()
-    if (!raw) return STREAM_REQUEST_TIMEOUT_MS
+  private resolveEnvTimeoutMs(envName: string, fallbackMs: number): number {
+    const raw = (process.env[envName] || "").trim()
+    if (!raw) return fallbackMs
     const parsed = Number(raw)
     if (!Number.isFinite(parsed) || parsed <= 0) {
-      this.logger.warn(
-        `[Kiro] Ignoring invalid KIRO_STREAM_REQUEST_TIMEOUT_MS=${raw}`
-      )
-      return STREAM_REQUEST_TIMEOUT_MS
+      this.logger.warn(`[Kiro] Ignoring invalid ${envName}=${raw}`)
+      return fallbackMs
     }
     return Math.max(1_000, Math.floor(parsed))
   }
 
-  private createStreamRequestAbortSignal(externalSignal?: AbortSignal): {
-    signal: AbortSignal
-    timeoutMs: number
-  } {
-    const timeoutMs = this.resolveStreamRequestTimeoutMs()
-    const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  private resolveStreamRequestTimeoutMs(): number {
+    return this.resolveEnvTimeoutMs(
+      "KIRO_STREAM_REQUEST_TIMEOUT_MS",
+      STREAM_REQUEST_TIMEOUT_MS
+    )
+  }
+
+  private resolveStreamFirstChunkTimeoutMs(): number {
+    return this.resolveEnvTimeoutMs(
+      "KIRO_STREAM_FIRST_CHUNK_TIMEOUT_MS",
+      STREAM_FIRST_CHUNK_TIMEOUT_MS
+    )
+  }
+
+  private resolveStreamIdleTimeoutMs(): number {
+    return this.resolveEnvTimeoutMs(
+      "KIRO_STREAM_IDLE_TIMEOUT_MS",
+      STREAM_IDLE_TIMEOUT_MS
+    )
+  }
+
+  private createStreamRequestGuard(
+    externalSignal?: AbortSignal
+  ): KiroStreamRequestGuard {
+    const firstChunkMs = this.resolveStreamFirstChunkTimeoutMs()
+    const idleMs = this.resolveStreamIdleTimeoutMs()
+    const ceilingMs = this.resolveStreamRequestTimeoutMs()
+
+    // Inactivity watchdog: armed with the first-event deadline up front
+    // (covers connect / time-to-first-token), then reset to the idle
+    // deadline on every upstream event via noteActivity().
+    const idleController = new AbortController()
+    let idleTimer: NodeJS.Timeout | undefined
+    let receivedFirstChunk = false
+    let idleFired = false
+
+    const armIdle = (ms: number): void => {
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        idleFired = true
+        idleController.abort(
+          new DOMException(
+            receivedFirstChunk
+              ? `Kiro stream idle for ${idleMs}ms`
+              : `Kiro stream produced no event within ${firstChunkMs}ms`,
+            "TimeoutError"
+          )
+        )
+      }, ms)
+      // Never let the watchdog keep the event loop alive on its own.
+      idleTimer.unref?.()
+    }
+    armIdle(firstChunkMs)
+
+    const ceilingSignal = AbortSignal.timeout(ceilingMs)
+    const signals: AbortSignal[] = [ceilingSignal, idleController.signal]
+    if (externalSignal) signals.push(externalSignal)
+
     return {
-      signal: externalSignal
-        ? AbortSignal.any([externalSignal, timeoutSignal])
-        : timeoutSignal,
-      timeoutMs,
+      signal: AbortSignal.any(signals),
+      noteActivity(): void {
+        if (idleFired) return
+        receivedFirstChunk = true
+        armIdle(idleMs)
+      },
+      dispose(): void {
+        if (idleTimer) {
+          clearTimeout(idleTimer)
+          idleTimer = undefined
+        }
+      },
+      describeTimeout(): string {
+        if (idleFired) {
+          return receivedFirstChunk
+            ? `no events for ${idleMs}ms (idle timeout)`
+            : `no first event within ${firstChunkMs}ms`
+        }
+        return `the ${ceilingMs}ms absolute ceiling`
+      },
     }
   }
 
@@ -2137,6 +2232,21 @@ export class KiroService implements OnModuleInit {
       )
     }
 
+    // Kiro folds the system prompt into user content, so the language
+    // directive ends up buried before the user's latest message and loses
+    // recency over long turns (the visible output can briefly drift even
+    // though the directive is present). Re-assert a terse, config-driven
+    // anchor at the very END of the outbound content so recency pins the
+    // output/thinking language. The anchor reads the user's configured
+    // Response Language (or allowlist-detected language); it is empty — and
+    // thus a no-op — when neither is set.
+    const langAnchor = buildTerseLanguageAnchor(dto.messages)
+    if (langAnchor) {
+      const userMsg = payload.conversationState.currentMessage.userInputMessage
+      const base = userMsg.content || ""
+      userMsg.content = base ? `${base}\n\n${langAnchor}` : langAnchor
+    }
+
     return payload
   }
 
@@ -2162,6 +2272,15 @@ export class KiroService implements OnModuleInit {
     const attemptedAccountKeys = new Set<string>()
     /** Accounts that have already been force-refreshed this call (max once per account). */
     const forceRefreshedKeys = new Set<string>()
+    /**
+     * Idle-timeout retries consumed this call. An idle timeout is a
+     * transient backend stall (no stream events within the guard window),
+     * classified transient_network by RETRY_POLICY. Unlike fast-failing
+     * status errors, each idle timeout costs the full guard window, so it
+     * is bounded by the transient_network retry budget to avoid looping
+     * for minutes when the backend is persistently stalled.
+     */
+    let idleTimeoutRetries = 0
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       // Class-driven early exit: if the last failure carries a class
@@ -2248,7 +2367,12 @@ export class KiroService implements OnModuleInit {
       // ensureProfileArn calls, force one final parse attempt before
       // sending the request. This prevents 400 "profileArn is required"
       // errors from reaching the wire.
-      if (!payload.profileArn) {
+      //
+      // API-key accounts never carry a profileArn — ensureProfileArn
+      // returns early for them and the upstream does not require one —
+      // so skip the guard entirely. Otherwise every api_key request
+      // emits a spurious WARN + ERROR even though it succeeds.
+      if (!payload.profileArn && currentAccount.authMethod !== "api_key") {
         this.logger.warn(
           `[Kiro] profileArn missing in payload for ${this.accountTag(currentAccount)} before request — forcing final parse attempt`
         )
@@ -2307,12 +2431,11 @@ export class KiroService implements OnModuleInit {
           baseHeaders["tokentype"] = "API_KEY"
         }
 
-        let activeRequestAbort =
-          this.createStreamRequestAbortSignal(abortSignal)
+        let streamGuard = this.createStreamRequestGuard(abortSignal)
         const fetchOptions: RequestInit & { dispatcher?: unknown } = {
           method: "POST",
           headers: baseHeaders,
-          signal: activeRequestAbort.signal,
+          signal: streamGuard.signal,
         }
         const dispatcher = this.buildProxyDispatcher(currentAccount)
         if (dispatcher) fetchOptions.dispatcher = dispatcher
@@ -2416,14 +2539,14 @@ export class KiroService implements OnModuleInit {
                   if (currentAccount.authMethod === "api_key") {
                     retryHeaders["tokentype"] = "API_KEY"
                   }
-                  activeRequestAbort =
-                    this.createStreamRequestAbortSignal(abortSignal)
+                  streamGuard.dispose()
+                  streamGuard = this.createStreamRequestGuard(abortSignal)
                   const retryFetchOptions: RequestInit & {
                     dispatcher?: unknown
                   } = {
                     method: "POST",
                     headers: retryHeaders,
-                    signal: activeRequestAbort.signal,
+                    signal: streamGuard.signal,
                   }
                   const retryDispatcher =
                     this.buildProxyDispatcher(currentAccount)
@@ -2451,10 +2574,13 @@ export class KiroService implements OnModuleInit {
                       await parseKiroEventStream(
                         retryResponse.body,
                         callback,
-                        activeRequestAbort.signal
+                        streamGuard.signal,
+                        () => streamGuard.noteActivity()
                       )
                     } catch (parseError) {
                       throw this.tagKiroStreamParseError(parseError)
+                    } finally {
+                      streamGuard.dispose()
                     }
                     this.logger.log(
                       `[Kiro] <- ${endpoint.name} stream completed after refresh (account=${this.accountTag(currentAccount)}, model=${model})`
@@ -2547,10 +2673,13 @@ export class KiroService implements OnModuleInit {
             await parseKiroEventStream(
               response.body,
               callback,
-              activeRequestAbort.signal
+              streamGuard.signal,
+              () => streamGuard.noteActivity()
             )
           } catch (parseError) {
             throw this.tagKiroStreamParseError(parseError)
+          } finally {
+            streamGuard.dispose()
           }
           this.logger.log(
             `[Kiro] <- ${endpoint.name} stream completed (account=${this.accountTag(currentAccount)}, model=${model})`
@@ -2582,19 +2711,38 @@ export class KiroService implements OnModuleInit {
           // The AbortController fires with reason containing "Superseded"
           // when a new bidi stream replaces the current one.
           if (this.isAbortError(error)) {
-            const reason = this.extractAbortReason(
-              error,
-              activeRequestAbort.signal
-            )
-            if (this.isTimeoutAbort(error, activeRequestAbort.signal)) {
-              throw new BackendApiError(
-                `Kiro request timed out after ${activeRequestAbort.timeoutMs}ms`,
+            const reason = this.extractAbortReason(error, streamGuard.signal)
+            if (this.isTimeoutAbort(error, streamGuard.signal)) {
+              const timeoutError = new BackendApiError(
+                `Kiro request timed out (${streamGuard.describeTimeout()})`,
                 {
                   backend: "kiro",
                   statusCode: 504,
                   errorClass: "transient_network",
                 }
               )
+              // An idle timeout means the upstream accepted the request but
+              // streamed no events within the guard window — a transient,
+              // account-bound stall. RETRY_POLICY classifies it
+              // transient_network (retryable on a different account), so feed
+              // it back into the retry loop instead of throwing. Exclude the
+              // stalled account so the next attempt rotates to another one;
+              // bound by the transient_network budget so a persistently
+              // stalled backend fails over to the router instead of looping
+              // for minutes (each idle timeout costs the full guard window).
+              if (
+                idleTimeoutRetries < RETRY_POLICY.transient_network.maxRetries
+              ) {
+                idleTimeoutRetries++
+                attemptedAccountKeys.add(currentAccount.stateKey)
+                lastError = timeoutError
+                this.logger.warn(
+                  `[Kiro] Idle timeout on ${this.accountTag(currentAccount)} (${streamGuard.describeTimeout()}); ` +
+                    `retry ${idleTimeoutRetries}/${RETRY_POLICY.transient_network.maxRetries} on a different account`
+                )
+                continue
+              }
+              throw timeoutError
             }
             throw new BackendApiError(`Kiro request aborted: ${reason}`, {
               backend: "kiro",

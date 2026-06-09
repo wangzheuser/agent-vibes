@@ -2,6 +2,7 @@ import { Injectable, Logger } from "@nestjs/common"
 import { CompactWarningStateService } from "./compact-warning-state.service"
 import { ContextCollapseService } from "./context-collapse.service"
 import { ContextTelemetryService } from "./context-telemetry.service"
+import { ReasoningMemoryService } from "./reasoning-memory.service"
 import { ContextConversationState } from "./types"
 
 /**
@@ -16,6 +17,14 @@ import { ContextConversationState } from "./types"
  *   2. Reset `investigationMemory` — the investigation buffer is
  *      summarized into the boundary record itself, so the live
  *      mirror gets cleared.
+ *   3. Clear `ReasoningMemoryService` for the conversation — the
+ *      per-conversation reasoning ring buffer is a live mirror of the
+ *      most recent thinking blocks (replayed cross-turn as the
+ *      `<previous_thinking>` preamble on text_preamble backends). Once
+ *      the boundary moves, those records describe archived/summarized
+ *      work; replaying them makes the model re-execute already-done
+ *      history tasks. Reset it alongside the other live mirrors so the
+ *      preamble rebuilds from post-compaction turns only.
  *   4. `contextCollapse.reset(state)` — full compaction supersedes the
  *      read-time collapse commit log, matching Claude Code's
  *      post-compact reset behavior.
@@ -50,7 +59,8 @@ export class PostCompactCleanupService {
   constructor(
     private readonly contextCollapse: ContextCollapseService,
     private readonly compactWarningState: CompactWarningStateService,
-    private readonly telemetry: ContextTelemetryService
+    private readonly telemetry: ContextTelemetryService,
+    private readonly reasoningMemory: ReasoningMemoryService
   ) {}
 
   /**
@@ -123,6 +133,15 @@ export class PostCompactCleanupService {
       this.logger.warn(
         `Phase 2 reset investigationMemory failed: ${String(error)}`
       )
+    }
+
+    // Phase 3
+    try {
+      if (opts.conversationId) {
+        this.reasoningMemory.clear(opts.conversationId)
+      }
+    } catch (error) {
+      this.logger.warn(`Phase 3 clear reasoningMemory failed: ${String(error)}`)
     }
 
     // Phase 4

@@ -94,6 +94,14 @@ export class ConfigManager {
     )
   }
 
+  get responseLanguage(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("responseLanguage") ?? ""
+    ).trim()
+  }
+
   get antigravitySystemPrompt(): boolean {
     return (
       vscode.workspace

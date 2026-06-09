@@ -163,6 +163,15 @@ export class ReasoningMemoryService {
   /** conversationId -> ring buffer of records (oldest first). */
   private readonly memory = new Map<string, ReasoningRecord[]>()
 
+  /**
+   * conversationId -> the exact preamble text last injected for that
+   * conversation. Used to skip re-injecting a byte-identical digest on
+   * tool-continuation rounds within the same turn (see finalizeInjection),
+   * which otherwise wastes tokens and nudges the model to re-acknowledge /
+   * restate its own prior reasoning every round.
+   */
+  private readonly lastInjectedByConversation = new Map<string, string>()
+
   constructor(
     private readonly tokenCounter: TokenCounterService,
     private readonly telemetry: ContextTelemetryService
@@ -292,6 +301,9 @@ export class ReasoningMemoryService {
     } else {
       this.memory.set(conversationId, kept)
     }
+    // Records changed → the digest will differ; force the next build to
+    // re-inject rather than dedup against a now-stale last-injected text.
+    this.lastInjectedByConversation.delete(conversationId)
     this.telemetry.recordEvent({
       event: "reasoning_memory.invalidated",
       scope: conversationId,
@@ -301,6 +313,7 @@ export class ReasoningMemoryService {
   }
 
   clear(conversationId: string): void {
+    this.lastInjectedByConversation.delete(conversationId)
     if (this.memory.delete(conversationId)) {
       this.telemetry.recordEvent({
         event: "reasoning_memory.cleared",
@@ -322,7 +335,8 @@ export class ReasoningMemoryService {
     conversationId: string,
     targetBackend: BackendType,
     targetModel: string,
-    budget: ReasoningPreambleBudget
+    budget: ReasoningPreambleBudget,
+    injectionContext?: { isContinuation?: boolean }
   ): ReasoningPreamble | null {
     const cap = getBackendCapability(targetBackend)
     if (cap.continuityStrategy !== "text_preamble") return null
@@ -372,16 +386,59 @@ export class ReasoningMemoryService {
           tokens: this.tokenCounter.countText(truncated),
         },
       ])
-      return {
+      return this.finalizeInjection(
+        conversationId,
+        targetBackend,
         text,
-        recordsUsed: [newest],
-        tokens: this.tokenCounter.countText(text),
-      }
+        [newest],
+        allowed,
+        injectionContext?.isContinuation === true
+      )
     }
 
     // packed is newest-first; flip to chronological for readability.
     packed.reverse()
     const text = this.formatPreamble(packed)
+    return this.finalizeInjection(
+      conversationId,
+      targetBackend,
+      text,
+      packed,
+      allowed,
+      injectionContext?.isContinuation === true
+    )
+  }
+
+  /**
+   * Commit a built preamble for injection, or skip it when this is a
+   * tool-continuation round and the digest is byte-identical to what was
+   * already injected earlier in the same turn. Re-injecting the same
+   * `<previous_thinking>` text on every continuation round wastes tokens and
+   * nudges the model to re-acknowledge / restate it (subtle repetition). The
+   * first request of a turn (isContinuation=false) always injects so a fresh
+   * turn re-establishes continuity after the wire dropped thinking.
+   */
+  private finalizeInjection(
+    conversationId: string,
+    targetBackend: BackendType,
+    text: string,
+    recordsUsed: readonly ReasoningRecord[],
+    budgetAllowed: number,
+    isContinuation: boolean
+  ): ReasoningPreamble | null {
+    if (
+      isContinuation &&
+      this.lastInjectedByConversation.get(conversationId) === text
+    ) {
+      this.telemetry.recordEvent({
+        event: "reasoning_memory.preamble_skipped",
+        scope: conversationId,
+        delta: 1,
+        metadata: { reason: "unchanged_within_turn" },
+      })
+      return null
+    }
+    this.lastInjectedByConversation.set(conversationId, text)
     const tokens = this.tokenCounter.countText(text)
     this.telemetry.recordEvent({
       event: "reasoning_memory.preamble_built",
@@ -389,12 +446,12 @@ export class ReasoningMemoryService {
       delta: 1,
       metadata: {
         backend: targetBackend,
-        records: packed.length,
+        records: recordsUsed.length,
         tokens,
-        budgetAllowed: allowed,
+        budgetAllowed,
       },
     })
-    return { text, recordsUsed: packed, tokens }
+    return { text, recordsUsed, tokens }
   }
 
   /**
@@ -537,7 +594,24 @@ export class ReasoningMemoryService {
   }
 
   private formatPreamble(records: readonly ReasoningRecord[]): string {
-    const lines: string[] = ["<previous_thinking>"]
+    // The preamble is spliced as plain text into the next user message, so a
+    // bare <previous_thinking> block reads to the model like fresh user input
+    // it must respond to. On text_preamble backends (kiro) this digest is
+    // re-injected on every tool-continuation round of a turn, which made the
+    // model open each round with "you're right, ..." and restate the same
+    // plan — a subtle reasoning repetition. Frame it explicitly as the
+    // model's OWN earlier private reasoning to be continued silently, the
+    // text-mode analogue of how native_signature backends replay thinking
+    // blocks structurally (which the model never re-acknowledges).
+    const lines: string[] = [
+      "<previous_thinking>",
+      "NOTE: The text below is YOUR OWN earlier private reasoning from this " +
+        "task, replayed only because the wire format dropped it. Use it " +
+        "silently to keep continuity. Do NOT acknowledge, agree with, quote, " +
+        "summarize, or restate it, and do not treat it as a new user message " +
+        "— just continue the task from where it left off.",
+      "",
+    ]
     for (const r of records) {
       lines.push(r.text.trim())
       lines.push("---")

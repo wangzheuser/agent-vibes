@@ -21,8 +21,11 @@ import {
  * existing `CodexService.executeWebSearch` does exactly that and
  * hands us back `{ text, references }`.
  *
- * Selected for the `codex` and `openai-compat` backends by default.
- * Available iff `CodexService` reports configured account credentials.
+ * Selected for official `codex` backend sessions by default. OpenAI-
+ * compatible / reverse endpoints default to Exa MCP instead because they
+ * frequently degrade native web_search into slow text-only summaries without
+ * parseable sources. Available iff `CodexService` reports configured account
+ * credentials.
  */
 export class CodexServerToolAdapter implements WebSearchAdapter {
   private readonly logger = new Logger(CodexServerToolAdapter.name)

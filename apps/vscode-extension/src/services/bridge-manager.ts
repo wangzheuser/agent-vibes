@@ -128,6 +128,10 @@ export class BridgeManager extends EventEmitter {
         env.THINKING_BUDGET_AUTO = "true"
       }
 
+      if (this.config.responseLanguage) {
+        env.AGENT_VIBES_FORCED_LANGUAGE = this.config.responseLanguage
+      }
+
       // Stability first: Kiro warmup sends one request per account on every
       // bridge start. On account pools this can trigger 429 cooldowns and a
       // memory spike before the first real turn.

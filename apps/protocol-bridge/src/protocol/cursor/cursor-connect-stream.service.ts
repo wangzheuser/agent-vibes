@@ -778,8 +778,6 @@ interface TopLevelContinuationDecision {
 
 type AvoidableShellCommandClassification = {
   kind: "file_write"
-  recommendedTool: "edit_file_v2"
-  reason: string
 }
 
 interface AssistantTurnStreamParams {
@@ -1221,6 +1219,13 @@ export class CursorConnectStreamService {
   private readonly INFLATING_READONLY_TOOL_STORAGE_THRESHOLD_CHARS = 4_000
   private readonly GENERIC_TOOL_RESULT_STORAGE_THRESHOLD_CHARS = 50_000
   private readonly AGGREGATE_TOOL_RESULT_STORAGE_BUDGET_CHARS = 200_000
+
+  // Keep the N most recent read_file results verbatim (exempt from
+  // aggregate blob-storage). edit_file_v2 matches an exact search
+  // snippet against the file body, so replacing a fresh read with a
+  // stored-blob preview forces the model into re-reads / grep
+  // workarounds. Older reads still compress to protect the budget.
+  private readonly RECENT_VERBATIM_READ_EXEMPT_COUNT = 8
   private readonly LARGE_READ_FILE_SIZE_BYTES = 256 * 1024
   private readonly OFFICIAL_VIEW_FILE_MAX_LINES = 800
   private readonly OFFICIAL_VIEW_FILE_MAX_RESULT_TOKENS = 18_000
@@ -4108,21 +4113,48 @@ export class CursorConnectStreamService {
         route.backend,
         targetModel
       )
+      // A tool-result continuation round re-sends the SAME prior reasoning
+      // digest. Detect it (the latest outbound message carries tool_result
+      // blocks rather than a fresh user message) so buildPreamble can skip
+      // re-injecting an unchanged digest within a turn — the first request of
+      // a turn (fresh user message) and any digest update still inject.
+      const lastOutgoing = outgoingMessages[outgoingMessages.length - 1] as
+        | { role?: string; content?: unknown }
+        | undefined
+      const isToolResultContinuation =
+        !!lastOutgoing &&
+        lastOutgoing.role === "user" &&
+        Array.isArray(lastOutgoing.content) &&
+        lastOutgoing.content.some(
+          (block) => (block as { type?: string } | null)?.type === "tool_result"
+        )
       return this.reasoningMemory.buildPreamble(
         conversationId,
         route.backend,
         targetModel,
         {
-          // Tokens left after system + history + reserved output. Floor at
-          // zero — buildPreamble itself enforces a minimum useful size.
+          // The preamble is input-side content, so its headroom is the
+          // input room left before auto-compaction triggers — NOT the
+          // leftover after reserving the full output budget. Subtracting
+          // maxOutputTokens from the window starved the preamble on long
+          // conversations: once system + history exceeds
+          // (maxTokens - maxOutputTokens), the leftover hits zero and the
+          // preamble is silently dropped, disabling cross-turn reasoning
+          // continuity for text_preamble backends (kiro/codex) exactly when
+          // it matters most. Base the budget on autoCompactTokenLimit, which
+          // is the real input ceiling the request is allowed to fill before
+          // compaction reclaims space. Fall back to the previous
+          // window-minus-output semantics when the limit is unavailable.
+          // Floor at zero — buildPreamble enforces a minimum useful size.
           remainingTokens: Math.max(
             0,
-            budget.maxTokens -
+            (budget.autoCompactTokenLimit ??
+              budget.maxTokens - budget.maxOutputTokens) -
               budget.systemPromptTokens -
-              historyTokens -
-              budget.maxOutputTokens
+              historyTokens
           ),
-        }
+        },
+        { isContinuation: isToolResultContinuation }
       )
     })()
 
@@ -5541,6 +5573,14 @@ export class CursorConnectStreamService {
       batch.toolCallIds.length > 1 &&
       batch.toolCallIds.includes(toolCallId)
 
+    // [grep-loss diag] Trace the per-result write decision so a parallel batch
+    // that loses all-but-one result is fully reconstructable from the log.
+    this.logger.debug(
+      `[tool-result-write] toolCallId=${toolCallId} path=${isBufferableBatchMember ? "buffer" : "immediate"} ` +
+        `batch=${batch ? `id=${batch.id} members=[${batch.toolCallIds.join(",")}] unsettled=[${batch.unsettledToolCallIds.join(",")}] claimed=${batch.continuationClaimed === true}` : "none"} ` +
+        `bufferSize=${this.bufferedToolResultsByConversation.get(session.conversationId)?.size ?? 0}`
+    )
+
     if (!isBufferableBatchMember) {
       this.appendToolResultBlockNow(
         session,
@@ -5571,6 +5611,9 @@ export class CursorConnectStreamService {
     // The settle already ran before us, so an empty unsettled list means
     // we are the last member — flush the whole batch in declaration order.
     if (batch.unsettledToolCallIds.length === 0) {
+      this.logger.debug(
+        `[tool-result-write] flush-trigger (opportunistic) for batch members=[${batch.toolCallIds.join(",")}] buffered=[${[...(this.bufferedToolResultsByConversation.get(session.conversationId)?.keys() ?? [])].join(",")}]`
+      )
       this.flushBufferedToolResults(session, batch.toolCallIds)
     }
   }
@@ -5610,14 +5653,48 @@ export class CursorConnectStreamService {
       }))
     )
 
-    // A buffered id is only parked when it belongs to the active batch, and a
-    // batch never drops ids — so any entry NOT in the current batch's
-    // declaration set can only be a stale leftover from a prior/abandoned
-    // batch that was never flushed or torn down. Writing it would inject a
-    // stale tool_result (in the wrong place) into the current turn, so drop it
-    // rather than emit it.
+    // Diagnostic for the "parallel batch loses all-but-last tool_result"
+    // failure: declared batch members that never landed a buffered result
+    // become orphaned tool_uses at send time (rendered as "result was
+    // archived ... re-run the tool"), which traps the model in a re-grep
+    // loop. Logging the declared-vs-buffered delta here pinpoints whether
+    // the loss is upstream (results never matched/arrived) rather than in
+    // the write path.
+    const bufferedIds = new Set(
+      [...buffer.values()].map((entry) => entry.toolCallId)
+    )
+    const missingDeclared = declarationOrder.filter(
+      (id) => !bufferedIds.has(id)
+    )
+    if (missingDeclared.length > 0) {
+      this.logger.warn(
+        `flushBufferedToolResults: ${missingDeclared.length}/${declarationOrder.length} ` +
+          `declared batch member(s) have NO buffered result and will orphan ` +
+          `(conversation=${session.conversationId}, missing=[${missingDeclared.join(", ")}], ` +
+          `buffered=[${[...bufferedIds].join(", ")}])`
+      )
+    }
+
+    // Durable atomic batch write. The previous per-result loop called
+    // appendToolResultBlockNow, which for every NON-last split-sibling
+    // assistant message took the mid-transcript insert path
+    // (`replaceMessages`). replaceMessages is a transcript rewrite/reconcile
+    // primitive — it updates the in-memory array but does NOT append new rows
+    // to the append-only `session_messages` table the way addMessage does.
+    // So only the LAST result (which hit the end-append addMessage fallback)
+    // persisted; every earlier parallel result was silently lost on the next
+    // reload/reconcile → orphaned tool_use → "result archived, re-run" loop.
+    // This was a GENERAL parallel-batch defect, not grep-specific.
+    //
+    // Fix: collect every buffered result (declaration order, stale dropped)
+    // and persist them as ONE user turn through the durable append path
+    // (addMessage). The N tool_results reference their preceding tool_use
+    // split-siblings, which is protocol-valid; send-time tool-integrity owns
+    // any further ordering.
     const declarationSet = new Set(declarationOrder)
     let droppedStale = 0
+    const batchBlocks: ToolResultContentItem[] = []
+    const writtenIds: string[] = []
     for (const toolCallId of flushOrder) {
       const entry = buffer.get(toolCallId)
       if (!entry) continue
@@ -5625,14 +5702,32 @@ export class CursorConnectStreamService {
         droppedStale += 1
         continue
       }
-      this.appendToolResultBlockNow(
-        session,
-        entry.toolCallId,
-        entry.toolName,
-        entry.toolInput,
-        entry.toolResultContent,
-        entry.structuredContent,
-        entry.toolCallType
+      if (writtenIds.includes(toolCallId)) continue
+      batchBlocks.push({
+        type: "tool_result",
+        tool_use_id: entry.toolCallId,
+        content: entry.toolResultContent,
+        tool_call_type: entry.toolCallType,
+        ...(entry.structuredContent
+          ? { structuredContent: entry.structuredContent }
+          : {}),
+      })
+      writtenIds.push(toolCallId)
+    }
+    if (batchBlocks.length > 0) {
+      this.contextState.addMessage(session.conversationId, {
+        type: "user",
+        message: {
+          role: "user",
+          content: batchBlocks as MessageContent,
+        },
+      })
+      for (const id of writtenIds) {
+        this.closeLedgerForToolResult(session.conversationId, id)
+      }
+      this.logger.debug(
+        `[tool-result-write] flush durable-append ${batchBlocks.length} result(s) ` +
+          `as one user turn for ${session.conversationId}: [${writtenIds.join(", ")}]`
       )
     }
     if (droppedStale > 0) {
@@ -5697,6 +5792,11 @@ export class CursorConnectStreamService {
         appendPlan.assistantMessageIndex
       )
     ) {
+      // [grep-loss diag] repairDisplaced rewrote the transcript; the plan may
+      // now be stale, so it is recomputed. Log both to expose whether the
+      // per-write repair is relocating/dropping a sibling's result.
+      const beforeMode = appendPlan?.mode
+      const beforeAsst = appendPlan?.assistantMessageIndex
       appendPlan = findToolResultAppendPlan(
         this.contextState
           .getContextRecord(session.conversationId)!
@@ -5705,6 +5805,15 @@ export class CursorConnectStreamService {
           content: unknown
         }>,
         toolCallId
+      )
+      this.logger.debug(
+        `[tool-result-write] appendToolResultBlockNow toolCallId=${toolCallId} repairDisplaced=true ` +
+          `planBefore=${beforeMode}@asst${beforeAsst} planAfter=${appendPlan?.mode}@asst${appendPlan?.assistantMessageIndex ?? "?"}`
+      )
+    } else {
+      this.logger.debug(
+        `[tool-result-write] appendToolResultBlockNow toolCallId=${toolCallId} repairDisplaced=false ` +
+          `plan=${appendPlan?.mode ?? "null"}@asst${appendPlan?.assistantMessageIndex ?? "?"} userIdx=${appendPlan?.userMessageIndex ?? "?"}`
       )
     }
     if (appendPlan?.mode === "merge_into_existing_user_message") {
@@ -6699,6 +6808,31 @@ export class CursorConnectStreamService {
     })
   }
 
+  private selectRecentVerbatimReadToolUseIds(
+    groups: HistoryToolResultCandidate[][]
+  ): Set<string> {
+    const readToolUseIds: string[] = []
+    for (const group of groups) {
+      for (const candidate of group) {
+        if (this.isVerbatimEditableReadTool(candidate.toolName)) {
+          readToolUseIds.push(candidate.toolUseId)
+        }
+      }
+    }
+    const recent = readToolUseIds.slice(
+      Math.max(
+        0,
+        readToolUseIds.length - this.RECENT_VERBATIM_READ_EXEMPT_COUNT
+      )
+    )
+    return new Set(recent)
+  }
+
+  private isVerbatimEditableReadTool(toolName: string): boolean {
+    const normalized = toolName.toLowerCase()
+    return normalized === "read_file" || normalized === "read_file_v2"
+  }
+
   private enforceAggregateToolResultBudgetForHistory(
     messages: Array<{ role: "user" | "assistant"; content: MessageContent }>,
     options?: {
@@ -6718,7 +6852,10 @@ export class CursorConnectStreamService {
 
     const replacementMap = new Map<string, string>()
     let storedToolResults = 0
-    for (const group of this.collectAggregateToolResultBudgetGroups(messages)) {
+    const groups = this.collectAggregateToolResultBudgetGroups(messages)
+    const protectedReadToolUseIds =
+      this.selectRecentVerbatimReadToolUseIds(groups)
+    for (const group of groups) {
       const fresh: HistoryToolResultCandidate[] = []
       const frozenSize = 0
       for (const candidate of group) {
@@ -6726,6 +6863,11 @@ export class CursorConnectStreamService {
           replacementState.replacementByToolUseId?.[candidate.toolUseId]
         if (replacement !== undefined) {
           replacementMap.set(candidate.toolUseId, replacement)
+          continue
+        }
+        // Keep the freshest read_file bodies verbatim so edit_file_v2
+        // can match an exact snippet; never aggregate-store them.
+        if (protectedReadToolUseIds.has(candidate.toolUseId)) {
           continue
         }
         fresh.push(candidate)
@@ -14657,17 +14799,6 @@ ${raw}
     if (readDispatchError) {
       return {
         errorMessage: readDispatchError,
-      }
-    }
-
-    const avoidableShellDispatchError = this.buildAvoidableShellDispatchError(
-      session,
-      normalizedToolName,
-      input
-    )
-    if (avoidableShellDispatchError) {
-      return {
-        errorMessage: avoidableShellDispatchError,
       }
     }
 
@@ -26149,70 +26280,22 @@ ${raw}
     return null
   }
 
-  private latestUserExplicitlyRequestsShellExecution(
-    session: SessionRecord | undefined
-  ): boolean {
-    if (!session) return false
-    const latestUserText =
-      this.extractLatestUserPlainText(
-        this.contextState
-          .getContextRecord(session.conversationId)!
-          .messages.map(toLooseShape)
-      ) || ""
-    const normalized = latestUserText.trim().toLowerCase()
-    if (!normalized) return false
-    return (
-      normalized.includes("run_terminal_command") ||
-      normalized.includes("shell") ||
-      normalized.includes("terminal") ||
-      normalized.includes("命令行") ||
-      normalized.includes("终端") ||
-      normalized.includes("执行命令") ||
-      normalized.includes("运行命令") ||
-      normalized.includes("用命令")
-    )
-  }
-
   /**
-   * Classify a shell command for "you should have used a dedicated tool"
-   * intervention. Returns null when the command is either fine or its
-   * intent is not a deterministic file write.
+   * Detect whether a shell command performs a deterministic file write
+   * (redirection, tee, sed -i / perl -pi, or a programmatic write) to a
+   * non-ephemeral path. Returns null otherwise.
    *
-   * Design philosophy (mirrors claude-code's BashTool, see
-   * `claude-code/packages/builtin-tools/src/tools/BashTool/prompt.ts`):
+   * Used by isReadOnlyShellCommand to keep file-writing commands out of
+   * the read-only classification. It does NOT block dispatch: mirroring
+   * claude-code's BashTool, shell editing is steered toward edit_file_v2
+   * via the tool description, not hard-blocked here — this regex
+   * heuristic cannot parse shell precisely enough to block without false
+   * positives (a `>` inside a quoted echo, `tee` in a read-only pipe),
+   * and blocking legitimate edits / deletions is hostile to the user.
    *
-   *   - Hard-blocking shell read / search / discovery commands (cat,
-   *     head, tail, ls, find, grep, rg) is hostile to the user. A model
-   *     that wants to `wc -l file` should not be told "no, use
-   *     read_file" — it should just run, because read_file cannot
-   *     express line counting. claude-code's BashTool does NOT block
-   *     these; it only **suggests** the dedicated tools via the system
-   *     prompt and lets the model choose. We follow the same approach.
-   *
-   *   - File writes through shell (`echo > path`, `tee path`, `sed -i`
-   *     etc.) are still discouraged when the target is a workspace
-   *     file — the IDE cannot render the diff, the user cannot review
-   *     the change, and the model loses its file-state cache. We keep
-   *     this as a soft block, but with two corrections vs. the
-   *     previous implementation:
-   *
-   *       1. Compound commands are split per-segment before pattern
-   *          matching. `wc -l foo 2>/dev/null || echo bar; stat baz`
-   *          previously matched the global "echo + > anywhere" regex
-   *          and was rejected as a "file write through shell" — even
-   *          though no segment writes a file. Per-segment classification
-   *          fixes that false positive.
-   *
-   *       2. stderr-only redirections (`2>`, `2>>`) are not file
-   *          writes for our purposes. They route stderr to /dev/null
-   *          or a log file the user is already allowed to manage; the
-   *          IDE diff path is not relevant.
-   *
-   *   - Real security validation (network device redirects to /dev/tcp,
-   *     IFS injection, obfuscated flags, heredoc forging) is OUT OF
-   *     SCOPE here — those belong in a separate validator and are not
-   *     yet implemented in this bridge. claude-code's `bashSecurity.ts`
-   *     is the reference implementation.
+   * Per-segment classification (split on `;`, `&&`, `||`, `|`) avoids
+   * inferring a write from tokens in a different segment, and stderr-only
+   * redirections (`2>`, `2>>`) are not treated as file writes.
    */
   private classifyAvoidableShellCommand(
     command: string | null
@@ -26304,8 +26387,6 @@ ${raw}
       // sed -i / perl -pi / writeFileSync without a literal path.
       return {
         kind: "file_write",
-        recommendedTool: "edit_file_v2",
-        reason: "deterministic file write through shell",
       }
     }
 
@@ -26318,8 +26399,6 @@ ${raw}
 
     return {
       kind: "file_write",
-      recommendedTool: "edit_file_v2",
-      reason: "deterministic file write through shell",
     }
   }
 
@@ -26608,50 +26687,6 @@ ${raw}
       if (resolved.startsWith(prefix)) return true
     }
     return false
-  }
-
-  private buildAvoidableShellDispatchError(
-    session: SessionRecord,
-    normalizedToolName: string,
-    input: Record<string, unknown>
-  ): string | undefined {
-    if (
-      normalizedToolName !== "run_terminal_command" &&
-      normalizedToolName !== "run_terminal_command_v2" &&
-      normalizedToolName !== "exec_command" &&
-      normalizedToolName !== "shell" &&
-      normalizedToolName !== "run_command"
-    ) {
-      return undefined
-    }
-
-    if (this.latestUserExplicitlyRequestsShellExecution(session)) {
-      return undefined
-    }
-
-    const command = this.pickShellCommand(input)
-    const classification = this.classifyAvoidableShellCommand(command)
-    if (!classification) {
-      return undefined
-    }
-
-    const commandPreview = this.truncateForToolSummary(command || "", 220)
-    // classification is currently always `kind: "file_write"` — the
-    // read / search / discovery shapes are no longer hard-blocked
-    // (they're steered via the system prompt instead). The
-    // recommendation text reflects that single remaining case; if we
-    // ever re-introduce other classifications they need their own
-    // recommendation strings.
-    const recommendation =
-      "Use edit_file_v2. For a new file, call edit_file_v2 with search " +
-      "set to an empty string and replace set to the full file content. " +
-      "For an existing file, read_file first, then edit_file_v2 with a " +
-      "small exact search snippet."
-    const message =
-      `run_terminal_command rejected: ${classification.reason}; ` +
-      `${recommendation} command=${JSON.stringify(commandPreview)}`
-    this.logger.warn(message)
-    return message
   }
 
   private truncateForToolSummary(value: string, maxChars: number): string {
@@ -29302,6 +29337,45 @@ ${raw}
           return Promise.race([runnerSettle, aborted])
         },
       }),
+      // Transcript-anchor finalize. Owned by the turn lifecycle and
+      // run by driveRunner BEFORE terminalPromise resolves, so a
+      // superseding turn that awaits cancelTurnAndAwait sees a cleared
+      // anchor the instant the await returns. This is the fix for the
+      // "supersede serializer leaked a turn" race: the anchor used to
+      // be committed/aborted in the post-await business flow below,
+      // where an abort could resolve the terminal while the body was
+      // still mid-write, leaking the open anchor into the next turn's
+      // beginTurn.
+      onFinalize: (result, handle) => {
+        if (result.status === "completed") {
+          try {
+            this.sessionManager.commitTurn(conversationId, handle.turnId)
+          } catch (commitErr) {
+            this.logger.error(
+              `commitTurn failed for turn=${handle.turnId} conversation=${conversationId}: ${(commitErr as Error).message}`
+            )
+          }
+          return
+        }
+        // cancelled | failed — rewind the transcript to the turn
+        // anchor so a half-written assistant message does not pollute
+        // the canonical transcript.
+        try {
+          const dropped = this.sessionManager.abortTurn(
+            conversationId,
+            handle.turnId
+          )
+          if (dropped > 0) {
+            this.logger.warn(
+              `abortTurn rewound ${dropped} message(s) on turn=${handle.turnId} conversation=${conversationId} (status=${result.status})`
+            )
+          }
+        } catch (abortErr) {
+          this.logger.error(
+            `abortTurn failed for turn=${handle.turnId} conversation=${conversationId}: ${(abortErr as Error).message}`
+          )
+        }
+      },
     })
     const handle = turnSpawn.handle
 
@@ -29399,25 +29473,12 @@ ${raw}
       )
       // Body returned. If the supervisor already cancelled this
       // turn (supersede / bidi-close / parent-cancel), the impl
-      // may have early-returned mid-write — abort, don't commit,
-      // so the half-written assistant text doesn't pollute the
-      // canonical transcript.
+      // may have early-returned mid-write. Settle the runner as
+      // cancelled; the transcript anchor is rewound by onFinalize
+      // when driveRunner reaches the terminal path (before terminal
+      // resolves), so the half-written assistant text never pollutes
+      // the canonical transcript.
       if (handle.signal.aborted) {
-        try {
-          const dropped = this.sessionManager.abortTurn(
-            conversationId,
-            handle.turnId
-          )
-          if (dropped > 0) {
-            this.logger.warn(
-              `abortTurn rewound ${dropped} message(s) on cancelled turn=${handle.turnId} conversation=${conversationId}`
-            )
-          }
-        } catch (abortErr) {
-          this.logger.error(
-            `abortTurn failed for cancelled turn=${handle.turnId} conversation=${conversationId}: ${(abortErr as Error).message}`
-          )
-        }
         popOnce()
         resolveRunner({
           status: "cancelled",
@@ -29432,15 +29493,9 @@ ${raw}
         }
         return
       }
-      // Body completed normally — commit transcript, pop the
-      // writer, and settle the runner with `completed`.
-      try {
-        this.sessionManager.commitTurn(conversationId, handle.turnId)
-      } catch (commitErr) {
-        this.logger.error(
-          `commitTurn failed for turn=${handle.turnId} conversation=${conversationId}: ${(commitErr as Error).message}`
-        )
-      }
+      // Body completed normally — settle the runner with `completed`.
+      // The transcript commit is performed by onFinalize on the
+      // terminal path.
       popOnce()
       resolveRunner({ status: "completed", summary: "" })
       try {
@@ -29454,26 +29509,9 @@ ${raw}
     }
 
     if (bodyFailed) {
-      // Cancelled or failed — rewind the transcript to the turn
-      // anchor before propagating. We rewind unconditionally on
-      // body throw because cursor's legacy path may have already
-      // emitted half an assistant message into (this.contextState.getContextRecord(session.conversationId)!).messages
-      // before the abort signal raced through.
-      try {
-        const dropped = this.sessionManager.abortTurn(
-          conversationId,
-          handle.turnId
-        )
-        if (dropped > 0) {
-          this.logger.warn(
-            `abortTurn rewound ${dropped} message(s) on turn=${handle.turnId} conversation=${conversationId}`
-          )
-        }
-      } catch (abortErr) {
-        this.logger.error(
-          `abortTurn failed for turn=${handle.turnId} conversation=${conversationId}: ${(abortErr as Error).message}`
-        )
-      }
+      // Cancelled or failed — the transcript rewind to the turn anchor
+      // is performed by onFinalize on the terminal path, so the
+      // business flow only needs to settle the runner and propagate.
       popOnce()
       const e =
         bodyError instanceof Error ? bodyError : new Error(String(bodyError))
@@ -30819,6 +30857,25 @@ ${raw}
       return
     }
 
+    // Join-barrier safety net. The opportunistic flush in
+    // appendToolResultWithIntegrity only fires when the snapshot shows
+    // unsettledToolCallIds===0 inside the *bufferable* branch, so a sibling
+    // result that arrives out of declaration order, or a settling result that
+    // takes the immediate-write path, can leave earlier buffered siblings
+    // unflushed. They then become orphaned tool_uses at send time
+    // ("result was archived ... re-run the tool"), trapping the model in a
+    // re-grep loop. Winning the continuation claim means the whole batch has
+    // settled, so flush any still-buffered results NOW — in declaration
+    // order — before the continuation history is assembled. Already-flushed
+    // batches leave an empty buffer here, making this a no-op.
+    const settledBatchForFlush =
+      this.assistantToolBatch.getActiveAssistantToolBatchSnapshot(
+        conversationId
+      )
+    if (settledBatchForFlush && settledBatchForFlush.toolCallIds.length > 0) {
+      this.flushBufferedToolResults(session, settledBatchForFlush.toolCallIds)
+    }
+
     let activeSession =
       this.cleanSessionHistoryForTransientAssistantInfrastructureMessages(
         session,
@@ -31657,7 +31714,10 @@ ${raw}
       this.toolExecutionCoordinator.markCompleted(conversationId, toolCallId)
       const pendingToolCall = this.sessionManager.consumePendingToolCall(
         conversationId,
-        toolCallId
+        toolCallId,
+        // Defer the batch settle to the append site below (same synchronous
+        // slice as appendToolResultWithIntegrity). See consumePendingToolCall.
+        { deferBatchSettle: true }
       )
 
       if (!pendingToolCall) {
@@ -31721,6 +31781,14 @@ ${raw}
       // Add tool result to message history before any supersession return.
       // Once the pending tool call is consumed, resumed streams need the
       // persisted tool_result to reconstruct state safely.
+      //
+      // 第 1 类 join-barrier invariant: settle in the SAME synchronous slice as
+      // the append (no await between) so the buffer flush only fires on the
+      // last sibling. consumePendingToolCall deferred the settle for this.
+      this.assistantToolBatch.settleAssistantToolBatchTool(
+        conversationId,
+        toolCallId
+      )
       this.appendToolResultWithIntegrity(
         session,
         toolCallId,
@@ -32208,7 +32276,11 @@ ${raw}
     this.toolExecutionCoordinator.markCompleted(conversationId, toolCallId)
     const pendingToolCall = this.sessionManager.consumePendingToolCall(
       conversationId,
-      toolCallId
+      toolCallId,
+      // Defer the batch settle to the append site below so it lands in the
+      // same synchronous slice as appendToolResultWithIntegrity (第 1 类
+      // join-barrier invariant). See consumePendingToolCall for the rationale.
+      { deferBatchSettle: true }
     )
 
     if (!pendingToolCall) {
@@ -33158,6 +33230,16 @@ ${raw}
     // pending tool call has already been consumed, so dropping the history
     // write would strand resumed streams without either pending state or a
     // persisted tool_result to continue from.
+    // 第 1 类 join-barrier invariant: settle this tool in the SAME synchronous
+    // slice as the history append (no await between), so the buffer-flush
+    // condition (unsettledToolCallIds === 0) only becomes true on the
+    // genuinely-last sibling and the whole batch flushes in declaration order.
+    // consumePendingToolCall deferred the settle (deferBatchSettle:true)
+    // precisely so it can land here.
+    this.assistantToolBatch.settleAssistantToolBatchTool(
+      conversationId,
+      toolCallId
+    )
     this.appendToolResultWithIntegrity(
       session,
       toolCallId,
@@ -34935,13 +35017,9 @@ ${raw}
     {
       const ephLines: string[] = [
         `Step Id: ${stepId++}`,
-        "The following is an <EPHEMERAL_MESSAGE> not actually sent by the user. It is provided by the system as a set of reminders and general important information to pay attention to. Do NOT respond to this message, just act accordingly.",
+        "The following is an <EPHEMERAL_MESSAGE> not actually sent by the user. It is provided by the system as a set of reminders and general important information to pay attention to. Do NOT respond to nor acknowledge this message; just act accordingly. Never repeat, echo, quote, restate, or paraphrase the <EPHEMERAL_MESSAGE> wrapper, any tags nested inside it (for example <no_active_task_reminder>), or their contents anywhere in your visible reply.",
         "",
         "<EPHEMERAL_MESSAGE>",
-        "<artifact_reminder>",
-        "You have not yet created any artifacts. Please follow the artifact guidelines and create them as needed based on the task.",
-        "CRITICAL REMINDER: remember that user-facing artifacts should be AS CONCISE AS POSSIBLE. Keep this in mind when editing artifacts.",
-        "</artifact_reminder>",
         "<no_active_task_reminder>",
         "You are currently not in a task because: a task boundary has never been set yet in this conversation.",
         "If there is no obvious task from the user or if you are just conversing, then it is acceptable to not have a task set. If you are just handling simple one-off requests, such as explaining a single file, or making one or two ad-hoc code edit requests, or making an obvious refactoring request such as renaming or moving code into a helper function, it is also acceptable to not have a task set.",

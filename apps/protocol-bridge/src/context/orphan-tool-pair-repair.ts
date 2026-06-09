@@ -114,17 +114,61 @@ function repairOrphanedToolUses(
 }
 
 function renderOrphanedToolResultText(block: ToolResultBlock): string {
-  const body =
-    typeof block.content === "string"
-      ? block.content
-      : block.content
-          .map((inner) => (inner.type === "text" ? inner.text : ""))
-          .filter((text) => text.length > 0)
-          .join("\n")
+  const body = extractOrphanedToolResultBody(block)
+  if (!body.trim()) {
+    // No body survived (already-cleared / empty structured result). Only in
+    // this case is the result genuinely unavailable — say so explicitly and
+    // allow a re-run.
+    return (
+      `[The request for this earlier tool call was compacted into the ` +
+      `summary above and its result body is no longer available. Re-run the ` +
+      `tool if you need the result again.]`
+    )
+  }
+  // The body IS still present here — only the originating tool_use was
+  // archived behind the compaction boundary. The previous framing ("now
+  // summarized into the compaction summary above") made the model treat a
+  // still-present result as gone and re-run it (observed: repeated
+  // grep_search re-runs / fallback to run_terminal_command after compaction).
+  // Present the result as authoritative so the model uses it directly.
   return (
-    `[Tool result for an earlier tool call now summarized into the ` +
-    `compaction summary above]\n${body}`
+    `[Result of an earlier tool call whose request was compacted into the ` +
+    `summary above. The result below is complete and current — use it ` +
+    `directly; do not re-run the tool just to reproduce it.]\n${body}`
   )
+}
+
+/**
+ * Robustly extract the textual body of a (possibly orphaned) tool_result so
+ * the orphan repair never silently drops a structured search/read result.
+ * Falls back to JSON for non-text content parts and to `structuredContent`
+ * when the primary content is empty.
+ */
+function extractOrphanedToolResultBody(block: ToolResultBlock): string {
+  const parts: string[] = []
+  if (typeof block.content === "string") {
+    if (block.content.length > 0) parts.push(block.content)
+  } else if (Array.isArray(block.content)) {
+    for (const inner of block.content) {
+      if (inner.type === "text") {
+        if (inner.text.length > 0) parts.push(inner.text)
+      } else {
+        try {
+          parts.push(JSON.stringify(inner))
+        } catch {
+          // skip unserializable parts
+        }
+      }
+    }
+  }
+  if (parts.length === 0 && block.structuredContent) {
+    try {
+      parts.push(JSON.stringify(block.structuredContent))
+    } catch {
+      // skip unserializable structured content
+    }
+  }
+  return parts.join("\n")
 }
 
 function renderOrphanedToolUseText(block: ToolUseBlock): string {

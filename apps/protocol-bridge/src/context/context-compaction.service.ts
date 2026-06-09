@@ -97,7 +97,20 @@ export class ContextCompactionService {
   private readonly MIN_REQUEST_BUDGET = 256
   private readonly MIN_SUMMARY_TOKENS = 64
   private readonly MIN_ATTACHMENT_TOKENS = 128
-  private readonly SUMMARY_TOKEN_BUDGET = 2400
+  // Max output budget handed to the summary model when compacting history.
+  // Aligned with Claude Code's compaction output reserve (cc reserves
+  // min(maxOutputTokens, 20K) of the window for the compact summary — see
+  // docs/context/token-budget.mdx "有效上下文 = 窗口 - min(maxOutputTokens, 20K)").
+  //
+  // The previous value (2_400) was the root cause of catastrophic detail
+  // loss: regardless of how much history was being compacted, the summary
+  // was hard-capped at ~2.4K tokens. A real session compacted 154_315 source
+  // tokens into a 2_894-token summary (~53:1) — entire investigation threads
+  // were flattened to a sentence. cc instead lets the summary model spend up
+  // to ~20K output tokens so large histories retain their structure. The
+  // effective cap is still further bounded by resolveSummaryBudgetCap's
+  // 0.22 * effectiveMaxTokens term, so small budgets scale down naturally.
+  private readonly SUMMARY_TOKEN_BUDGET = 20_000
   private readonly ATTACHMENT_TOKEN_BUDGET = 2200
   /**
    * Fraction of the pressure budget that a compaction retains as the recent
@@ -421,6 +434,22 @@ export class ContextCompactionService {
       hardMaxTokens,
       options
     )
+    // Decouple the trigger budget from the retention budget (Option A).
+    //
+    // effectiveMaxTokens uses min(auto, predictive) so compaction can FIRE
+    // early (predictive's only intended job). But the retention window must
+    // NOT shrink just because the predictive threshold is low: predictive is
+    // designed purely to trigger sooner, not to discard more history. When
+    // both share effectiveMaxTokens, a low predictive limit (e.g. 134K vs
+    // auto 161K) silently pulls the retained recent window down with it,
+    // over-archiving ~17K of history that the auto budget would have kept.
+    //
+    // retentionMaxTokens therefore uses the auto-only budget (predictive
+    // excluded). The skip/trigger decision below stays on effectiveMaxTokens.
+    const retentionMaxTokens = this.resolvePressureBudget(hardMaxTokens, {
+      autoCompactTokenLimit: options.autoCompactTokenLimit,
+      systemPromptTokens: options.systemPromptTokens,
+    })
     const attachmentTokenBudget = this.resolveAttachmentBudget(
       hardMaxTokens,
       (snapshot.investigationSummaries?.length ?? 0) > 0
@@ -445,7 +474,8 @@ export class ContextCompactionService {
       effectiveMaxTokens,
       attachmentTokenBudget,
       options.strategy || "auto",
-      options.integrityMode
+      options.integrityMode,
+      retentionMaxTokens
     )
     if (!candidate) {
       this.logger.debug(
@@ -696,7 +726,12 @@ export class ContextCompactionService {
     effectiveMaxTokens: number,
     attachmentTokenBudget: number,
     strategy: ContextCompactionCommit["strategy"],
-    integrityMode?: "strict-adjacent" | "global"
+    integrityMode?: "strict-adjacent" | "global",
+    // Auto-only budget for the retention window (Option A). Defaults to
+    // effectiveMaxTokens so existing callers (directional compaction) keep
+    // their current behaviour; the auto-compact path passes the larger
+    // auto-only budget so a low predictive trigger does not shrink retention.
+    retentionMaxTokens: number = effectiveMaxTokens
   ): ContextCompactionCandidate | null {
     const commitId = randomUUID()
     const activeSlice = getRecordsAfterCompactBoundary(state.records)
@@ -733,8 +768,13 @@ export class ContextCompactionService {
     // immediately re-fire on the next tool result. Only the retention target
     // is reduced; the trigger (skip decision in prepareCompactionCandidate)
     // still uses the full effectiveMaxTokens.
+    //
+    // Option A: the retention window is sized off retentionMaxTokens (the
+    // auto-only budget), NOT effectiveMaxTokens (which may be pulled down by a
+    // low predictive trigger). This keeps the verbatim recent window stable
+    // regardless of how early predictive fired compaction.
     const retentionBudget = Math.floor(
-      effectiveMaxTokens * this.COMPACTION_RETENTION_RATIO
+      retentionMaxTokens * this.COMPACTION_RETENTION_RATIO
     )
     const targetRecentTokens = Math.max(
       0,

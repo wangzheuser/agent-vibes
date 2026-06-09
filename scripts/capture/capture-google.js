@@ -15,6 +15,7 @@
  *                     unexpected exit or Clash restart.
  */
 const fs = require("node:fs")
+const os = require("node:os")
 const path = require("node:path")
 const http = require("node:http")
 const { spawn, spawnSync } = require("node:child_process")
@@ -384,7 +385,31 @@ function readClashRuntimeConfig() {
 }
 
 function writeClashRuntimeConfig(content) {
-  fs.writeFileSync(CLASH_RUNTIME_CONFIG, content)
+  try {
+    fs.writeFileSync(CLASH_RUNTIME_CONFIG, content)
+  } catch (err) {
+    if (err.code !== "EACCES" && err.code !== "EPERM") throw err
+    // clash-verge.yaml is owned by root in some setups. Elevate only this
+    // single write via sudo so the rest of capture can run as the normal user
+    // (the GUI launch must not run as root). Fails loudly if sudo is missing.
+    if (platform.PLATFORM === "win32") throw err
+    const tmp = path.join(os.tmpdir(), `agent-vibes-clash-${process.pid}.yaml`)
+    fs.writeFileSync(tmp, content)
+    try {
+      const r = spawnSync("sudo", ["cp", tmp, CLASH_RUNTIME_CONFIG], {
+        stdio: "inherit",
+      })
+      if (r.status !== 0) {
+        throw new Error(
+          "Failed to write clash-verge.yaml via sudo (exit " + r.status + ")"
+        )
+      }
+    } finally {
+      try {
+        fs.unlinkSync(tmp)
+      } catch {}
+    }
+  }
 }
 
 function stripCaptureBlocks(content) {
@@ -685,10 +710,23 @@ async function cmdStart() {
   )
   console.log("  Logs:  " + path.join(SCRIPT_DIR, "antigravity_traffic.log"))
   console.log("  Dumps: " + LOG_DIR)
+  console.log("")
+
+  // ── Step 4: Relaunch the IDE so its Node TLS layer trusts the capture CA ──
+  // Capture now runs as the normal user, so we can start the GUI directly.
+  // Skip when AGENT_VIBES_CAPTURE_NO_LAUNCH is set (capture-only sessions).
+  if (!process.env.AGENT_VIBES_CAPTURE_NO_LAUNCH) {
+    await launchAntigravity()
+  } else {
+    console.log(
+      "Skipping IDE launch (AGENT_VIBES_CAPTURE_NO_LAUNCH set). Start it with `npm run google:capture:launch`."
+    )
+  }
+  console.log("")
   console.log("  Press Ctrl+C to stop capture and restore Clash config.")
   console.log("")
 
-  // ── Step 4: Auto-restore on exit (Ctrl+C, crash, kill) ──
+  // ── Step 5: Auto-restore on exit (Ctrl+C, crash, kill) ──
   let cleaned = false
   async function cleanup(code) {
     if (cleaned) return
@@ -845,7 +883,143 @@ async function cmdStatus() {
   }
 }
 
+function isAntigravityRunning() {
+  if (platform.PLATFORM === "win32") {
+    return (
+      queryWindowsProcesses("Name like '%Antigravity%'").filter(
+        (p) => p.ProcessId !== process.pid
+      ).length > 0
+    )
+  }
+  const r = runCapture("pgrep", ["-f", "Antigravity IDE.app"], true)
+  return r.status === 0 && (r.stdout || "").trim().length > 0
+}
+
+function quitAntigravity() {
+  if (platform.PLATFORM === "darwin") {
+    // Graceful quit first so the IDE flushes state, then force-kill leftovers.
+    runShell(`osascript -e 'quit app "Antigravity IDE"' 2>/dev/null`, true)
+  } else if (platform.PLATFORM === "win32") {
+    for (const proc of queryWindowsProcesses("Name like '%Antigravity%'")) {
+      if (proc.ProcessId === process.pid) continue
+      runShell(`taskkill /F /PID ${proc.ProcessId} >nul 2>&1`, true)
+    }
+  } else {
+    runShell('pkill -f "Antigravity IDE" 2>/dev/null', true)
+  }
+}
+
+async function waitForAntigravityExit(timeoutMs = 12000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (!isAntigravityRunning()) return true
+    await new Promise((r) => setTimeout(r, 300))
+  }
+  return !isAntigravityRunning()
+}
+
+/**
+ * Launch Antigravity IDE with NODE_EXTRA_CA_CERTS pointing at the mitmproxy CA
+ * so its Node TLS layer (the @connectrpc/connect-node client to
+ * cloudcode-pa.googleapis.com and the google-auth-library token refresh) trusts
+ * the capture proxy. Node does NOT read the macOS System Keychain, so the
+ * keychain-installed CA alone does not cover the IDE login flow.
+ *
+ * Returns true if the IDE was launched, false otherwise (reason logged). Never
+ * calls process.exit so callers like cmdStart can keep the capture running.
+ */
+async function launchAntigravity() {
+  // A GUI app started as root creates root-owned files in the user profile and
+  // cannot attach to the desktop session. Skip rather than break it.
+  if (
+    platform.PLATFORM !== "win32" &&
+    typeof process.getuid === "function" &&
+    process.getuid() === 0
+  ) {
+    console.error(
+      "Cannot launch the IDE as root. Run capture without sudo so the IDE inherits a normal-user session."
+    )
+    return false
+  }
+
+  const caCert = platform.mitmproxyCaCertPath()
+  if (!fs.existsSync(caCert)) {
+    console.error("mitmproxy CA certificate not found at: " + caCert)
+    console.error(
+      "Run a capture session once so mitmproxy generates its CA, then retry."
+    )
+    return false
+  }
+
+  const binary = platform.antigravityIdeBinaryPath()
+  if (!fs.existsSync(binary)) {
+    console.error("Antigravity IDE executable not found at: " + binary)
+    console.error(
+      "Set AGENT_VIBES_ANTIGRAVITY_IDE_BINARY_PATH to override the path."
+    )
+    return false
+  }
+
+  // Electron enforces a single-instance lock: a second launch only focuses the
+  // existing process, which was started WITHOUT our env. Quit it first.
+  if (isAntigravityRunning()) {
+    console.log("Antigravity IDE is already running. Quitting it first...")
+    quitAntigravity()
+    const exited = await waitForAntigravityExit()
+    if (!exited) {
+      console.error(
+        "Antigravity IDE did not exit. Quit it manually, then launch again."
+      )
+      return false
+    }
+  }
+
+  console.log("Launching Antigravity IDE with NODE_EXTRA_CA_CERTS=" + caCert)
+  const child = spawn(binary, [], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, NODE_EXTRA_CA_CERTS: caCert },
+  })
+  child.unref()
+
+  console.log(
+    "✓ IDE launched. Its Node TLS layer now trusts the capture proxy CA."
+  )
+  console.log(
+    "  Sign in again; the OAuth + cloudcode-pa traffic will be captured."
+  )
+  return true
+}
+
+/**
+ * `capture launch` — relaunch the IDE only. Use when capture is already running
+ * but the IDE was opened normally (Dock/Finder) without the CA env.
+ */
+async function cmdLaunch() {
+  // Heads-up if capture is not active; launching trusts the CA either way.
+  try {
+    const state = await inspectCaptureState()
+    if (!state.runtimePatched || !state.managedMitmdumpRunning) {
+      console.log(
+        "Note: capture does not appear to be active. Start it with `npm run google:capture:start` to record traffic."
+      )
+    }
+  } catch {
+    // status check is best-effort
+  }
+
+  const ok = await launchAntigravity()
+  if (!ok) process.exit(1)
+}
+
 switch (process.argv[2]) {
+  case "launch":
+  case "open":
+    cmdLaunch().catch((e) => {
+      console.error(e.message)
+      process.exit(1)
+    })
+    break
   case "start":
   case "run":
     cmdStart().catch((e) => {
@@ -875,6 +1049,8 @@ switch (process.argv[2]) {
     })
     break
   default:
-    console.log("Usage: sudo node capture-google.js [start|stop|status|repair]")
+    console.log(
+      "Usage: node capture-google.js [start|stop|status|repair|launch]"
+    )
     process.exit(1)
 }

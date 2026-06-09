@@ -33,7 +33,8 @@ import type { WebSearchAdapter, WebSearchAdapterName } from "./types"
  *  2. Backend-driven default:
  *       - `google` / `google-claude` → `google-grounding`
  *       - `claude-api`               → `anthropic-server-tool`
- *       - `codex` / `openai-compat`  → `exa-mcp`
+ *       - `codex`                    → `codex-server-tool`
+ *       - `openai-compat`            → `exa-mcp`
  *       - `kiro`                     → keyless fallback chain (Brave
  *                                       if key configured, else Exa
  *                                       MCP, else DuckDuckGo HTML)
@@ -116,11 +117,11 @@ export class WebSearchAdapterFactory {
 
   /**
    * Internal: map BackendType → selected adapter, or `undefined`
-   * if the backend should use the generic keyless chain. Codex's
-   * native server-side web_search is still available through the
-   * WEB_SEARCH_ADAPTER override, but Exa MCP is the default because
-   * Codex's reverse endpoint frequently returns slow text-only
-   * summaries without parseable sources.
+   * if the backend should use the generic keyless chain. Official Codex
+   * sessions use the Responses-API server-side web_search tool. OpenAI-
+   * compatible / reverse endpoints keep Exa MCP as the default because
+   * those endpoints frequently return slow text-only summaries without
+   * parseable sources from native web_search.
    */
   private preferredAdapterForBackend(
     backend: BackendType | undefined
@@ -132,6 +133,7 @@ export class WebSearchAdapterFactory {
       case "claude-api":
         return this.anthropicAdapter
       case "codex":
+        return this.codexAdapter
       case "openai-compat":
         return this.exaAdapter
       case "kiro":

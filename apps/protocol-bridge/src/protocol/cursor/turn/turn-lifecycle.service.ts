@@ -52,6 +52,8 @@ interface TurnRecord {
   readonly terminalPromise: Promise<TurnTerminalResult>
   /** Set when the supervisor force-resolves the terminal promise on a cancel race. */
   resolveTerminal: (r: TurnTerminalResult) => void
+  /** Finalize hook (transcript-anchor commit/abort) — see TurnSpawnRequest.onFinalize. */
+  onFinalize?: (result: TurnTerminalResult, handle: TurnHandle) => void
 }
 
 export interface TurnSpawnRequest {
@@ -73,6 +75,23 @@ export interface TurnSpawnRequest {
    * tools, etc) into the runner's closure.
    */
   buildRunner: (handle: TurnHandle) => TurnRunner
+  /**
+   * Optional finalize hook invoked by `driveRunner` exactly once, on
+   * the terminal path, BEFORE `terminalPromise` resolves. This is the
+   * happens-before that lets a superseding turn observe a fully
+   * settled transcript anchor the instant `cancelTurnAndAwait`
+   * returns. Transcript-anchor commit/abort belongs here — never in
+   * the caller's post-await business flow, where an abort race could
+   * resolve the terminal before the anchor was cleared (the
+   * "supersede serializer leaked a turn" trace).
+   *
+   * Receives the turn's `handle` explicitly so callers don't depend on
+   * a `handle` binding that is only assigned after `spawn` returns.
+   * Must not throw: `driveRunner` guards it, but a leaked anchor is the
+   * exact failure this hook exists to prevent — do error handling
+   * inside the hook.
+   */
+  onFinalize?: (result: TurnTerminalResult, handle: TurnHandle) => void
 }
 
 export interface TurnLifecycleObserver {
@@ -228,6 +247,7 @@ export class TurnLifecycle {
       outbound: req.outbound,
       terminalPromise,
       resolveTerminal,
+      onFinalize: req.onFinalize,
     }
     this.turns.set(turnId, record)
     this.auditByTurn.set(turnId, [])
@@ -362,11 +382,36 @@ export class TurnLifecycle {
       }
     }
 
-    // Resolve terminalPromise AFTER supervisor cleanup so callers of
-    // cancelTurnAndAwait observe a registry where this turn has
-    // already been detached. This is the happens-before that lets
-    // a new turn safely call beginTurn on the single-anchor
-    // TranscriptStore right after the await returns.
+    // Finalize the turn's transcript anchor (commit on success / abort
+    // on cancel|fail) BEFORE resolving terminalPromise. The anchor is
+    // owned by the turn lifecycle, not the caller's post-await flow:
+    // running it here is the happens-before that guarantees a
+    // superseding turn sees a settled (cleared) anchor the instant
+    // cancelTurnAndAwait returns. Doing it after resolve — as the old
+    // business-flow code did — let an abort race resolve the terminal
+    // while the anchor was still open, leaking it into the next turn's
+    // beginTurn ("supersede serializer leaked a turn").
+    if (record.onFinalize) {
+      try {
+        record.onFinalize(result, record.handle)
+      } catch (err) {
+        // onFinalize must not throw (it owns the anchor it is meant to
+        // clear). If it does, log loudly — a leaked anchor is exactly
+        // the failure this hook prevents — but still resolve so the
+        // superseding turn is not blocked forever.
+        this.logger.error(
+          `onFinalize threw for turn=${record.handle.turnId} ` +
+            `conversation=${record.conversationId}: ${(err as Error).message}`
+        )
+      }
+    }
+
+    // Resolve terminalPromise AFTER supervisor cleanup AND anchor
+    // finalize so callers of cancelTurnAndAwait observe a registry
+    // where this turn has been detached and its anchor cleared. This
+    // is the happens-before that lets a new turn safely call beginTurn
+    // on the single-anchor TranscriptStore right after the await
+    // returns.
     record.resolveTerminal(result)
   }
 

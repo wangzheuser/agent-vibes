@@ -5,12 +5,6 @@ import { TokenCounterService } from "../../context/token-counter.service"
 import { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 import type { CloudCodeToolDeclaration } from "../../shared/cloud-code"
-import {
-  adaptOfficialAntigravityToolInput as adaptOfficialAntigravityToolInputFromContract,
-  buildOfficialAntigravityToolDeclarations as buildOfficialAntigravityToolDeclarationsFromContract,
-  fromOfficialAntigravityToolName as fromOfficialAntigravityToolNameFromContract,
-  toOfficialAntigravityToolName as toOfficialAntigravityToolNameFromContract,
-} from "../../shared/official-antigravity-tools"
 import { UsageStatsService } from "../../usage"
 import type { ImageGenerationReference } from "../image-generation/image-generation.service"
 import {
@@ -38,7 +32,23 @@ import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
 
 const GOOGLE_WEB_SEARCH_MODEL = "gemini-2.5-flash"
 const GOOGLE_IMAGE_GENERATION_MODEL = "gemini-3.1-flash-image"
-const FALLBACK_ANTIGRAVITY_IDE_VERSION = "2.0.1"
+const FALLBACK_ANTIGRAVITY_IDE_VERSION = "2.0.4"
+
+// Gemini-3 / Antigravity requires every functionCall part (and replayed thought
+// part) to carry a `thoughtSignature`. The validator only checks the field is
+// PRESENT, not that the token is authentic. A first-party client (official
+// Antigravity) always has the real signature end-to-end. We are a Cursor
+// reverse-proxy, so the signature is lost or unsafe in three unavoidable cases:
+// (1) Cursor's Anthropic-shaped tool_use carries no signature field, (2) our
+// cross-turn cache misses on bridge restart / worker isolation / Cursor context
+// compaction, (3) thought_signature is account-bound and replaying a cached
+// real signature after worker/account rotation triggers a cross-account 400.
+// In all three we fall back to this dummy placeholder to satisfy the validator
+// instead of bare-sending (hard 400) or dropping the thought (loses real
+// reasoning fidelity). Matches the upstream Antigravity reverse-proxy contract
+// (sub2api: antigravity.DummyThoughtSignature).
+// Ref: https://ai.google.dev/gemini-api/docs/thought-signatures
+const DUMMY_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 
 /**
  * Adapt the official Antigravity system prompt for the Cursor IDE environment.
@@ -155,12 +165,6 @@ export class GoogleService implements ProviderAdapter {
       : adaptAntigravityPromptForCursor(ANTIGRAVITY_SYSTEM_PROMPT)
   private readonly systemPromptMode =
     process.env.ANTIGRAVITY_SYSTEM_PROMPT === "false" ? "cursor" : "google"
-
-  // Whether to use official Antigravity tool declarations for Claude models.
-  // When false, Claude via Cloud Code uses direct Cursor tool passthrough
-  // (same path as Gemini models). Controlled via ANTIGRAVITY_OFFICIAL_TOOLS=false env var.
-  private readonly useOfficialAntigravityTools =
-    process.env.ANTIGRAVITY_OFFICIAL_TOOLS !== "false"
 
   // Per-conversation source request ID tracking.
   // ProcessPoolService rewrites these into per-worker lineages before send so
@@ -1203,13 +1207,28 @@ export class GoogleService implements ProviderAdapter {
 
     const sanitized: Array<Record<string, unknown>> = []
     const pendingThoughtIndexes: number[] = []
-    let removedInvalidThoughtParts = 0
+    // Kept for return-shape compatibility with the downstream logging plumbing.
+    // We no longer DROP orphan thoughts (that destroyed real reasoning
+    // fidelity); instead we attach a dummy signature below, so this stays 0.
+    const removedInvalidThoughtParts = 0
 
-    const dropPendingThoughts = () => {
+    // Orphan thought parts (reasoning text with no downstream real signature to
+    // chain them) used to be spliced out, which threw away the model's actual
+    // reasoning. The validator only needs a thoughtSignature field to be
+    // PRESENT, so instead we KEEP the thought text and attach the dummy
+    // placeholder. Matches the upstream Antigravity reverse-proxy contract
+    // (sub2api attaches DummyThoughtSignature to Gemini thinking parts).
+    const ensurePendingThoughtsSigned = () => {
       while (pendingThoughtIndexes.length > 0) {
         const index = pendingThoughtIndexes.pop()!
-        sanitized.splice(index, 1)
-        removedInvalidThoughtParts++
+        const tp = sanitized[index]
+        const alreadySigned =
+          !!tp &&
+          typeof tp.thoughtSignature === "string" &&
+          tp.thoughtSignature.trim().length > 0
+        if (tp && !alreadySigned) {
+          tp.thoughtSignature = DUMMY_THOUGHT_SIGNATURE
+        }
       }
     }
 
@@ -1233,9 +1252,13 @@ export class GoogleService implements ProviderAdapter {
 
       if (pendingThoughtIndexes.length > 0) {
         if (hasThoughtSignature) {
+          // A downstream real signature covers the pending thought chain;
+          // keep those thoughts exactly as the model emitted them.
           pendingThoughtIndexes.length = 0
         } else {
-          dropPendingThoughts()
+          // Orphan thoughts: keep the reasoning, satisfy the validator with
+          // the dummy placeholder instead of dropping.
+          ensurePendingThoughtsSigned()
         }
       }
 
@@ -1243,7 +1266,7 @@ export class GoogleService implements ProviderAdapter {
     }
 
     if (pendingThoughtIndexes.length > 0) {
-      dropPendingThoughts()
+      ensurePendingThoughtsSigned()
     }
 
     return {
@@ -1641,11 +1664,6 @@ export class GoogleService implements ProviderAdapter {
     this.logger.log(
       `System prompt mode: ${this.systemPromptMode} (${this.officialSystemPrompt.length} chars)`
     )
-    if (!this.useOfficialAntigravityTools) {
-      this.logger.warn(
-        "Official Antigravity tool declarations are DISABLED — Claude will use Cursor tool passthrough"
-      )
-    }
   }
 
   /**
@@ -2570,20 +2588,15 @@ export class GoogleService implements ProviderAdapter {
             ? part.functionCall.id
             : makeToolUseId()
 
-        const originalToolName = part.functionCall.name
-        const mappedToolName =
-          this.fromOfficialAntigravityToolName(originalToolName)
+        const toolName = part.functionCall.name
         const toolUseBlock = {
           type: "tool_use",
           id: toolId,
-          name: mappedToolName,
-          input: this.adaptOfficialAntigravityToolInput(
-            originalToolName,
-            part.functionCall.args || {}
-          ),
+          name: toolName,
+          input: part.functionCall.args || {},
         }
 
-        this.rememberToolName(toolId, mappedToolName)
+        this.rememberToolName(toolId, toolName)
 
         // Cache signature for next turn
         const sigForToolCache = signature || pendingToolThoughtSignature
@@ -2615,9 +2628,13 @@ export class GoogleService implements ProviderAdapter {
           thinkingBuilder += part.text
           if (signature) {
             thinkingSignature = signature
-            if (part.text.length === 0) {
-              pendingToolThoughtSignature = signature
-            }
+            // Carry ANY thought-part signature (empty OR non-empty thinking)
+            // to the next functionCall so it gets cached under that tool id.
+            // Gemini-3 / Antigravity now frequently attach the signature to a
+            // non-empty thinking part rather than the functionCall part itself.
+            // Without this the replayed functionCall has no thought_signature
+            // and the upstream rejects the turn with 400 INVALID_ARGUMENT.
+            pendingToolThoughtSignature = signature
           }
         } else {
           // Empty text with signature -> trailingSignature
@@ -2672,6 +2689,25 @@ export class GoogleService implements ProviderAdapter {
     // Determine stop_reason
     const finishReason = candidates?.[0]?.finishReason
     const stopReason = this.mapGeminiFinishReason(finishReason, hasToolCall)
+
+    // TEMP DIAGNOSTIC: when conversion produced no content blocks, dump the
+    // raw candidate parts so we can tell whether Gemini returned a truly empty
+    // candidate (root cause A) or a signature-only / empty-text part that the
+    // converter dropped (root cause B). Remove once the empty_stream
+    // continuation finalize regression is resolved.
+    if (contentBlocks.length === 0) {
+      const rawShape = parts.map((p) => ({
+        hasText: p?.text !== undefined,
+        textLen: typeof p?.text === "string" ? p.text.length : -1,
+        thought: !!p?.thought,
+        hasSignature: !!p?.thoughtSignature,
+        hasFunctionCall: !!p?.functionCall,
+      }))
+      this.logger.warn(
+        `[empty-conversion] finishReason=${finishReason} parts=${parts.length} ` +
+          `shape=${JSON.stringify(rawShape)}`
+      )
+    }
 
     // Extract usage metadata
     const usageMetadata = responseData.usageMetadata as
@@ -2772,21 +2808,6 @@ export class GoogleService implements ProviderAdapter {
 
   private sanitizeCloudCodeToolName(name: string): string {
     return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64)
-  }
-
-  private toOfficialAntigravityToolName(name: string): string {
-    return toOfficialAntigravityToolNameFromContract(name)
-  }
-
-  private fromOfficialAntigravityToolName(name: string): string {
-    return fromOfficialAntigravityToolNameFromContract(name)
-  }
-
-  private adaptOfficialAntigravityToolInput(
-    officialName: string,
-    input: Record<string, unknown>
-  ): Record<string, unknown> {
-    return adaptOfficialAntigravityToolInputFromContract(officialName, input)
   }
 
   private resolveCloudCodeToolChoice(
@@ -2923,10 +2944,19 @@ export class GoogleService implements ProviderAdapter {
       },
       "gemini-3-flash": {
         supportsThinking: true,
+        // Official Antigravity sends thinkingBudget=10000 for the flash tier.
+        // Without a default, undefined-effort continuation turns collapsed to
+        // minThinkingBudget (32), which is near-zero and made Gemini-3 abandon
+        // structured thought parts and inline reasoning as `<thought ...>` text.
+        thinkingBudget: 10000,
         minThinkingBudget: 32,
       },
       "gemini-3-flash-agent": {
         supportsThinking: true,
+        // Match official Antigravity wire (thinkingBudget=10000). See note on
+        // gemini-3-flash above: a missing default let continuation turns fall
+        // back to 32 and leak `<thought>` tags into visible output.
+        thinkingBudget: 10000,
         minThinkingBudget: 32,
       },
       "gemini-3-pro-high": {
@@ -3092,7 +3122,21 @@ export class GoogleService implements ProviderAdapter {
     // model IDs even when the Cursor-side request does not carry explicit
     // thinkingDetails. Keep that default at the Cloud Code serialization layer
     // so non-Claude/non-thinking routes remain controlled by the parsed request.
-    if (!thinkingIntent && resolvedModel.includes("thinking")) {
+    //
+    // Gemini-3 reasoning models (e.g. gemini-3-flash-agent / gemini-3-pro-*)
+    // do NOT carry "thinking" in their ID, so the name check alone left them
+    // with thinkingConfig=none. These models still reason regardless, but
+    // WITHOUT includeThoughts they inline the reasoning as `<thought ...>`
+    // text inside ordinary text parts instead of returning structured
+    // thought:true parts. The stream handler only recognises part.thought,
+    // so that inline reasoning leaked into the visible assistant message.
+    // Defaulting includeThoughts:true for any supportsThinking model makes
+    // Gemini-3 emit structured thought parts that the handler classifies
+    // correctly as thinking blocks.
+    const modelSupportsThinking =
+      resolvedModel.includes("thinking") ||
+      this.getOfficialThinkingProfile(resolvedModel).supportsThinking === true
+    if (!thinkingIntent && modelSupportsThinking) {
       const autoEffort = this.estimateClaudeTaskComplexity(dto)
       const thinkingBudget = this.resolveCloudCodeThinkingBudget(
         resolvedModel,
@@ -3340,22 +3384,30 @@ export class GoogleService implements ProviderAdapter {
       dto.max_tokens
     )
     const thinkingConfig = this.buildClaudeThinkingConfig(dto, resolvedModel)
+    // Official Antigravity generationConfig only carries maxOutputTokens +
+    // thinkingConfig; it omits sampling params (temperature/topP/topK/
+    // candidateCount) and lets Cloud Code apply the model defaults. Hardcoding
+    // temperature=0.4/topP=1/topK=50 here diverged from the wire and altered
+    // Gemini-3 sampling. Forward sampling params only when Cursor explicitly
+    // provides them.
     const genConfig: Record<string, unknown> = {
-      temperature:
-        typeof dto.temperature === "number" && Number.isFinite(dto.temperature)
-          ? dto.temperature
-          : 0.4,
-      topP:
-        typeof dto.top_p === "number" && Number.isFinite(dto.top_p)
-          ? dto.top_p
-          : 1,
-      topK:
-        typeof dto.top_k === "number" && Number.isFinite(dto.top_k)
-          ? dto.top_k
-          : 50,
-      candidateCount: 1,
       maxOutputTokens: resolvedMaxOutputTokens,
+      // stopSequences is intentionally kept (not present on the official wire):
+      // it guards against Cursor protocol markers (<|user|>, <|end_of_turn|>,
+      // etc.) leaking into visible output. See resolveClaudeStopSequences.
       stopSequences: this.resolveClaudeStopSequences(dto),
+    }
+    if (
+      typeof dto.temperature === "number" &&
+      Number.isFinite(dto.temperature)
+    ) {
+      genConfig.temperature = dto.temperature
+    }
+    if (typeof dto.top_p === "number" && Number.isFinite(dto.top_p)) {
+      genConfig.topP = dto.top_p
+    }
+    if (typeof dto.top_k === "number" && Number.isFinite(dto.top_k)) {
+      genConfig.topK = dto.top_k
     }
 
     this.logger.debug(
@@ -3385,17 +3437,15 @@ export class GoogleService implements ProviderAdapter {
       generationConfig: genConfig,
     }
 
-    // Add tools if present. Claude Cloud Code uses the official
-    // Antigravity-native tool surface when useOfficialAntigravityTools is enabled;
-    // otherwise all models (including Claude) use direct tool passthrough.
+    // Add tools if present. All models (including Claude via Cloud Code)
+    // use direct Cursor tool passthrough.
     if (dto.tools && dto.tools.length > 0) {
       const toolDeclarations = this.buildCloudCodeToolDeclarations(
         dto.tools as Array<{
           name?: unknown
           description?: unknown
           input_schema?: unknown
-        }>,
-        this.useOfficialAntigravityTools && this.isClaudeModel(resolvedModel)
+        }>
       )
       if (toolDeclarations.length > 0) {
         request.tools = toolDeclarations
@@ -3447,12 +3497,8 @@ export class GoogleService implements ProviderAdapter {
       name?: unknown
       description?: unknown
       input_schema?: unknown
-    }>,
-    useOfficialAntigravityTools = false
+    }>
   ): CloudCodeToolDeclaration[] {
-    if (useOfficialAntigravityTools) {
-      return this.buildOfficialAntigravityToolDeclarations(tools)
-    }
     const declarations: CloudCodeToolDeclaration[] = []
     const seenNames = new Set<string>()
 
@@ -3591,16 +3637,6 @@ export class GoogleService implements ProviderAdapter {
     }
 
     return declarations
-  }
-
-  private buildOfficialAntigravityToolDeclarations(
-    tools: Array<{
-      name?: unknown
-      description?: unknown
-      input_schema?: unknown
-    }>
-  ): CloudCodeToolDeclaration[] {
-    return buildOfficialAntigravityToolDeclarationsFromContract(tools)
   }
 
   /**
@@ -3906,6 +3942,21 @@ export class GoogleService implements ProviderAdapter {
 
         if (sig) {
           fcPart.thoughtSignature = sig
+        } else {
+          // No real signature available for this functionCall (Cursor's
+          // tool_use carries none, our cross-turn cache missed, or an
+          // account/worker rotation invalidated the cached one). Bare-sending
+          // makes Gemini reject the whole turn with 400 INVALID_ARGUMENT
+          // ("Function call is missing a thought_signature"). The validator
+          // only checks the field is PRESENT, not authentic, so fall back to
+          // the dummy placeholder to satisfy it. Matches the upstream
+          // Antigravity reverse-proxy contract (sub2api DummyThoughtSignature).
+          fcPart.thoughtSignature = DUMMY_THOUGHT_SIGNATURE
+          this.logger.debug(
+            `Replaying functionCall with dummy thought_signature: id=${toolUseId} name=${String(
+              b.name
+            )} (no real signature captured for this tool)`
+          )
         }
 
         if (typeof toolUseId === "string" && typeof b.name === "string") {
@@ -5318,19 +5369,14 @@ export class GoogleService implements ProviderAdapter {
             push(...emitSignatureBlock(signature))
           }
           const toolId = part.functionCall.id || makeToolUseId()
-          const originalToolName = part.functionCall.name
-          const mappedToolName =
-            this.fromOfficialAntigravityToolName(originalToolName)
-          const mappedToolInput = this.adaptOfficialAntigravityToolInput(
-            originalToolName,
-            part.functionCall.args || {}
-          )
-          this.rememberToolName(toolId, mappedToolName)
+          const toolName = part.functionCall.name
+          const mappedToolInput = part.functionCall.args || {}
+          this.rememberToolName(toolId, toolName)
           push(
             ...startBlock(BLOCK_TOOL_USE, {
               type: "tool_use",
               id: toolId,
-              name: mappedToolName,
+              name: toolName,
               input: {},
             })
           )
@@ -5399,9 +5445,14 @@ export class GoogleService implements ProviderAdapter {
           }
           if (signature) {
             pendingSignature = signature
-            if (part.text.length === 0) {
-              pendingToolThoughtSignature = signature
-            }
+            // Carry ANY thought-part signature (empty OR non-empty thinking)
+            // to the next functionCall so it gets cached under that tool id.
+            // Gemini-3 / Antigravity now frequently attach the signature to a
+            // non-empty thinking part rather than the functionCall part itself.
+            // Without this the replayed functionCall has no thought_signature
+            // and the upstream rejects the turn with 400 INVALID_ARGUMENT
+            // ("Function call is missing a thought_signature ...").
+            pendingToolThoughtSignature = signature
           }
         } else {
           if (part.text.length === 0) {

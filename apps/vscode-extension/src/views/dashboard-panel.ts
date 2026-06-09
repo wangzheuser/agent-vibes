@@ -951,6 +951,7 @@ export class DashboardPanel {
     ])
     const allowedStrings = new Set([
       "language",
+      "responseLanguage",
       "dataDir",
       "antigravityAccountsPath",
       "codexAccountsPath",
@@ -1244,6 +1245,14 @@ export class DashboardPanel {
                   { value: "en", label: st.general.langEn },
                   { value: "zh", label: st.general.langZh },
                 ],
+              },
+              {
+                label: st.groups.general.items.responseLanguage.label,
+                desc: st.groups.general.items.responseLanguage.desc,
+                type: "path",
+                key: "responseLanguage",
+                value: agentCfg.get<string>("responseLanguage") || "",
+                placeholder: "中文 / English / 日本語",
               },
               {
                 label: st.groups.general.items.autoCheckUpdates.label,

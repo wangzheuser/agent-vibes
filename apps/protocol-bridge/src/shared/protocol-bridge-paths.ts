@@ -282,22 +282,37 @@ function readVersionFromAppPath(appPath: string): string | null {
     path.join(appRootPath, "Contents", "resources", "app", "package.json"),
   ]
 
-  for (const candidate of packageJsonCandidates) {
-    const version = readVersionFromPackageJson(candidate)
-    if (version) {
-      return version
-    }
-  }
-
   const plistCandidates = [
     path.join(appRootPath, "Contents", "Info.plist"),
     path.join(appRootPath, "Info.plist"),
   ]
 
-  for (const candidate of plistCandidates) {
-    const version = readVersionFromInfoPlist(candidate)
-    if (version) {
-      return version
+  // For a macOS .app bundle, Info.plist (CFBundleShortVersionString) holds the
+  // PRODUCT version (e.g. Antigravity 2.0.4), whereas the bundled
+  // Resources/app/package.json only carries the underlying VS Code shell
+  // version (e.g. 1.107.0). Probe the plist first so VS Code-based apps report
+  // their real product version. When a package.json path is passed directly
+  // (no .app bundle), this falls through to the package.json scan unchanged.
+  const isMacAppBundle = appRootPath.toLowerCase().endsWith(".app")
+  const orderedCandidates = isMacAppBundle
+    ? [
+        { kind: "plist" as const, paths: plistCandidates },
+        { kind: "package" as const, paths: packageJsonCandidates },
+      ]
+    : [
+        { kind: "package" as const, paths: packageJsonCandidates },
+        { kind: "plist" as const, paths: plistCandidates },
+      ]
+
+  for (const group of orderedCandidates) {
+    for (const candidate of group.paths) {
+      const version =
+        group.kind === "plist"
+          ? readVersionFromInfoPlist(candidate)
+          : readVersionFromPackageJson(candidate)
+      if (version) {
+        return version
+      }
     }
   }
 
@@ -344,9 +359,11 @@ function getAntigravityAppPathCandidates(): string[] {
     case "darwin":
       candidates.push(
         "/Applications/Antigravity.app",
+        "/Applications/Antigravity IDE.app",
         "/Applications/Antigravity Beta.app",
         "/Applications/Setapp/Antigravity.app",
-        path.join(os.homedir(), "Applications", "Antigravity.app")
+        path.join(os.homedir(), "Applications", "Antigravity.app"),
+        path.join(os.homedir(), "Applications", "Antigravity IDE.app")
       )
       break
     case "win32":

@@ -107,19 +107,20 @@ export class AssistantToolBatchService {
     }
 
     for (const toolCallId of normalizedToolCallIds) {
+      // A tool already known to this batch carries authoritative settle
+      // state: it is either still in `unsettledToolCallIds` (awaiting its
+      // result) or was already drained by `settleAssistantToolBatchTool`
+      // once its result landed. Re-registering the same id (the
+      // message_stop finalization re-adds every tool_use after the
+      // streaming early-dispatch path registered them one-by-one) must NOT
+      // resurrect an already-settled tool into the unsettled set: with
+      // Cursor's early dispatch a sibling result can settle BEFORE the
+      // batch is finalized, and resurrecting it would strand the
+      // continuation barrier in a permanently-deferred state with no
+      // future result to clear it. Only genuinely new ids join the batch,
+      // and a new id starts out unsettled in the same step.
       if (!batch.toolCallIds.includes(toolCallId)) {
         batch.toolCallIds.push(toolCallId)
-      }
-      // The unsettled list mirrors "tools the bridge has not yet
-      // received a result for"; we add unconditionally and rely on
-      // settleAssistantToolBatchTool to drain entries as results
-      // arrive. (Pre-step-4 the lifecycle service consulted its
-      // own pending-tool map here before adding; we keep the batch
-      // service self-contained — any tool the caller adds is by
-      // definition still in flight from its perspective, and a
-      // duplicate-add is idempotent because settleAssistantToolBatchTool
-      // tolerates absent ids.)
-      if (!batch.unsettledToolCallIds.includes(toolCallId)) {
         batch.unsettledToolCallIds.push(toolCallId)
       }
     }

@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	antigravityIDEVersion      = "2.0.1"
+	antigravityIDEVersion      = "2.0.4"
 	loadCodeAssistCacheTTL     = 10 * time.Second
 	maxRetries                 = 3
 	baseDelay                  = 200 * time.Millisecond

@@ -263,7 +263,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     string,
     { cooldownUntil: number; reason?: BackendPoolModelCooldownReason }
   >()
-  private readonly MAX_CONCURRENT_GENERATIONS_PER_WORKER = 1
+  private readonly MAX_CONCURRENT_GENERATIONS_PER_WORKER = 5
   private readonly WORKER_BUSY_RETRY_HINT_MS = 1000
   private readonly GOOGLE_QUOTA_SNAPSHOT_CACHE_TTL_MS = 60_000
   /**

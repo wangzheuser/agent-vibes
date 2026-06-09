@@ -81,9 +81,21 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. Investigate, Then Commit
+
+**Investigation serves the change. Once you have enough evidence to act, act — don't keep circling.**
+
+- The moment you can name the files to edit and the edits to make, stop reading and start editing. Further reading that wouldn't change your plan is procrastination, not diligence.
+- Re-reading a file you already read, or re-running an equivalent search, is a stall signal. If the result won't change your next move, you already have your answer.
+- "Let me confirm once more" is not free. Each extra investigation step must reveal something that changes the plan, or it shouldn't happen.
+- After the user makes an explicit decision (picks an option, says "go", approves a plan), execute it. Do not reopen analysis you already finished or re-ask what was just answered.
+- Genuinely risky or irreversible edits justify deeper investigation — but state *why* the extra caution is warranted instead of silently looping.
+
+The test: if your last three tool calls were all reads and your plan didn't change, you should have been editing.
+
 ---
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.`
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, clarifying questions come before implementation rather than after mistakes, and investigation converts into edits instead of more investigation.`
 
 /**
  * Stable synthetic path for the built-in ruleset. Used as provenance in

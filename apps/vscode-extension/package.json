@@ -211,6 +211,11 @@
           ],
           "description": "Dashboard display language"
         },
+        "agentVibes.responseLanguage": {
+          "type": "string",
+          "default": "",
+          "description": "Force the language the model responds and thinks in (e.g. 中文, English, 日本語). Leave empty to auto-detect from the user's messages. Requires bridge restart."
+        },
         "agentVibes.autoStart": {
           "type": "boolean",
           "default": true,

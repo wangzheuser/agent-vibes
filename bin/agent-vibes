@@ -85,6 +85,7 @@ Advanced:
   agent-vibes capture stop            Stop traffic capture
   agent-vibes capture status          Show capture status
   agent-vibes capture repair          Repair stale capture injection
+  agent-vibes capture launch          Relaunch Antigravity IDE trusting the capture CA
 
 
 Documentation: https://github.com/funny-vibes/agent-vibes
@@ -494,16 +495,11 @@ if (command === "forward") {
 
 if (command === "capture") {
   const subCmd = args[1] || "status"
-  if (process.platform === "win32") {
-    // Windows: no sudo, scripts check elevation internally
-    nodeScript("scripts/capture/capture-google.js", [subCmd])
-  } else {
-    run("sudo", [
-      process.execPath,
-      path.join(ROOT, "scripts/capture/capture-google.js"),
-      subCmd,
-    ])
-  }
+  // Capture runs as the normal user: it patches clash-verge.yaml (user-owned in
+  // the common setup) and relaunches the IDE GUI, which must NOT run as root.
+  // The script elevates only the single clash-verge.yaml write via sudo when
+  // that file happens to be root-owned, so no blanket sudo wrapper is needed.
+  nodeScript("scripts/capture/capture-google.js", [subCmd])
 }
 
 // Default: start server

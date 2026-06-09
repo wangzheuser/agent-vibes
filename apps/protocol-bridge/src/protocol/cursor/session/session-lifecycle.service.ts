@@ -4779,24 +4779,18 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         return
       }
       // A stale anchor from a prior turn is still open while we open a
-      // new one. The supersede serializer in cursor-connect-stream is
-      // supposed to await the prior turn's terminal (via
-      // TurnLifecycle.cancelTurnAndAwait) and abort it before reaching
-      // here. If cancelTurnAndAwait threw and the turn-cleanup
-      // coordinator swallowed the error, the stale anchor leaks and we
-      // used to hard-throw — permanently locking the conversation (the
-      // "already has an open turn" production trace seen after a user
-      // stops a turn then immediately sends a new message). Mirror the
-      // commitTurn/abortTurn race policy: force-abort the leaked stale
-      // turn (rewinding its partial transcript) and proceed to open the
-      // new one rather than failing.
-      this.logger.warn(
+      // new one. With transcript-anchor finalize owned by the turn
+      // lifecycle (TurnLifecycle.driveRunner runs onFinalize →
+      // commit/abort BEFORE resolving terminalPromise), the supersede
+      // serializer's `await cancelTurnAndAwait` is guaranteed to observe
+      // a cleared anchor before it begins the next turn. Reaching this
+      // branch means a real finalize-ordering bug upstream — fail loud
+      // instead of masking it by force-aborting the stale turn.
+      throw new Error(
         `beginTurn: conversation ${conversationId} still has stale turn ` +
-          `${existingAnchor.turnId} open while opening ${turnId}; the ` +
-          `supersede serializer leaked it. Force-aborting stale turn and ` +
-          `continuing — investigate the supersede cleanup path.`
+          `${existingAnchor.turnId} open while opening ${turnId}; anchor ` +
+          `finalize did not run before the superseding turn began.`
       )
-      this.abortTurn(conversationId, existingAnchor.turnId)
     }
     const ctx = this.contextState.getContextRecord(conversationId)!
     this.turnAnchors.set(conversationId, {
@@ -4817,22 +4811,20 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   /**
    * Close the open turn without rewinding. Anchors dropped.
    *
-   * If the open anchor belongs to a different turnId, this is a
-   * supersede race that the cursor-connect-stream supersede
-   * serializer should have prevented. We log loudly and skip — the
-   * other turn already owns the anchor and is responsible for
-   * commit/abort. Throwing here used to permanently lock the
-   * conversation (1:52:37 production trace).
+   * If the open anchor belongs to a different turnId we throw: the
+   * turn lifecycle runs onFinalize (commit/abort) before resolving the
+   * terminal promise, so by the time a superseding turn begins the
+   * anchor is always either this turn's or absent. A mismatch is a real
+   * finalize-ordering bug, not a tolerable race — fail loud.
    */
   commitTurn(conversationId: string, turnId: TurnId): void {
     const anchor = this.turnAnchors.get(conversationId)
     if (!anchor) return
     if (anchor.turnId !== turnId) {
-      this.logger.warn(
-        `commitTurn: anchor owned by another turn (open=${anchor.turnId} given=${turnId}); skipping. ` +
-          `This indicates the supersede serializer leaked a turn — investigate.`
+      throw new Error(
+        `commitTurn: anchor owned by another turn (open=${anchor.turnId} ` +
+          `given=${turnId}); anchor finalize ordering is broken.`
       )
-      return
     }
     this.turnAnchors.delete(conversationId)
     this.transcriptCommitTurn(ConversationId.of(conversationId), turnId)
@@ -4851,11 +4843,10 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     const anchor = this.turnAnchors.get(conversationId)
     if (!anchor) return 0
     if (anchor.turnId !== turnId) {
-      this.logger.warn(
-        `abortTurn: anchor owned by another turn (open=${anchor.turnId} given=${turnId}); skipping. ` +
-          `This indicates the supersede serializer leaked a turn — investigate.`
+      throw new Error(
+        `abortTurn: anchor owned by another turn (open=${anchor.turnId} ` +
+          `given=${turnId}); anchor finalize ordering is broken.`
       )
-      return 0
     }
     const session = this.getSession(conversationId)
     if (!session) {
@@ -5123,7 +5114,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
   consumePendingToolCall(
     conversationId: string,
-    toolCallId: string
+    toolCallId: string,
+    options?: { deferBatchSettle?: boolean }
   ): PendingToolCall | undefined {
     const session = this.getSession(conversationId)
     if (session) {
@@ -5138,10 +5130,29 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       if (toolCall) {
         // Settle this tool in the batch barrier so that continuation is only
         // triggered after ALL tools in the assistant turn have completed.
-        this.assistantToolBatch.settleAssistantToolBatchTool(
-          conversationId,
-          toolCallId
-        )
+        //
+        // deferBatchSettle: the 第 1 类 join-barrier append path
+        // (appendToolResultWithIntegrity) requires the batch settle to land in
+        // the SAME synchronous slice as the history append, with no await in
+        // between. Detaching the pending entry here while settling the batch
+        // many awaits later (emitToolCompletedAndStep, etc.) lets sibling
+        // results settle out from under the buffer-flush condition
+        // (unsettledToolCallIds === 0): by the time the first sibling's append
+        // runs the whole batch is already settled, so the join collapses into
+        // per-result flushes and re-triggers the displaced-tool_result repair.
+        // Callers on that path pass deferBatchSettle:true and call
+        // settleAssistantToolBatchTool themselves immediately before the
+        // append, so "settled" means "result written to history" — the
+        // correct barrier semantics. Detach still happens here unconditionally,
+        // so a tool that is consumed always reaches its append (the only
+        // intervening early return is the `!toolCall` guard above, which
+        // never settled in the first place).
+        if (!options?.deferBatchSettle) {
+          this.assistantToolBatch.settleAssistantToolBatchTool(
+            conversationId,
+            toolCallId
+          )
+        }
         this.logger.debug(
           `Consumed tool call: ${toolCallId} for session ${conversationId}`
         )

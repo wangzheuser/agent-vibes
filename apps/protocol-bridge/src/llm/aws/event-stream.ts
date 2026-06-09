@@ -32,7 +32,8 @@ const TEXT_DECODER = new TextDecoder("utf-8", { fatal: false })
 export async function parseKiroEventStream(
   body: ReadableStream<Uint8Array>,
   callback: KiroStreamCallback,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  onActivity?: () => void
 ): Promise<void> {
   const reader = body.getReader()
   let pending = new Uint8Array(0)
@@ -71,6 +72,9 @@ export async function parseKiroEventStream(
       if (!value || value.length === 0) {
         continue
       }
+      // Upstream sent bytes: reset the caller's inactivity watchdog so an
+      // actively-streaming generation is never aborted by the idle timeout.
+      onActivity?.()
       append(value)
 
       while (pending.length >= 12) {

@@ -958,6 +958,7 @@ type SettingsItemCopy = { label: string; desc: string }
 
 type GeneralSettingsItems = {
   language: SettingsItemCopy
+  responseLanguage: SettingsItemCopy
   autoCheckUpdates: SettingsItemCopy
   updateCheckIntervalHours: SettingsItemCopy
 }
@@ -1030,6 +1031,10 @@ const SETTINGS_EN: SettingsCopy = {
         language: {
           label: "Dashboard Language",
           desc: "Language used by the Agent Vibes dashboard webview",
+        },
+        responseLanguage: {
+          label: "Response Language",
+          desc: "Force the model to reply and think in this language (e.g. 中文, English, 日本語). Leave empty to auto-detect. Requires bridge restart.",
         },
         autoCheckUpdates: {
           label: "Auto Check Updates",
@@ -1163,6 +1168,10 @@ const SETTINGS_ZH: SettingsCopy = {
         language: {
           label: "控制台语言",
           desc: "Agent Vibes 控制台（Webview）显示语言",
+        },
+        responseLanguage: {
+          label: "回复语言",
+          desc: "强制模型用该语言回复和思考（如 中文、English、日本語）。留空则自动检测。需重启桥接生效。",
         },
         autoCheckUpdates: {
           label: "自动检查更新",

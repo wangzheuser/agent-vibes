@@ -48,7 +48,24 @@ export type ToolResultStorageReadChunkResult =
 export class ToolResultStorageService {
   private readonly logger = new Logger(ToolResultStorageService.name)
   private readonly CHUNK_SIZE = 4_000
-  private readonly PREVIEW_CHARS = 4_000
+  // Persistence threshold — aligned with Claude Code's
+  // DEFAULT_MAX_RESULT_SIZE_CHARS (src/constants/toolLimits.ts). A result is
+  // only archived to disk once it exceeds this size. The previous value
+  // (4_000, shared with the preview size) archived almost every command
+  // output — a 4_195-char result was spilled for being 195 chars over the
+  // limit, then required a re-invocation to read back. cc keeps the bar high
+  // (50K) so small/medium outputs are never archived and the model keeps the
+  // full content inline.
+  private readonly PERSIST_THRESHOLD_CHARS = 50_000
+  // Inline preview size for archived results — aligned with cc's
+  // PREVIEW_SIZE_BYTES. Only ever used once a result is past the (much
+  // larger) persistence threshold.
+  private readonly PREVIEW_CHARS = 2_000
+  // Minimum size for proactive aggregate storage once several tool results
+  // have accumulated in a turn. Kept as an explicit constant (was coupled to
+  // the old 4_000 preview size as PREVIEW_CHARS/2 = 2_000) so decoupling the
+  // preview size does not change the aggregate trigger.
+  private readonly AGGREGATE_STORE_MIN_CHARS = 2_000
   private readonly METADATA_SUFFIX = ".metadata.json"
 
   processToolResultForHistory(input: ToolResultStorageProcessInput): string {
@@ -67,7 +84,10 @@ export class ToolResultStorageService {
       return existingReplacement
     }
 
-    const threshold = Math.max(1, input.thresholdChars ?? this.PREVIEW_CHARS)
+    const threshold = Math.max(
+      1,
+      input.thresholdChars ?? this.PERSIST_THRESHOLD_CHARS
+    )
     if (
       !input.force &&
       normalizedContent.length <= threshold &&
@@ -162,10 +182,15 @@ export class ToolResultStorageService {
     this.writeFileAtomic(absolutePath, content)
     this.writeFileAtomic(metadataPath, JSON.stringify(reference, null, 2))
 
+    const { preview, hasMore } = this.generatePreview(
+      content,
+      reference.previewChars
+    )
     const replacement = this.buildReplacementText(
       reference,
       absolutePath,
-      content.slice(0, reference.previewChars)
+      preview,
+      hasMore
     )
     this.recordReplacement(
       replacementState,
@@ -296,7 +321,7 @@ export class ToolResultStorageService {
     content: string
   ): boolean {
     const seenCount = replacementState?.seenToolUseIds?.length || 0
-    return seenCount >= 3 && content.length > Math.floor(this.PREVIEW_CHARS / 2)
+    return seenCount >= 3 && content.length > this.AGGREGATE_STORE_MIN_CHARS
   }
 
   private markSeen(
@@ -454,10 +479,27 @@ export class ToolResultStorageService {
     return undefined
   }
 
+  private generatePreview(
+    content: string,
+    maxChars: number
+  ): { preview: string; hasMore: boolean } {
+    if (content.length <= maxChars) {
+      return { preview: content, hasMore: false }
+    }
+    // Back off to the last newline within the window if it falls reasonably
+    // close to the limit (> 50%), so the preview never cuts a line in half.
+    // Aligned with Claude Code's generatePreview (toolResultStorage.ts).
+    const truncated = content.slice(0, maxChars)
+    const lastNewline = truncated.lastIndexOf("\n")
+    const cutPoint = lastNewline > maxChars * 0.5 ? lastNewline : maxChars
+    return { preview: content.slice(0, cutPoint), hasMore: true }
+  }
+
   private buildReplacementText(
     reference: ContextStoredToolResultReference,
     absolutePath: string,
-    preview: string
+    preview: string,
+    hasMore: boolean
   ): string {
     const lines = [
       "[tool_result stored]",
@@ -484,6 +526,11 @@ export class ToolResultStorageService {
     }
 
     lines.push("", "Preview:", preview || "[empty tool result]")
+    // Mirror cc's trailing "…" marker so the model can tell the inline preview
+    // is head-truncated and the tail lives only in the archived file.
+    if (hasMore) {
+      lines.push("...")
+    }
     return lines.join("\n")
   }
 
