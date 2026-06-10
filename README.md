@@ -180,46 +180,46 @@ Follow these steps in order:
 For the Cursor client side, a free account is enough. No paid Cursor plan is required.
 
 One-click download + install from [GitHub Releases](https://github.com/funny-vibes/agent-vibes/releases):
-Compatible Cursor version: `3.6.31`.
+Compatible Cursor version: `3.7.21`.
 
 #### macOS Apple Silicon
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-arm64-0.1.43.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.43/agent-vibes-darwin-arm64-0.1.43.vsix
+curl -L -o agent-vibes-darwin-arm64-0.1.44.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.44/agent-vibes-darwin-arm64-0.1.44.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-arm64-0.1.43.vsix --force
+cursor --install-extension agent-vibes-darwin-arm64-0.1.44.vsix --force
 ```
 
 #### macOS Intel
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-x64-0.1.43.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.43/agent-vibes-darwin-x64-0.1.43.vsix
+curl -L -o agent-vibes-darwin-x64-0.1.44.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.44/agent-vibes-darwin-x64-0.1.44.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-x64-0.1.43.vsix --force
+cursor --install-extension agent-vibes-darwin-x64-0.1.44.vsix --force
 ```
 
 #### Linux x64
 
 ```bash
 # Download
-curl -L -o agent-vibes-linux-x64-0.1.43.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.43/agent-vibes-linux-x64-0.1.43.vsix
+curl -L -o agent-vibes-linux-x64-0.1.44.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.44/agent-vibes-linux-x64-0.1.44.vsix
 
 # Install
-cursor --install-extension agent-vibes-linux-x64-0.1.43.vsix --force
+cursor --install-extension agent-vibes-linux-x64-0.1.44.vsix --force
 ```
 
 #### Windows x64
 
 ```powershell
 # Download
-Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.43/agent-vibes-win32-x64-0.1.43.vsix" -OutFile "agent-vibes-win32-x64-0.1.43.vsix"
+Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.44/agent-vibes-win32-x64-0.1.44.vsix" -OutFile "agent-vibes-win32-x64-0.1.44.vsix"
 
 # Install
-cursor --install-extension agent-vibes-win32-x64-0.1.43.vsix --force
+cursor --install-extension agent-vibes-win32-x64-0.1.44.vsix --force
 ```
 
 Restart Cursor after installation.
