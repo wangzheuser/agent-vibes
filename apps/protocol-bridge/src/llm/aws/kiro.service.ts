@@ -2240,7 +2240,9 @@ export class KiroService implements OnModuleInit {
     // output/thinking language. The anchor reads the user's configured
     // Response Language (or allowlist-detected language); it is empty — and
     // thus a no-op — when neither is set.
-    const langAnchor = buildTerseLanguageAnchor(dto.messages)
+    const langAnchor = buildTerseLanguageAnchor(dto.messages, {
+      skip: dto._clientIsClaudeCode === true,
+    })
     if (langAnchor) {
       const userMsg = payload.conversationState.currentMessage.userInputMessage
       const base = userMsg.content || ""

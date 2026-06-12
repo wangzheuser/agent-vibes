@@ -195,8 +195,18 @@ function buildNamedDirective(name: string): string {
  * Build the language directive for a request. Names the detected language
  * explicitly when it is on the allowlist; otherwise returns the generic
  * directive.
+ *
+ * When `skip` is true (the request comes from the Claude Code frontend) this
+ * returns an empty string — CC follows the user's language on its own and the
+ * injected directive only pollutes its thinking blocks.
  */
-export function buildLanguageDirective(messages: unknown): string {
+export function buildLanguageDirective(
+  messages: unknown,
+  options: { skip?: boolean } = {}
+): string {
+  if (options.skip) {
+    return ""
+  }
   const forced = (process.env[FORCED_LANGUAGE_ENV] ?? "").trim()
   if (forced) {
     return buildForcedDirective(forced)
@@ -220,7 +230,13 @@ export function buildLanguageDirective(messages: unknown): string {
  *   - otherwise the allowlist-detected user language,
  *   - otherwise "" (no anchor — the model keeps auto-detecting).
  */
-export function buildTerseLanguageAnchor(messages: unknown): string {
+export function buildTerseLanguageAnchor(
+  messages: unknown,
+  options: { skip?: boolean } = {}
+): string {
+  if (options.skip) {
+    return ""
+  }
   const forced = (process.env[FORCED_LANGUAGE_ENV] ?? "").trim()
   if (forced) {
     return `[Reminder: write your reply AND your thinking in ${forced}.]`
@@ -237,10 +253,14 @@ export function buildTerseLanguageAnchor(messages: unknown): string {
  */
 export function appendLanguageDirectiveToText(
   base: string | null | undefined,
-  messages: unknown
+  messages: unknown,
+  options: { skip?: boolean } = {}
 ): string {
-  const directive = buildLanguageDirective(messages)
+  const directive = buildLanguageDirective(messages, options)
   const trimmed = (base ?? "").trim()
+  if (!directive) {
+    return trimmed
+  }
   return trimmed ? `${trimmed}\n\n${directive}` : directive
 }
 
@@ -251,9 +271,13 @@ export function appendLanguageDirectiveToText(
  */
 export function appendLanguageDirectiveToAnthropicSystem(
   system: unknown,
-  messages: unknown
+  messages: unknown,
+  options: { skip?: boolean } = {}
 ): string | Array<Record<string, unknown>> {
-  const directive = buildLanguageDirective(messages)
+  const directive = buildLanguageDirective(messages, options)
+  if (!directive) {
+    return (system ?? "") as string | Array<Record<string, unknown>>
+  }
   if (Array.isArray(system)) {
     return [
       ...(system as Array<Record<string, unknown>>),

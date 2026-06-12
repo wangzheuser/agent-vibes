@@ -17,6 +17,7 @@ import {
   ApiTags,
 } from "@nestjs/swagger"
 import type { FastifyReply } from "fastify"
+import { looksLikeRealCcCliRequest } from "../../llm/anthropic/oauth-cloaking"
 import { ApiKeyGuard } from "../../shared/api-key.guard"
 import {
   type AnthropicErrorEnvelope,
@@ -143,6 +144,17 @@ export class MessagesController {
     }
     const forwardHeaders = this.pickAnthropicForwardHeaders(headers)
     const codexForwardHeaders = this.pickCodexForwardHeaders(headers)
+
+    // Identify the FRONTEND once, here at the entry: when the request comes
+    // from the real Claude Code client we flag the dto so every backend adapter
+    // skips injecting the forced language directive (CC manages its own
+    // response/thinking language; the directive otherwise pollutes its thinking
+    // blocks and, on Kiro, surfaces as prompt-injection-like text). The flag is
+    // frontend-based, so it holds no matter which backend the model routes to.
+    createMessageDto._clientIsClaudeCode = looksLikeRealCcCliRequest(
+      body,
+      forwardHeaders
+    )
 
     // Handle streaming mode
     if (createMessageDto.stream && res) {

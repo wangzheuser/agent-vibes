@@ -239,6 +239,13 @@ export class ContextCompactRunnerService {
     records: readonly ContextTranscriptRecord[]
   ): string {
     const transcript = records
+      // Topic-continuity guards (hook_result) are transient post-compaction
+      // instructions, not conversation content. If one falls inside a later
+      // compaction's archived window it must NOT be fed to the summarizer:
+      // folding "Most recent user request: <X>" into the summary would make
+      // that stale claim permanent and re-shown every turn, resurrecting the
+      // exact old-topic drift the guard was meant to prevent.
+      .filter((record) => record.kind !== "hook_result")
       .map((record, index) => {
         const text = this.renderRecord(record)
         return `<message index="${index + 1}" role="${record.role}">\n${text}\n</message>`

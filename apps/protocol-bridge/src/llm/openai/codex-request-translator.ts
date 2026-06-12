@@ -50,6 +50,7 @@ export function createCodexExecutionRequestFromClaude(
     serviceTier: dto.service_tier,
     parallelToolCalls: resolveParallelToolCalls(dto.tool_choice),
     cacheUserId: cacheUserId || undefined,
+    clientIsClaudeCode: dto._clientIsClaudeCode === true,
   }
 }
 

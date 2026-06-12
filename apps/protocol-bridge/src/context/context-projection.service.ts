@@ -48,9 +48,27 @@ export class ContextProjectionService {
       state,
       compactSlice
     )
-    const projected = collapsedSlice.flatMap((record) =>
-      this.projectRecord(record)
-    )
+    // A compaction topic-continuity guard (hook_result) asserts that one
+    // specific quoted message is "the user's MOST RECENT request" and tells
+    // the model to resume it and not pivot away. That is only true on the
+    // turn the compaction happened. Once the user speaks again, the guard's
+    // claim is false — and because the guard is imperative and persists in
+    // history, it actively drags the model back to the topic that was
+    // current at compaction time (the "post-compact reply jumps to an old
+    // topic" failure). Render a guard only while it is still the freshest
+    // user-authored anchor; retire it as soon as a later real user turn
+    // exists.
+    const lastUserInputIndex = this.findLastUserInputIndex(collapsedSlice)
+    const projected = collapsedSlice.flatMap((record, index) => {
+      if (
+        isHookResultRecord(record) &&
+        record.hookMetadata?.compactionId &&
+        index < lastUserInputIndex
+      ) {
+        return []
+      }
+      return this.projectRecord(record)
+    })
     const activeCommit = getActiveCompactCommitFromTranscript(sourceRecords)
     const hasPostCompactAttachments = compactSlice.some(isAttachmentRecord)
     const liveAttachments =
@@ -78,6 +96,25 @@ export class ContextProjectionService {
 
   renderCompactionSummary(commit: ContextCompactionCommit): string {
     return renderCompactSummary(commit)
+  }
+
+  /**
+   * Index of the last genuine user-input turn in the slice. Synthetic
+   * user-role records (compaction guards, attachments, tool results) carry
+   * a non-"message" kind and never count, so a guard is only considered
+   * stale when a real user message follows it.
+   */
+  private findLastUserInputIndex(
+    records: readonly ContextTranscriptRecord[]
+  ): number {
+    for (let i = records.length - 1; i >= 0; i--) {
+      const record = records[i]
+      if (!record) continue
+      if (record.role !== "user") continue
+      if (record.kind && record.kind !== "message") continue
+      return i
+    }
+    return -1
   }
 
   private projectRecord(

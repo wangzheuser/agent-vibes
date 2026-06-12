@@ -48,6 +48,13 @@ export interface CodexExecutionRequest {
   parallelToolCalls?: boolean
   cacheUserId?: string
   /**
+   * True when the request originates from the Claude Code frontend (set from
+   * `dto._clientIsClaudeCode` by the Claude→Codex translator). Suppresses the
+   * forced language directive in the built instructions — CC manages its own
+   * response/thinking language.
+   */
+  clientIsClaudeCode?: boolean
+  /**
    * @deprecated previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
    * 由 strict incremental delta 校验保护。不再从外部传入。该字段不参与请求构建。
    * 保留字段声明以避免现有调用方的编译错误。
@@ -363,7 +370,8 @@ export function buildCodexRequest(
   let input: CodexInputItem[] = []
   const instructions = appendLanguageDirectiveToText(
     serializeCodexInstructions(request.system),
-    request.messages
+    request.messages,
+    { skip: request.clientIsClaudeCode === true }
   )
 
   // No protocol-level repair: the ToolCallLedger guarantees tool_use ↔

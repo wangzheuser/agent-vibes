@@ -301,4 +301,20 @@ export class CreateMessageDto {
   @IsOptional()
   @IsString()
   _requestedModel?: string
+
+  /**
+   * Internal flag: the request originates from the real Claude Code client
+   * (recognised at the /v1/messages entry by `looksLikeRealCcCliRequest` from
+   * the inbound user-agent / billing header / metadata signals — i.e. by the
+   * FRONTEND, regardless of which backend the model routes to).
+   *
+   * When true, backend adapters skip injecting the forced language directive:
+   * Claude Code already follows the user's language on its own, and an injected
+   * "you MUST respond in X" directive both pollutes its thinking blocks and, on
+   * text-preamble backends (Kiro), surfaces as prompt-injection-like text in the
+   * user turn. Other clients (Cursor, generic) keep the directive.
+   */
+  @IsOptional()
+  @IsBoolean()
+  _clientIsClaudeCode?: boolean
 }

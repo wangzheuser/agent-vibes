@@ -3472,13 +3472,17 @@ export class GoogleService implements ProviderAdapter {
       })
     }
 
-    // Forced language directive: injected unconditionally (decoupled from the
-    // interleaved-thinking hint above) so language consistency — including in
-    // thinking blocks — holds on every Google request regardless of tools or
-    // thinking config. See shared/language-directive.ts.
-    systemParts.push({
-      text: buildLanguageDirective(dto.messages),
+    // Forced language directive: injected (decoupled from the interleaved-
+    // thinking hint above) so language consistency — including in thinking
+    // blocks — holds on every Google request regardless of tools or thinking
+    // config. Skipped for Claude Code frontend traffic, which manages its own
+    // language. See shared/language-directive.ts.
+    const languageDirective = buildLanguageDirective(dto.messages, {
+      skip: dto._clientIsClaudeCode === true,
     })
+    if (languageDirective) {
+      systemParts.push({ text: languageDirective })
+    }
 
     // Only add systemInstruction if we have content
     // Official Antigravity includes role: "user" in systemInstruction

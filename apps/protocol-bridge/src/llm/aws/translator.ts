@@ -155,7 +155,8 @@ export function claudeToKiro(
 
   const systemPrompt = appendLanguageDirectiveToText(
     extractSystemPromptText(dto.system),
-    dto.messages
+    dto.messages,
+    { skip: dto._clientIsClaudeCode === true }
   )
   const history: KiroHistoryMessage[] = []
   let currentContent = ""
@@ -204,14 +205,21 @@ export function claudeToKiro(
         ...tu,
         name: enforceToolNameLength(tu.name),
       }))
-      history.push({
-        assistantResponseMessage: {
-          content: extracted.text,
-          ...(truncatedToolUses.length > 0
-            ? { toolUses: truncatedToolUses }
-            : {}),
-        },
-      })
+      // Kiro history must strictly alternate user/assistant, and every
+      // assistant `toolUses` entry is answered by the toolResults of the
+      // immediately following user message. Upstream transcripts (most
+      // notably after reactive context compaction) can split one logical
+      // assistant turn into several consecutive assistant messages — e.g. a
+      // text-only message followed by one message per parallel tool_use.
+      // Merge consecutive assistant turns so the trailing user message
+      // answers the whole turn; otherwise the earlier toolUses lose their
+      // adjacent user answer and the backend rejects the payload with HTTP
+      // 400 "Improperly formed request".
+      appendAssistantResponseToHistory(
+        history,
+        extracted.text,
+        truncatedToolUses
+      )
     }
   }
 
@@ -554,6 +562,56 @@ function extractToolResultContent(content: unknown): string {
     }
   }
   return parts.join("")
+}
+
+/**
+ * Append an assistant turn to Kiro history, merging into the previous entry
+ * when it is also an `assistantResponseMessage`.
+ *
+ * Kiro requires strict user/assistant alternation and answers every assistant
+ * `toolUses` entry with the toolResults of the immediately following user
+ * message. Upstream transcripts — especially after reactive context
+ * compaction — can split one logical assistant turn into several consecutive
+ * assistant messages (a text-only message followed by one message per parallel
+ * tool_use). Pushing them verbatim leaves the earlier toolUses without an
+ * adjacent user answer, which `sanitizeKiroHistoryToolAdjacency` cannot
+ * reconcile, and the backend rejects the payload with HTTP 400
+ * "Improperly formed request".
+ *
+ * Merging collapses the run into a single turn: text segments are joined with a
+ * newline (preserving order) and toolUses are concatenated, so the following
+ * user message answers the whole turn and any still-missing toolResults are
+ * backfilled by the adjacency/trailing passes.
+ */
+function appendAssistantResponseToHistory(
+  history: KiroHistoryMessage[],
+  content: string,
+  toolUses: KiroToolUse[]
+): void {
+  const previous = history[history.length - 1]?.assistantResponseMessage
+  if (previous) {
+    previous.content = joinAssistantText(previous.content, content)
+    const mergedToolUses = [...(previous.toolUses || []), ...toolUses]
+    if (mergedToolUses.length > 0) {
+      previous.toolUses = mergedToolUses
+    } else {
+      delete previous.toolUses
+    }
+    return
+  }
+
+  history.push({
+    assistantResponseMessage: {
+      content,
+      ...(toolUses.length > 0 ? { toolUses } : {}),
+    },
+  })
+}
+
+function joinAssistantText(previous: string, next: string): string {
+  if (!previous) return next
+  if (!next) return previous
+  return `${previous}\n${next}`
 }
 
 function trimLeadingAssistantHistory(

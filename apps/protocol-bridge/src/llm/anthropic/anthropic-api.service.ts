@@ -3680,10 +3680,17 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     const raw = structuredClone(dto)
     const betas = this.normalizeBetas(raw.betas)
 
+    // Frontend-identity flag set at the /v1/messages entry
+    // (`looksLikeRealCcCliRequest`). Capture it before stripping: it is an
+    // internal field and MUST NOT be forwarded to the upstream Anthropic API
+    // as an unknown request key.
+    const clientIsClaudeCode = raw._clientIsClaudeCode === true
+
     delete raw.betas
     delete raw._conversationId
     delete raw._contextTokenBudget
     delete raw._pendingToolUseIds
+    delete raw._clientIsClaudeCode
 
     raw.model = upstreamModel
     raw.tools = this.normalizeClaudeTools(raw.tools)
@@ -3741,10 +3748,17 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     // wire shape, and mutating its system prompt would break the
     // cloaking fingerprint. For cursor/generic the system prompt reaches
     // the upstream verbatim, so this is the correct exactly-once chokepoint.
+    //
+    // The `skip` option additionally suppresses the directive whenever the
+    // FRONTEND is the real Claude Code client (regardless of routing
+    // clientMode): CC manages its own response/thinking language, and an
+    // injected directive only pollutes its thinking blocks. This mirrors the
+    // skip wired into every other backend adapter (Kiro / Google / Codex).
     if (options.clientMode !== "claude-code-cli") {
       raw.system = appendLanguageDirectiveToAnthropicSystem(
         raw.system,
-        raw.messages
+        raw.messages,
+        { skip: clientIsClaudeCode }
       )
     }
 
